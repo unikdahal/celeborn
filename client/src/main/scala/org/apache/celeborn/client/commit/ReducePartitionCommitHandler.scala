@@ -388,6 +388,36 @@ class ReducePartitionCommitHandler(
     initMapperAttempts(shuffleId, numMappers, numPartitions)
   }
 
+  /**
+   * Resume support (docs/LLD-resumable-spark-driver.md S6.2). Everything downstream keys off
+   * three pieces of state, all seeded here in one atomic pass so a concurrent reader never
+   * observes a partial adoption: the file groups themselves (so handleGetReducerFileGroup has
+   * something to serve), every mapper attempt marked finished (so areAllMapperAttemptsFinished,
+   * which getShuffleId's reader branch depends on, is true), and stageEnd (so
+   * handleGetReducerFileGroup replies immediately instead of queuing behind a stage that will
+   * never end in this process).
+   */
+  override def adoptCommittedShuffle(
+      shuffleId: Int,
+      numMappers: Int,
+      numPartitions: Int,
+      fileGroups: util.Map[Integer, util.Set[PartitionLocation]],
+      mapperAttempts: Array[Int]): Unit = {
+    require(
+      mapperAttempts.length == numMappers,
+      s"adoptCommittedShuffle: mapperAttempts.length=${mapperAttempts.length} != numMappers=$numMappers")
+    registerShuffle(shuffleId, numMappers, isSegmentGranularityVisible = false, numPartitions)
+    val target = reducerFileGroupsMap.get(shuffleId)
+    fileGroups.asScala.foreach { case (partitionId, locs) => target.put(partitionId, locs) }
+    // Captured verbatim from the crashed driver's commit handler, NOT synthesized as all-zero:
+    // CelebornInputStream filters records by attemptId, so a mapper that actually committed on
+    // a retry/speculative attempt (attemptId > 0) would have its real data silently dropped by
+    // an all-zero placeholder here -- a wrong-answer failure mode with no exception attached.
+    shuffleMapperAttempts.put(shuffleId, mapperAttempts)
+    shuffleToCompletedMappers.put(shuffleId, mapperAttempts.count(_ >= 0))
+    setStageEnd(shuffleId)
+  }
+
   override def finishPartition(
       shuffleId: Int,
       partitionId: Int,

@@ -18,6 +18,7 @@
 package org.apache.celeborn.client
 
 import java.lang.{Byte => JByte}
+import java.net.{InetSocketAddress, Socket}
 import java.nio.ByteBuffer
 import java.security.SecureRandom
 import java.util
@@ -2102,4 +2103,99 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
   }
 
   def getShuffleIdMapping = shuffleIdMapping
+
+  // ---------------------------------------------------------------------------------------
+  // Resume support (docs/LLD-resumable-spark-driver.md S6.2, patch 10). This LifecycleManager
+  // is driver-embedded and holds no persistence of its own (S1.2): everything below exists to
+  // let an operator-external anchor store seed a *fresh* instance -- running in a restarted
+  // driver, for the same appUniqueId -- with the catalog a crashed instance held, without
+  // re-deriving it from any commit traffic this instance never saw.
+  // ---------------------------------------------------------------------------------------
+
+  /**
+   * Seed the catalog for one shuffle from state captured out of a previous LifecycleManager
+   * instance (almost always: a crashed driver's). Must be called before any task for
+   * appShuffleId runs in this driver -- afterwards handleGetShuffleIdForApp's normal writer
+   * path would race it. Refuses to clobber a live registration: adoption only ever fills in
+   * state this instance does not yet have (invariant A-1 -- when in doubt, do nothing rather
+   * than overwrite).
+   */
+  def adoptShuffle(
+      appShuffleId: Int,
+      appShuffleIdentifier: String,
+      celebornShuffleId: Int,
+      numMappers: Int,
+      numPartitions: Int,
+      fileGroups: util.Map[Integer, util.Set[PartitionLocation]],
+      mapperAttempts: Array[Int]): Boolean = {
+    if (shuffleIdMapping.containsKey(appShuffleId)) {
+      logWarning(s"adoptShuffle: appShuffleId $appShuffleId already registered in this " +
+        s"LifecycleManager, refusing to clobber it with adopted state")
+      return false
+    }
+    commitManager.getCommitHandler(celebornShuffleId).adoptCommittedShuffle(
+      celebornShuffleId,
+      numMappers,
+      numPartitions,
+      fileGroups,
+      mapperAttempts)
+    // LLD S8.1's advanceAtLeast watermark, applied to this instance's own shuffleIdGenerator
+    // instead of Spark's nextShuffleId: without it, the next *unadopted* writer shuffle in this
+    // driver could mint a celebornShuffleId that collides with one we just adopted, aliasing two
+    // logically distinct shuffles onto one Celeborn file namespace with no exception anywhere.
+    // A watermark bump can only waste identifiers, never reissue one already handed out.
+    advanceShuffleIdGeneratorAtLeast(celebornShuffleId + 1)
+    registeredShuffle.add(celebornShuffleId)
+    celebornShuffleIdToAppShuffleIdMap.put(celebornShuffleId, appShuffleId)
+    appShuffleDeterminateMap.put(appShuffleId, true)
+    shuffleIdMapping.put(
+      appShuffleId,
+      scala.collection.mutable.LinkedHashMap(appShuffleIdentifier -> ((celebornShuffleId, true))))
+    logInfo(s"adoptShuffle: appShuffleId=$appShuffleId appShuffleIdentifier=$appShuffleIdentifier " +
+      s"-> celebornShuffleId=$celebornShuffleId ($numMappers mappers, $numPartitions partitions, " +
+      s"${fileGroups.size()} partitions with file groups)")
+    true
+  }
+
+  private def advanceShuffleIdGeneratorAtLeast(floor: Int): Unit = {
+    var cur = shuffleIdGenerator.get()
+    while (cur < floor && !shuffleIdGenerator.compareAndSet(cur, floor))
+      cur = shuffleIdGenerator.get()
+  }
+
+  /**
+   * Acceptance-ladder rung 7 (docs/LLD-resumable-spark-driver.md S3.6, invariant S-1): the
+   * anchor store is never the authority, Celeborn is. A store TTL can outlive the data it
+   * describes -- an application-heartbeat timeout reclaims worker-held files independently of
+   * whatever the store still remembers -- so before adopting anything this instance did not
+   * itself commit, probe every worker the captured file groups reference and require it to
+   * still be reachable. This is a coarser signal than "does this exact file still exist"
+   * (that would need a dedicated worker RPC this prototype does not add), but it is a real,
+   * live network check against the actual cluster rather than a trust-the-store stub, and it
+   * is exactly what distinguishes "Celeborn reclaimed the app" (reject, rung 7) from "the app
+   * is still within its window" (safe to probe further down the ladder).
+   */
+  def confirmAlive(
+      celebornShuffleIdsWithFileGroups: Map[Int, util.Map[Integer, util.Set[PartitionLocation]]],
+      probeTimeoutMs: Int = 2000): Set[Int] = {
+    def workerReachable(loc: PartitionLocation): Boolean = {
+      val sock = new Socket()
+      try {
+        sock.connect(new InetSocketAddress(loc.getHost, loc.getFetchPort), probeTimeoutMs)
+        true
+      } catch {
+        case _: Exception => false
+      } finally {
+        try sock.close()
+        catch { case _: Exception => () }
+      }
+    }
+    celebornShuffleIdsWithFileGroups.collect {
+      case (shuffleId, fileGroups)
+          if !fileGroups.isEmpty &&
+            fileGroups.values().asScala.forall(locs =>
+              !locs.isEmpty && locs.asScala.exists(workerReachable)) =>
+        shuffleId
+    }.toSet
+  }
 }

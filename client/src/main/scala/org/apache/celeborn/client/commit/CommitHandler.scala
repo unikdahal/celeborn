@@ -211,6 +211,30 @@ abstract class CommitHandler(
   def areAllMapperAttemptsFinished(shuffleId: Int): Boolean
 
   /**
+   * Resume support (docs/LLD-resumable-spark-driver.md S6.2, patch 10). Seed this handler's
+   * catalog for `shuffleId` from file groups committed by a *different* (crashed) driver's
+   * LifecycleManager, so handleGetReducerFileGroup / getShuffleId can serve it without any
+   * mapper actually re-running here. Not supported for MapPartition shuffle type: unlike reduce
+   * partition, map partition readers may start before all mappers finish, so "all committed" is
+   * not a well-defined precondition to seed atomically -- default throws.
+   */
+  def adoptCommittedShuffle(
+      shuffleId: Int,
+      numMappers: Int,
+      numPartitions: Int,
+      fileGroups: util.Map[Integer, util.Set[PartitionLocation]],
+      mapperAttempts: Array[Int]): Unit =
+    throw new UnsupportedOperationException(
+      s"adoptCommittedShuffle not supported by ${getClass.getSimpleName}")
+
+  /**
+   * Resume support: export the committed file groups so they can be captured into the anchor
+   * store before this driver dies. Mirrors the shape adoptCommittedShuffle expects back.
+   */
+  def exportFileGroups(shuffleId: Int): util.Map[Integer, util.Set[PartitionLocation]] =
+    reducerFileGroupsMap.get(shuffleId)
+
+  /**
    * return (thisMapperAttemptedFinishedSuccessOrNot, allMapperFinishedOrNot)
    */
   def finishMapperAttempt(

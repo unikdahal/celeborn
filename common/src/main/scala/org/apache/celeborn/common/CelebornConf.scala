@@ -974,12 +974,22 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
     get(USER_SPECIFIC_APPLICATION_INFO).map(Utils.parseKeyValuePair).toMap
   def clientShuffleIntegrityCheckEnabled: Boolean =
     get(CLIENT_SHUFFLE_INTEGRITY_CHECK_ENABLED)
+  // Resume support (docs/LLD-resumable-spark-driver.md S6.4): applicationId is an OUTPUT of
+  // SparkContext, not settable via conf, so a restarted driver in local/local-cluster mode
+  // cannot otherwise present the same appUniqueId a crashed driver used. Ops-only escape hatch;
+  // production deployments should get a stable id from the cluster manager instead.
+  def clientApplicationUniqueIdOverride: Option[String] =
+    get(CLIENT_APPLICATION_UNIQUE_ID_OVERRIDE)
 
   def appUniqueIdWithUUIDSuffix(appId: String): String = {
-    if (clientApplicationUUIDSuffixEnabled) {
-      appId + "-" + UUID.randomUUID().toString.replaceAll("-", "")
-    } else {
-      appId
+    clientApplicationUniqueIdOverride match {
+      case Some(fixed) => fixed
+      case None =>
+        if (clientApplicationUUIDSuffixEnabled) {
+          appId + "-" + UUID.randomUUID().toString.replaceAll("-", "")
+        } else {
+          appId
+        }
     }
   }
 
@@ -5915,6 +5925,19 @@ object CelebornConf extends Logging {
       .doc("Whether to add UUID suffix for application id for unique. When `true`, add UUID suffix for unique application id. Currently, this only applies to Spark and MR.")
       .booleanConf
       .createWithDefault(false)
+
+  val CLIENT_APPLICATION_UNIQUE_ID_OVERRIDE: OptionalConfigEntry[String] =
+    buildConf("celeborn.client.application.uniqueId")
+      .categories("client")
+      .version("0.6.0")
+      .doc("Force appUniqueId to this exact value instead of deriving it from the Spark/MR " +
+        "application id. Intended for resumable-driver setups (see " +
+        "docs/LLD-resumable-spark-driver.md S6.4) where a restarted driver must present the " +
+        "same identity a crashed driver used but the cluster manager does not guarantee a " +
+        "stable applicationId across the restart. Unset by default; when set, overrides " +
+        s"${CLIENT_APPLICATION_UUID_SUFFIX_ENABLED.key} entirely.")
+      .stringConf
+      .createOptional
 
   val CLIENT_APPLICATION_INFO_PROVIDER: ConfigEntry[String] =
     buildConf("celeborn.client.application.info.provider")
