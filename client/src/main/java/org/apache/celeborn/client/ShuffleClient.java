@@ -451,6 +451,40 @@ public abstract class ShuffleClient {
       boolean needDecompress)
       throws IOException;
 
+  /**
+   * Like {@link #readPartition(int, int, int, int, long, int, int, ExceptionMaker, ArrayList,
+   * ArrayList, Map, Map, int[], MetricsCallback, boolean)}, but reads a shuffle's already-committed
+   * output under a different application's identity than this client's own {@code appUniqueId}.
+   *
+   * <p>{@code locations} and {@code mapAttempts} must both be supplied by the caller: this overload
+   * never resolves them via RPC, since this client has no {@code LifecycleManager} reference for a
+   * foreign application to resolve them against. The caller is expected to have obtained them
+   * out-of-band (e.g. from wherever that application recorded its own committed shuffle metadata).
+   *
+   * @param producerAppUniqueId the {@code appUniqueId} of the application that produced and
+   *     committed this shuffle's data. Used to address the data on the worker side, in place of
+   *     this client's own {@code appUniqueId}.
+   * @throws IllegalArgumentException if {@code locations} or {@code mapAttempts} is null
+   */
+  public abstract CelebornInputStream readPartition(
+      String producerAppUniqueId,
+      int shuffleId,
+      int appShuffleId,
+      int partitionId,
+      int attemptNumber,
+      long taskId,
+      int startMapIndex,
+      int endMapIndex,
+      ExceptionMaker exceptionMaker,
+      ArrayList<PartitionLocation> locations,
+      ArrayList<PbStreamHandler> streamHandlers,
+      Map<String, LocationPushFailedBatches> failedBatchSetMap,
+      Map<String, Pair<Integer, Integer>> chunksRange,
+      int[] mapAttempts,
+      MetricsCallback metricsCallback,
+      boolean needDecompress)
+      throws IOException;
+
   public abstract boolean cleanupShuffle(int shuffleId);
 
   public abstract void shutdown();

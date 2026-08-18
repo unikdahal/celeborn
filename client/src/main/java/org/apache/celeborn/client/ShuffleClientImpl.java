@@ -30,6 +30,7 @@ import scala.Tuple3;
 import scala.reflect.ClassTag$;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.protobuf.InvalidProtocolBufferException;
 import io.netty.buffer.CompositeByteBuf;
@@ -2044,11 +2045,68 @@ public class ShuffleClientImpl extends ShuffleClient {
       }
     }
 
+    // preserve existing behavior: a partition with no locations to read is empty, not an error --
+    // the producerAppUniqueId overload requires non-null locations/mapAttempts unconditionally
+    // (it has no RPC fallback to resolve them), so that check must happen here, before delegating
     if (locations == null || locations.size() == 0) {
       logger.warn("Shuffle data is empty for shuffle {} partition {}.", shuffleId, partitionId);
       return CelebornInputStream.empty();
+    }
+
+    return readPartition(
+        appUniqueId,
+        shuffleId,
+        appShuffleId,
+        partitionId,
+        attemptNumber,
+        taskId,
+        startMapIndex,
+        endMapIndex,
+        exceptionMaker,
+        locations,
+        streamHandlers,
+        failedBatchSetMap,
+        chunksRange,
+        mapAttempts,
+        metricsCallback,
+        needDecompress);
+  }
+
+  @Override
+  public CelebornInputStream readPartition(
+      String producerAppUniqueId,
+      int shuffleId,
+      int appShuffleId,
+      int partitionId,
+      int attemptNumber,
+      long taskId,
+      int startMapIndex,
+      int endMapIndex,
+      ExceptionMaker exceptionMaker,
+      ArrayList<PartitionLocation> locations,
+      ArrayList<PbStreamHandler> streamHandlers,
+      Map<String, LocationPushFailedBatches> failedBatchSetMap,
+      Map<String, Pair<Integer, Integer>> chunksRange,
+      int[] mapAttempts,
+      MetricsCallback metricsCallback,
+      boolean needDecompress)
+      throws IOException {
+    if (shuffleId == Utils$.MODULE$.UNKNOWN_APP_SHUFFLE_ID()) {
+      logger.warn("Shuffle data is empty for shuffle {}: UNKNOWN_APP_SHUFFLE_ID.", shuffleId);
+      return CelebornInputStream.empty();
+    }
+
+    Preconditions.checkArgument(
+        locations != null && mapAttempts != null,
+        "readPartition for a producerAppUniqueId other than this client's own requires locations "
+            + "and mapAttempts to be supplied by the caller; there is no LifecycleManager for a "
+            + "foreign application to resolve them against.");
+
+    if (locations.size() == 0) {
+      logger.warn("Shuffle data is empty for shuffle {} partition {}.", shuffleId, partitionId);
+      return CelebornInputStream.empty();
     } else {
-      String shuffleKey = Utils.makeShuffleKey(appUniqueId, shuffleId);
+      String shuffleKey = Utils.makeShuffleKey(producerAppUniqueId, shuffleId);
       assert dataClientFactory != null;
       return CelebornInputStream.create(
           conf,
