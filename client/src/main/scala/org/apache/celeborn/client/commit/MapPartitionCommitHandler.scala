@@ -27,7 +27,7 @@ import scala.collection.mutable
 
 import org.roaringbitmap.RoaringBitmap
 
-import org.apache.celeborn.client.{ShuffleCommittedInfo, WorkerStatusTracker}
+import org.apache.celeborn.client.{LifecycleManager, ShuffleCommittedInfo, WorkerStatusTracker}
 import org.apache.celeborn.client.CommitManager.CommittedPartitionInfo
 import org.apache.celeborn.client.LifecycleManager.{ShuffleAllocatedWorkers, ShuffleFailedWorkers}
 import org.apache.celeborn.common.{CelebornConf, CommitMetadata}
@@ -58,7 +58,8 @@ class MapPartitionCommitHandler(
     committedPartitionInfo: CommittedPartitionInfo,
     workerStatusTracker: WorkerStatusTracker,
     sharedRpcPool: ThreadPoolExecutor,
-    commitRetryScheduler: ScheduledExecutorService)
+    commitRetryScheduler: ScheduledExecutorService,
+    lifecycleManager: LifecycleManager = null)
   extends CommitHandler(
     appId,
     conf,
@@ -67,6 +68,9 @@ class MapPartitionCommitHandler(
     sharedRpcPool,
     commitRetryScheduler)
   with Logging {
+
+  override protected def currentApplicationLease =
+    if (lifecycleManager == null) null else lifecycleManager.currentApplicationLease
 
   private val shuffleSucceedPartitionIds = JavaUtils.newConcurrentHashMap[Int, util.Set[Integer]]()
 

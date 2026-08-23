@@ -18,8 +18,8 @@
 package org.apache.celeborn.client
 
 import java.lang.{Byte => JByte}
-import java.net.{InetSocketAddress, Socket}
 import java.nio.ByteBuffer
+import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util
 import java.util.{function, List => JList}
@@ -32,7 +32,7 @@ import scala.collection.generic.CanBuildFrom
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.{ExecutionContext, Future}
-import scala.concurrent.duration.Duration
+import scala.concurrent.duration._
 import scala.util.Random
 
 import com.google.common.annotations.VisibleForTesting
@@ -46,7 +46,7 @@ import org.apache.celeborn.common.CelebornConf.ACTIVE_STORAGE_TYPES
 import org.apache.celeborn.common.client.{ApplicationInfoProvider, MasterClient}
 import org.apache.celeborn.common.identity.{IdentityProvider, UserIdentifier}
 import org.apache.celeborn.common.internal.Logging
-import org.apache.celeborn.common.meta.{ApplicationMeta, ShufflePartitionLocationInfo, WorkerInfo}
+import org.apache.celeborn.common.meta.{ApplicationLease, ApplicationMeta, ShufflePartitionLocationInfo, WorkerInfo}
 import org.apache.celeborn.common.metrics.source.Role
 import org.apache.celeborn.common.network.protocol.{SerdeVersion, TransportMessagesHelper}
 import org.apache.celeborn.common.network.sasl.registration.RegistrationInfo
@@ -57,7 +57,7 @@ import org.apache.celeborn.common.protocol.message.StatusCode
 import org.apache.celeborn.common.rpc._
 import org.apache.celeborn.common.rpc.{ClientSaslContextBuilder, RpcSecurityContext, RpcSecurityContextBuilder}
 import org.apache.celeborn.common.rpc.netty.{LocalNettyRpcCallContext, RemoteNettyRpcCallContext}
-import org.apache.celeborn.common.util.{JavaUtils, PbSerDeUtils, ThreadUtils, Utils}
+import org.apache.celeborn.common.util.{JavaUtils, PbSerDeUtils, RecoveryTaskCommitUtils, ThreadUtils, Utils}
 // Can Remove this if celeborn don't support scala211 in future
 import org.apache.celeborn.common.util.FunctionConverter._
 import org.apache.celeborn.common.util.ThreadUtils.awaitResult
@@ -74,6 +74,18 @@ object LifecycleManager {
   type ShuffleAllocatedWorkers =
     ConcurrentHashMap[Int, ConcurrentHashMap[String, ShufflePartitionLocationInfo]]
   type ShuffleFailedWorkers = ConcurrentHashMap[WorkerInfo, (StatusCode, Long)]
+
+  /** Spark-visible statistics for a shuffle adopted from Celeborn's committed catalog. */
+  case class AdoptedShuffleCatalog(
+      celebornShuffleId: Int,
+      bytesByPartitionId: Array[Long],
+      catalogSha256: Array[Byte])
+
+  private[client] def sourceRecoveryBindingId(sourceId: String): String =
+    s"source:v1:${sourceId.length}:$sourceId"
+
+  private[client] def writeRecoveryBindingId(sinkId: String): String =
+    s"write:v1:${sinkId.length}:$sinkId"
 }
 
 class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends RpcEndpoint
@@ -91,6 +103,7 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
   private val shufflePartitionType = JavaUtils.newConcurrentHashMap[Int, PartitionType]()
   private val rangeReadFilter = conf.shuffleRangeReadFilterEnabled
   private val unregisterShuffleTime = JavaUtils.newConcurrentHashMap[Int, Long]()
+  private val shuffleRecoveryKeys = JavaUtils.newConcurrentHashMap[Int, String]()
 
   val registeredShuffle = ConcurrentHashMap.newKeySet[Int]()
   val shuffleCount = new LongAdder()
@@ -222,6 +235,8 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
         createRpcSecurityContext(appSecret))
   }
 
+  @volatile private var applicationLease: ApplicationLease = _
+
   private val masterClient = new MasterClient(masterRpcEnvInUse, conf, false)
   val commitManager = new CommitManager(appUniqueId, conf, this)
   val workerStatusTracker = new WorkerStatusTracker(conf, this)
@@ -237,6 +252,7 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
       },
       workerStatusTracker,
       registeredShuffle,
+      () => applicationLease,
       reason => cancelAllActiveStages(reason))
   private def resetFallbackCounts(counts: ConcurrentHashMap[String, java.lang.Long])
       : Map[String, java.lang.Long] = {
@@ -260,6 +276,272 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
         userIdentifier,
         extraInfo.asJava))
     }
+  }
+
+  def acquireApplicationLease(
+      expectedEpoch: Long,
+      ownerId: String,
+      expiresAtMs: Long): PbApplicationLeaseControlResponse = {
+    requestApplicationLease(expectedEpoch, ownerId, expiresAtMs, renewal = false)
+  }
+
+  def renewApplicationLease(
+      epoch: Long,
+      ownerId: String,
+      expiresAtMs: Long): PbApplicationLeaseControlResponse = {
+    requestApplicationLease(epoch, ownerId, expiresAtMs, renewal = true)
+  }
+
+  /** Atomically acquire the next lease epoch using the master's clock. */
+  def takeOverApplicationLease(
+      ownerId: String,
+      leaseDurationMs: Long): PbApplicationLeaseControlResponse = {
+    require(ownerId != null && ownerId.nonEmpty, "ownerId must be non-empty")
+    require(leaseDurationMs > 0, "leaseDurationMs must be positive")
+    val response = masterClient.askSync[PbApplicationLeaseControlResponse](
+      PbApplicationLeaseControl.newBuilder()
+        .setAppId(appUniqueId)
+        .setExpectedEpoch(-1L)
+        .setOwnerId(ownerId)
+        .setLeaseDurationMs(leaseDurationMs)
+        .setRenewal(false)
+        .setRequestId(MasterClient.genRequestId())
+        .build(),
+      classOf[PbApplicationLeaseControlResponse])
+    if (response.getSuccess) {
+      applicationLease =
+        new ApplicationLease(response.getEpoch, response.getOwnerId, response.getExpiresAtMs)
+    }
+    response
+  }
+
+  /** Renew the current epoch using the master's clock. */
+  def renewApplicationLeaseForDuration(
+      epoch: Long,
+      ownerId: String,
+      leaseDurationMs: Long): PbApplicationLeaseControlResponse = {
+    require(epoch > 0, "epoch must be positive")
+    require(ownerId != null && ownerId.nonEmpty, "ownerId must be non-empty")
+    require(leaseDurationMs > 0, "leaseDurationMs must be positive")
+    val response = masterClient.askSync[PbApplicationLeaseControlResponse](
+      PbApplicationLeaseControl.newBuilder()
+        .setAppId(appUniqueId)
+        .setExpectedEpoch(epoch)
+        .setOwnerId(ownerId)
+        .setLeaseDurationMs(leaseDurationMs)
+        .setRenewal(true)
+        .setRequestId(MasterClient.genRequestId())
+        .build(),
+      classOf[PbApplicationLeaseControlResponse])
+    if (response.getSuccess) {
+      applicationLease =
+        new ApplicationLease(response.getEpoch, response.getOwnerId, response.getExpiresAtMs)
+    }
+    response
+  }
+
+  private[client] def currentApplicationLease: ApplicationLease = applicationLease
+
+  def resolveSourceRecoveryAnchor(
+      recoveryId: String,
+      sourceId: String,
+      currentAnchor: String): PbResolveSourceRecoveryAnchorResponse = {
+    require(sourceId != null && sourceId.nonEmpty, "sourceId must be non-empty")
+    require(currentAnchor != null && currentAnchor.nonEmpty, "currentAnchor must be non-empty")
+    resolveRecoveryBinding(
+      recoveryId,
+      LifecycleManager.sourceRecoveryBindingId(sourceId),
+      currentAnchor)
+  }
+
+  private def resolveRecoveryBinding(
+      recoveryId: String,
+      bindingId: String,
+      currentValue: String): PbResolveSourceRecoveryAnchorResponse = {
+    require(recoveryId != null && recoveryId.nonEmpty, "recoveryId must be non-empty")
+    val lease = applicationLease
+    if (lease == null) {
+      throw new IllegalStateException("Cannot resolve a source anchor without an application lease")
+    }
+    masterClient.askSync[PbResolveSourceRecoveryAnchorResponse](
+      PbResolveSourceRecoveryAnchor.newBuilder()
+        .setAppId(appUniqueId)
+        .setRecoveryId(recoveryId)
+        .setSourceId(bindingId)
+        .setCurrentAnchor(currentValue)
+        .setApplicationLeaseEpoch(lease.epoch())
+        .setApplicationLeaseOwnerId(lease.ownerId())
+        .setRequestId(MasterClient.genRequestId())
+        .build(),
+      classOf[PbResolveSourceRecoveryAnchorResponse])
+  }
+
+  /**
+   * Resolves the immutable ID of a resumable sink write. Write identities share the replicated
+   * recovery-binding store with source anchors, but use disjoint length-delimited namespaces so a
+   * sink can never alias a source identity. Keeping one CAS primitive gives both identities equal
+   * lease fencing, snapshotting, and HA replay semantics.
+   */
+  def resolveWriteRecoveryId(
+      recoveryId: String,
+      sinkId: String,
+      currentWriteId: String): PbResolveSourceRecoveryAnchorResponse = {
+    require(sinkId != null && sinkId.nonEmpty, "sinkId must be non-empty")
+    require(currentWriteId != null && currentWriteId.nonEmpty, "currentWriteId must be non-empty")
+    resolveRecoveryBinding(
+      recoveryId,
+      LifecycleManager.writeRecoveryBindingId(sinkId),
+      currentWriteId)
+  }
+
+  /**
+   * Publishes a task envelope through the current driver lease and returns the canonical winner.
+   */
+  def publishRecoveryTaskCommit(
+      recoveryId: String,
+      writeId: String,
+      partitionId: Int,
+      payload: Array[Byte],
+      sha256: Array[Byte]): PbPublishRecoveryTaskCommitResponse = {
+    RecoveryTaskCommitUtils.validateIdentity(appUniqueId, recoveryId, writeId, partitionId)
+    RecoveryTaskCommitUtils.validatePayload(
+      payload, sha256, conf.recoveryTaskCommitMaxPayloadSize)
+    val lease = requireRecoveryLease("publish a recovery task commit")
+    masterClient.askSync[PbPublishRecoveryTaskCommitResponse](
+      PbPublishRecoveryTaskCommit.newBuilder()
+        .setAppId(appUniqueId)
+        .setRecoveryId(recoveryId)
+        .setWriteId(writeId)
+        .setPartitionId(partitionId)
+        .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
+        .setSha256(com.google.protobuf.ByteString.copyFrom(sha256))
+        .setApplicationLeaseEpoch(lease.epoch())
+        .setApplicationLeaseOwnerId(lease.ownerId())
+        .setRequestId(MasterClient.genRequestId())
+        .build(),
+      classOf[PbPublishRecoveryTaskCommitResponse])
+  }
+
+  /** Reads an authoritative task envelope through the current driver lease. */
+  def getRecoveryTaskCommit(
+      recoveryId: String,
+      writeId: String,
+      partitionId: Int): PbGetRecoveryTaskCommitResponse = {
+    RecoveryTaskCommitUtils.validateIdentity(appUniqueId, recoveryId, writeId, partitionId)
+    val lease = requireRecoveryLease("read a recovery task commit")
+    masterClient.askSync[PbGetRecoveryTaskCommitResponse](
+      PbGetRecoveryTaskCommit.newBuilder()
+        .setAppId(appUniqueId)
+        .setRecoveryId(recoveryId)
+        .setWriteId(writeId)
+        .setPartitionId(partitionId)
+        .setApplicationLeaseEpoch(lease.epoch())
+        .setApplicationLeaseOwnerId(lease.ownerId())
+        .build(),
+      classOf[PbGetRecoveryTaskCommitResponse])
+  }
+
+  def batchGetRecoveryTaskCommits(
+      recoveryId: String,
+      writeId: String,
+      partitionIds: java.util.List[Integer]): PbBatchGetRecoveryTaskCommitsResponse = {
+    require(partitionIds != null && !partitionIds.isEmpty && partitionIds.size() <= 1024,
+      "partitionIds size must be within [1, 1024]")
+    RecoveryTaskCommitUtils.validateIdentity(appUniqueId, recoveryId, writeId, -1)
+    partitionIds.asScala.foreach { partitionId =>
+      require(partitionId != null, "partitionIds must not contain null")
+      RecoveryTaskCommitUtils.validateIdentity(
+        appUniqueId, recoveryId, writeId, partitionId.intValue())
+    }
+    val lease = requireRecoveryLease("read recovery task commits")
+    masterClient.askSync[PbBatchGetRecoveryTaskCommitsResponse](
+      PbBatchGetRecoveryTaskCommits.newBuilder()
+        .setAppId(appUniqueId)
+        .setRecoveryId(recoveryId)
+        .setWriteId(writeId)
+        .addAllPartitionIds(partitionIds)
+        .setApplicationLeaseEpoch(lease.epoch())
+        .setApplicationLeaseOwnerId(lease.ownerId())
+        .build(),
+      classOf[PbBatchGetRecoveryTaskCommitsResponse])
+  }
+
+  private def requireRecoveryLease(operation: String): ApplicationLease = {
+    val lease = applicationLease
+    if (lease == null) {
+      throw new IllegalStateException(s"Cannot $operation without an application lease")
+    }
+    lease
+  }
+
+  private[client] def publishCommittedShuffleCatalog(
+      shuffleId: Int,
+      catalog: PbCommittedShuffleCatalog): PbPublishCommittedShuffleCatalogResponse = {
+    val lease = applicationLease
+    if (lease == null) {
+      throw new IllegalStateException(
+        s"Cannot publish committed catalog for shuffle $shuffleId without an application lease")
+    }
+    masterClient.askSync[PbPublishCommittedShuffleCatalogResponse](
+      PbPublishCommittedShuffleCatalog.newBuilder()
+        .setAppId(appUniqueId)
+        .setShuffleId(shuffleId)
+        .setCatalog(catalog.toByteString)
+        .setApplicationLeaseEpoch(lease.epoch())
+        .setApplicationLeaseOwnerId(lease.ownerId())
+        .setRequestId(MasterClient.genRequestId())
+        .build(),
+      classOf[PbPublishCommittedShuffleCatalogResponse])
+  }
+
+  def getCommittedShuffleCatalog(shuffleId: Int): PbGetCommittedShuffleCatalogResponse = {
+    getCommittedShuffleCatalog(shuffleId, "")
+  }
+
+  def getCommittedShuffleCatalog(recoveryKey: String): PbGetCommittedShuffleCatalogResponse = {
+    require(recoveryKey != null && recoveryKey.nonEmpty, "recoveryKey must be non-empty")
+    getCommittedShuffleCatalog(0, recoveryKey)
+  }
+
+  private def getCommittedShuffleCatalog(
+      shuffleId: Int,
+      recoveryKey: String): PbGetCommittedShuffleCatalogResponse = {
+    val lease = applicationLease
+    if (lease == null) {
+      throw new IllegalStateException(
+        "Cannot fetch a committed catalog without an application lease")
+    }
+    masterClient.askSync[PbGetCommittedShuffleCatalogResponse](
+      PbGetCommittedShuffleCatalog.newBuilder()
+        .setAppId(appUniqueId)
+        .setShuffleId(shuffleId)
+        .setRecoveryKey(recoveryKey)
+        .setApplicationLeaseEpoch(lease.epoch())
+        .setApplicationLeaseOwnerId(lease.ownerId())
+        .build(),
+      classOf[PbGetCommittedShuffleCatalogResponse])
+  }
+
+  private def requestApplicationLease(
+      expectedEpoch: Long,
+      ownerId: String,
+      expiresAtMs: Long,
+      renewal: Boolean): PbApplicationLeaseControlResponse = {
+    val response = masterClient.askSync[PbApplicationLeaseControlResponse](
+      PbApplicationLeaseControl.newBuilder()
+        .setAppId(appUniqueId)
+        .setExpectedEpoch(expectedEpoch)
+        .setOwnerId(ownerId)
+        .setExpiresAtMs(expiresAtMs)
+        .setRenewal(renewal)
+        .setRequestId(MasterClient.genRequestId())
+        .build(),
+      classOf[PbApplicationLeaseControlResponse])
+    if (response.getSuccess) {
+      applicationLease =
+        new ApplicationLease(response.getEpoch, response.getOwnerId, response.getExpiresAtMs)
+    }
+    response
   }
 
   // Since method `onStart` is executed when `rpcEnv.setupEndpoint` is executed, and
@@ -541,6 +823,40 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
           new IllegalArgumentException("Application meta is not initialized for this app."))
       } else {
         context.reply(PbSerDeUtils.toPbApplicationMeta(applicationMeta))
+      }
+
+    // Executors address the driver's LifecycleManager. Never forward executor-supplied lease
+    // fields: this endpoint injects its own current lease, so a stale driver endpoint either no
+    // longer exists or is rejected by the master after lease takeover.
+    case pb: PbPublishRecoveryTaskCommit =>
+      if (pb.getAppId != appUniqueId) {
+        context.sendFailure(
+          new IllegalArgumentException("Recovery task commit application mismatch"))
+      } else {
+        context.reply(publishRecoveryTaskCommit(
+          pb.getRecoveryId,
+          pb.getWriteId,
+          pb.getPartitionId,
+          pb.getPayload.toByteArray,
+          pb.getSha256.toByteArray))
+      }
+
+    case pb: PbGetRecoveryTaskCommit =>
+      if (pb.getAppId != appUniqueId) {
+        context.sendFailure(
+          new IllegalArgumentException("Recovery task commit application mismatch"))
+      } else {
+        context.reply(getRecoveryTaskCommit(
+          pb.getRecoveryId, pb.getWriteId, pb.getPartitionId))
+      }
+
+    case pb: PbBatchGetRecoveryTaskCommits =>
+      if (pb.getAppId != appUniqueId) {
+        context.sendFailure(
+          new IllegalArgumentException("Recovery task commit application mismatch"))
+      } else {
+        context.reply(batchGetRecoveryTaskCommits(
+          pb.getRecoveryId, pb.getWriteId, pb.getPartitionIdsList))
       }
   }
 
@@ -1734,7 +2050,14 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
       case (workerInfo, (primaryLocations, replicaLocations)) =>
         val primaryIds = primaryLocations.asScala.map(_.getUniqueId).asJava
         val replicaIds = replicaLocations.asScala.map(_.getUniqueId).asJava
-        val destroy = DestroyWorkerSlots(shuffleKey, primaryIds, replicaIds, mockDestroyFailure)
+        val lease = applicationLease
+        val destroy = DestroyWorkerSlots(
+          shuffleKey,
+          primaryIds,
+          replicaIds,
+          mockDestroyFailure,
+          if (lease == null) 0L else lease.epoch(),
+          if (lease == null) "" else lease.ownerId())
         val future = workerInfo.endpoint.ask[DestroyWorkerSlotsResponse](destroy)
         futures.add(DestroyFutureWithStatus(future, destroy, workerInfo.endpoint, 1, startTime))
     }
@@ -1824,10 +2147,18 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
 
     if (shuffleIdsToRemove.nonEmpty) {
       logInfo(s"Clear shuffleIds: (${shuffleIdsToRemove.mkString(", ")}).")
+      val lease = applicationLease
+      val leaseEpoch = Option(lease).map(_.epoch()).getOrElse(0L)
+      val leaseOwnerId = Option(lease).map(_.ownerId()).getOrElse("")
       if (!batchRemoveExpiredShufflesEnabled) {
         shuffleIdsToRemove.foreach { shuffleId =>
           val unregisterShuffleResponse = requestMasterUnregisterShuffle(
-            UnregisterShuffle(appUniqueId, shuffleId, MasterClient.genRequestId()))
+            UnregisterShuffle(
+              appUniqueId,
+              shuffleId,
+              MasterClient.genRequestId(),
+              leaseEpoch,
+              leaseOwnerId))
           // if unregister shuffle not success, wait next turn
           if (StatusCode.SUCCESS == StatusCode.fromValue(unregisterShuffleResponse.getStatus)) {
             unregisterShuffleTime.remove(shuffleId)
@@ -1838,7 +2169,9 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
           BatchUnregisterShuffles(
             appUniqueId,
             shuffleIdsToRemove.asJava,
-            MasterClient.genRequestId()))
+            MasterClient.genRequestId(),
+            leaseEpoch,
+            leaseOwnerId))
         if (StatusCode.SUCCESS == StatusCode.fromValue(unregisterShuffleResponse.getStatus)) {
           shuffleIdsToRemove.foreach { shuffleId: Integer =>
             unregisterShuffleTime.remove(shuffleId)
@@ -1871,8 +2204,10 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
         slotsAssignMaxWorkers,
         availableStorageTypes,
         excludedWorkerSet,
-        true,
-        clientTagsExpr)
+        packed = true,
+        tagsExpr = clientTagsExpr,
+        applicationLeaseEpoch = Option(applicationLease).map(_.epoch()).getOrElse(0L),
+        applicationLeaseOwnerId = Option(applicationLease).map(_.ownerId()).getOrElse(""))
     val res = requestMasterRequestSlots(req)
     if (res.status != StatusCode.SUCCESS) {
       requestMasterRequestSlots(req)
@@ -2113,6 +2448,29 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
   // ---------------------------------------------------------------------------------------
 
   /**
+   * Bind Spark's current shuffle ID to a durable semantic recovery key before map submission.
+   * Exact replay is idempotent; changing the key in one driver is a correctness error.
+   */
+  def registerShuffleRecoveryIntent(appShuffleId: Int, recoveryKey: String): Unit = {
+    require(appShuffleId >= 0, s"appShuffleId must be non-negative: $appShuffleId")
+    require(recoveryKey != null && recoveryKey.nonEmpty, "recoveryKey must be non-empty")
+    require(
+      applicationLease != null,
+      "An application lease must be acquired before registering a recovery intent")
+    val existing = shuffleRecoveryKeys.putIfAbsent(appShuffleId, recoveryKey)
+    if (existing != null && existing != recoveryKey) {
+      throw new IllegalStateException(
+        s"Spark shuffle $appShuffleId is already bound to recovery key $existing")
+    }
+  }
+
+  private[client] def recoveryIdentity(celebornShuffleId: Int): Option[(Int, String)] = {
+    Option(celebornShuffleIdToAppShuffleIdMap.get(celebornShuffleId)).flatMap { appShuffleId =>
+      Option(shuffleRecoveryKeys.get(appShuffleId)).map(appShuffleId -> _)
+    }
+  }
+
+  /**
    * Seed the catalog for one shuffle from state captured out of a previous LifecycleManager
    * instance (almost always: a crashed driver's). Must be called before any task for
    * appShuffleId runs in this driver -- afterwards handleGetShuffleIdForApp's normal writer
@@ -2120,17 +2478,56 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
    * state this instance does not yet have (invariant A-1 -- when in doubt, do nothing rather
    * than overwrite).
    */
-  def adoptShuffle(
+  private[celeborn] def adoptShuffle(
       appShuffleId: Int,
       appShuffleIdentifier: String,
       celebornShuffleId: Int,
       numMappers: Int,
       numPartitions: Int,
       fileGroups: util.Map[Integer, util.Set[PartitionLocation]],
-      mapperAttempts: Array[Int]): Boolean = {
+      mapperAttempts: Array[Int]): Boolean = synchronized {
+    require(appShuffleId >= 0, s"adoptShuffle: appShuffleId must be non-negative: $appShuffleId")
+    require(
+      appShuffleIdentifier != null && appShuffleIdentifier.nonEmpty,
+      "adoptShuffle: appShuffleIdentifier must be non-empty")
+    require(
+      celebornShuffleId >= 0,
+      s"adoptShuffle: celebornShuffleId must be non-negative: $celebornShuffleId")
+    require(numMappers >= 0, s"adoptShuffle: numMappers must be non-negative: $numMappers")
+    require(numPartitions > 0, s"adoptShuffle: numPartitions must be positive: $numPartitions")
+    require(fileGroups != null, "adoptShuffle: fileGroups must not be null")
+    require(mapperAttempts != null, "adoptShuffle: mapperAttempts must not be null")
+    require(
+      mapperAttempts.length == numMappers,
+      s"adoptShuffle: mapperAttempts.length=${mapperAttempts.length} != numMappers=$numMappers")
+    require(
+      fileGroups.keySet().asScala.forall(id => id >= 0 && id < numPartitions),
+      s"adoptShuffle: fileGroups contains a partition outside [0, $numPartitions)")
+    require(
+      fileGroups.values().asScala.forall(locs => locs != null && !locs.contains(null)),
+      "adoptShuffle: fileGroups contains a null location set or location")
+
+    // Validate every identity collision before touching the CommitHandler. Adoption publishes
+    // state into several concurrent maps plus the handler's own catalog; a rejection after that
+    // first mutation cannot be rolled back safely. Synchronizing this method makes the validation
+    // and publication one transaction with respect to other adopters. Normal writer registration
+    // still cannot race this call by contract: callers must adopt before submitting any task for
+    // appShuffleId (documented above).
     if (shuffleIdMapping.containsKey(appShuffleId)) {
       logWarning(s"adoptShuffle: appShuffleId $appShuffleId already registered in this " +
         s"LifecycleManager, refusing to clobber it with adopted state")
+      return false
+    }
+    val hasReverseMapping = celebornShuffleIdToAppShuffleIdMap.containsKey(celebornShuffleId)
+    if (hasReverseMapping || registeredShuffle.contains(celebornShuffleId)) {
+      val owner =
+        if (hasReverseMapping) {
+          s"for appShuffleId ${celebornShuffleIdToAppShuffleIdMap.get(celebornShuffleId)}"
+        } else {
+          "in this LifecycleManager"
+        }
+      logWarning(s"adoptShuffle: celebornShuffleId $celebornShuffleId is already registered " +
+        s"$owner, refusing to alias it to appShuffleId $appShuffleId")
       return false
     }
     commitManager.getCommitHandler(celebornShuffleId).adoptCommittedShuffle(
@@ -2157,10 +2554,164 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
     true
   }
 
+  /**
+   * Adopt a completed reduce shuffle using only Celeborn-authoritative physical metadata.
+   *
+   * The caller supplies semantic identity and a digest previously persisted with its recovery
+   * anchor. Physical locations and mapper attempts are fetched from the current lease owner's
+   * master and can never be injected by the anchor store. A successful return means every exact
+   * worker file was validated and the shuffle is readable through this LifecycleManager.
+   */
+  def adoptShuffleFromCatalog(
+      appShuffleId: Int,
+      appShuffleIdentifier: String,
+      recoveryKey: String,
+      numMappers: Int,
+      numPartitions: Int,
+      expectedCatalogSha256: Array[Byte] = Array.emptyByteArray,
+      probeTimeoutMs: Int = 2000): Option[LifecycleManager.AdoptedShuffleCatalog] = synchronized {
+    require(
+      recoveryKey != null && recoveryKey.nonEmpty,
+      "adoptShuffleFromCatalog: recoveryKey must be non-empty")
+    require(
+      expectedCatalogSha256 != null &&
+        (expectedCatalogSha256.isEmpty || expectedCatalogSha256.length == 32),
+      "adoptShuffleFromCatalog: expectedCatalogSha256 must be empty or contain 32 bytes")
+    Option(shuffleRecoveryKeys.get(appShuffleId)).foreach { existing =>
+      require(
+        existing == recoveryKey,
+        s"Spark shuffle $appShuffleId is already bound to recovery key $existing")
+    }
+
+    val response = getCommittedShuffleCatalog(recoveryKey)
+    if (!response.getSuccess) {
+      throw new IllegalStateException(
+        s"Unable to determine whether a committed catalog exists for recovery key " +
+          s"$recoveryKey: ${response.getMessage}")
+    }
+    if (!response.getFound) {
+      logWarning(s"No committed catalog exists for recovery key $recoveryKey: " +
+        response.getMessage)
+      return None
+    }
+
+    val catalogBytes = response.getCatalog.toByteArray
+    val actualDigest = MessageDigest.getInstance("SHA-256").digest(catalogBytes)
+    if (response.getSha256.size() != 32 ||
+        !MessageDigest.isEqual(actualDigest, response.getSha256.toByteArray) ||
+        (expectedCatalogSha256.nonEmpty &&
+          !MessageDigest.isEqual(actualDigest, expectedCatalogSha256))) {
+      throw new IllegalStateException(
+        s"Committed catalog digest mismatch for recovery key $recoveryKey")
+    }
+
+    val catalog = try {
+      PbCommittedShuffleCatalog.parseFrom(catalogBytes)
+    } catch {
+      case e: com.google.protobuf.InvalidProtocolBufferException =>
+        throw new IllegalStateException(
+          s"Malformed committed catalog for recovery key $recoveryKey", e)
+    }
+    val celebornShuffleId = catalog.getShuffleId
+    if (catalog.getAppId != appUniqueId ||
+        catalog.getRecoveryKey != recoveryKey ||
+        catalog.getNumMappers != numMappers ||
+        catalog.getNumPartitions != numPartitions ||
+        catalog.getMapperAttemptsCount != numMappers ||
+        catalog.getMapperAttemptsList.asScala.exists(_.intValue() < 0) ||
+        catalog.getFileGroupsCount != numPartitions) {
+      throw new IllegalStateException(
+        s"Committed catalog identity or dimensions do not match recovery key $recoveryKey " +
+          s"(original Spark shuffle ${catalog.getAppShuffleId}, current Spark shuffle " +
+          s"$appShuffleId, Celeborn shuffle $celebornShuffleId)")
+    }
+
+    val fileGroups = new util.HashMap[Integer, util.Set[PartitionLocation]](numPartitions)
+    val bytesByPartitionId = Array.fill[Long](numPartitions)(0L)
+    catalog.getFileGroupsMap.asScala.foreach { case (partitionId, locationSet) =>
+      if (partitionId < 0 || partitionId >= numPartitions ||
+          locationSet.getLocationsCount == 0) {
+        throw new IllegalStateException(
+          s"Committed catalog contains an invalid reducer $partitionId for $recoveryKey")
+      }
+      val locations = new util.HashSet[PartitionLocation](locationSet.getLocationsCount)
+      locationSet.getLocationsList.asScala.foreach { pbLocation =>
+        if (pbLocation.getId != partitionId || !pbLocation.hasStorageInfo ||
+            pbLocation.getStorageInfo.getFileSize < 0) {
+          throw new IllegalStateException(
+            s"Committed catalog contains an invalid location for reducer $partitionId " +
+              s"for $recoveryKey")
+        }
+        locations.add(PbSerDeUtils.fromPbPartitionLocation(pbLocation))
+        try {
+          bytesByPartitionId(partitionId) = Math.addExact(
+            bytesByPartitionId(partitionId),
+            pbLocation.getStorageInfo.getFileSize)
+        } catch {
+          case _: ArithmeticException =>
+            throw new IllegalStateException(
+              s"Committed size overflows Long for reducer $partitionId for $recoveryKey")
+        }
+      }
+      fileGroups.put(partitionId, locations)
+    }
+    if ((0 until numPartitions).exists(id => !fileGroups.containsKey(id))) {
+      throw new IllegalStateException(
+        s"Committed catalog is missing a reducer for recovery key $recoveryKey")
+    }
+    if (!confirmAlive(Map(celebornShuffleId -> fileGroups), probeTimeoutMs)
+        .contains(celebornShuffleId)) {
+      throw new IllegalStateException(
+        s"Committed files are missing or unverifiable for recovery key $recoveryKey")
+    }
+
+    val mapperAttempts = catalog.getMapperAttemptsList.asScala.map(_.intValue()).toArray
+    if (!adoptShuffle(
+        appShuffleId,
+        appShuffleIdentifier,
+        celebornShuffleId,
+        numMappers,
+        numPartitions,
+        fileGroups,
+        mapperAttempts)) {
+      throw new IllegalStateException(
+        s"Driver-local state conflicts with committed recovery key $recoveryKey")
+    } else {
+      shuffleRecoveryKeys.put(appShuffleId, recoveryKey)
+      Some(LifecycleManager.AdoptedShuffleCatalog(
+        celebornShuffleId,
+        bytesByPartitionId,
+        actualDigest.clone()))
+    }
+  }
+
   private def advanceShuffleIdGeneratorAtLeast(floor: Int): Unit = {
     var cur = shuffleIdGenerator.get()
     while (cur < floor && !shuffleIdGenerator.compareAndSet(cur, floor))
       cur = shuffleIdGenerator.get()
+  }
+
+  /** Remove only driver-local state installed by catalog adoption; never delete worker data. */
+  def rollbackAdoptedShuffle(appShuffleId: Int, celebornShuffleId: Int): Unit = synchronized {
+    val mappings = shuffleIdMapping.get(appShuffleId)
+    val ownsPhysicalShuffle = mappings != null &&
+      mappings.values.exists(_._1 == celebornShuffleId) &&
+      Option(celebornShuffleIdToAppShuffleIdMap.get(celebornShuffleId))
+        .contains(appShuffleId)
+    if (!ownsPhysicalShuffle) {
+      throw new IllegalStateException(
+        s"Shuffle $appShuffleId does not own adopted Celeborn shuffle $celebornShuffleId")
+    }
+    shuffleIdMapping.remove(appShuffleId)
+    celebornShuffleIdToAppShuffleIdMap.remove(celebornShuffleId)
+    registeredShuffle.remove(celebornShuffleId)
+    appShuffleDeterminateMap.remove(appShuffleId)
+    registeringShuffleRequest.remove(celebornShuffleId)
+    shuffleAllocatedWorkers.remove(celebornShuffleId)
+    latestPartitionLocation.remove(celebornShuffleId)
+    commitManager.removeExpiredShuffle(celebornShuffleId)
+    changePartitionManager.removeExpiredShuffle(celebornShuffleId)
+    invalidatedBroadcastGetReducerFileGroupResponse(celebornShuffleId)
   }
 
   /**
@@ -2168,33 +2719,55 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
    * anchor store is never the authority, Celeborn is. A store TTL can outlive the data it
    * describes -- an application-heartbeat timeout reclaims worker-held files independently of
    * whatever the store still remembers -- so before adopting anything this instance did not
-   * itself commit, probe every worker the captured file groups reference and require it to
-   * still be reachable. This is a coarser signal than "does this exact file still exist"
-   * (that would need a dedicated worker RPC this prototype does not add), but it is a real,
-   * live network check against the actual cluster rather than a trust-the-store stub, and it
-   * is exactly what distinguishes "Celeborn reclaimed the app" (reject, rung 7) from "the app
-   * is still within its window" (safe to probe further down the ladder).
+   * itself commit, ask every referenced worker to validate the exact committed file name, byte
+   * length, and chunk-offset catalog captured in the anchor. Validation is read-only and does not
+   * extend retention; adoption remains a separate operation after every worker has agreed.
    */
   def confirmAlive(
       celebornShuffleIdsWithFileGroups: Map[Int, util.Map[Integer, util.Set[PartitionLocation]]],
       probeTimeoutMs: Int = 2000): Set[Int] = {
-    def workerReachable(loc: PartitionLocation): Boolean = {
-      val sock = new Socket()
+    require(probeTimeoutMs > 0, s"probeTimeoutMs must be positive: $probeTimeoutMs")
+    val timeout = new RpcTimeout(probeTimeoutMs.millis, "celeborn.resume.validation.timeout")
+
+    def validateWorker(
+        shuffleId: Int,
+        host: String,
+        rpcPort: Int,
+        locations: Seq[PartitionLocation]): Boolean = {
       try {
-        sock.connect(new InetSocketAddress(loc.getHost, loc.getFetchPort), probeTimeoutMs)
-        true
+        val endpoint = workerRpcEnvInUse.setupEndpointRefByAddr(
+          RpcEndpointAddress(RpcAddress(host, rpcPort), WORKER_EP))
+        val files = locations.map { location =>
+          val storage = location.getStorageInfo
+          require(
+            storage != null,
+            s"Shuffle $shuffleId location ${location.getUniqueId} has no committed storage info")
+          ShuffleFileDescriptor(
+            location.getFileName,
+            storage.getFileSize,
+            Option(storage.getChunkOffsets).getOrElse(util.Collections.emptyList()))
+        }.asJava
+        endpoint.askSync[ValidateShuffleFilesResponse](
+          ValidateShuffleFiles(appUniqueId, shuffleId, files),
+          timeout).status == StatusCode.SUCCESS
       } catch {
-        case _: Exception => false
-      } finally {
-        try sock.close()
-        catch { case _: Exception => () }
+        case e: Exception =>
+          logWarning(
+            s"Exact recovery validation failed for shuffle $shuffleId on " +
+              s"worker $host:$rpcPort",
+            e)
+          false
       }
     }
+
     celebornShuffleIdsWithFileGroups.collect {
-      case (shuffleId, fileGroups)
-          if !fileGroups.isEmpty &&
-            fileGroups.values().asScala.forall(locs =>
-              !locs.isEmpty && locs.asScala.exists(workerReachable)) =>
+      case (shuffleId, fileGroups) if !fileGroups.isEmpty && {
+            val locations = fileGroups.values().asScala.flatMap(_.asScala).toSeq
+            locations.nonEmpty && locations.groupBy(loc => (loc.getHost, loc.getRpcPort)).forall {
+              case ((host, rpcPort), workerLocations) =>
+                validateWorker(shuffleId, host, rpcPort, workerLocations)
+            }
+          } =>
         shuffleId
     }.toSet
   }

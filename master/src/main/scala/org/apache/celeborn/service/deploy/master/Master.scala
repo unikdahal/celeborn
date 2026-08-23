@@ -19,6 +19,7 @@ package org.apache.celeborn.service.deploy.master
 
 import java.io.IOException
 import java.net.BindException
+import java.security.MessageDigest
 import java.util
 import java.util.{Map => JMap}
 import java.util.Collections
@@ -28,6 +29,7 @@ import java.util.function.ToLongFunction
 
 import scala.collection.JavaConverters._
 import scala.util.Random
+import scala.util.control.NonFatal
 
 import com.google.common.annotations.VisibleForTesting
 import org.apache.commons.lang3.function.FailableConsumer
@@ -51,7 +53,7 @@ import org.apache.celeborn.common.protocol.message.StatusCode
 import org.apache.celeborn.common.quota.ResourceConsumption
 import org.apache.celeborn.common.rpc._
 import org.apache.celeborn.common.rpc.{RpcSecurityContextBuilder, ServerSaslContextBuilder}
-import org.apache.celeborn.common.util.{CelebornExitKind, CelebornHadoopUtils, JavaUtils, PbSerDeUtils, ShutdownHookManager, SignalUtils, ThreadUtils, Utils}
+import org.apache.celeborn.common.util.{CelebornExitKind, CelebornHadoopUtils, JavaUtils, PbSerDeUtils, RecoveryTaskCommitUtils, ShutdownHookManager, SignalUtils, ThreadUtils, Utils}
 import org.apache.celeborn.server.common.{HttpService, Service}
 import org.apache.celeborn.service.deploy.master.audit.ShuffleAuditLogger
 import org.apache.celeborn.service.deploy.master.clustermeta.SingleMasterMetaManager
@@ -189,6 +191,9 @@ private[celeborn] class Master(
   // Config constants
   private val workerHeartbeatTimeoutMs = conf.workerHeartbeatTimeout
   private val appHeartbeatTimeoutMs = conf.appHeartbeatTimeoutMs
+  private val applicationLeaseMaxDurationMs = conf.applicationLeaseMaxDurationMs
+  private val recoveryTaskCommitMaxPayloadSize = conf.recoveryTaskCommitMaxPayloadSize
+  private val recoveryTaskCommitMaxBatchResponseSize = conf.recoveryTaskCommitMaxBatchResponseSize
   private val workerUnavailableInfoExpireTimeoutMs = conf.workerUnavailableInfoExpireTimeout
   private val allowWorkerHostPattern = conf.allowWorkerHostPattern
   private val denyWorkerHostPattern = conf.denyWorkerHostPattern
@@ -477,23 +482,27 @@ private[celeborn] class Master(
           applicationFallbackCounts,
           needCheckedWorkerList,
           requestId,
-          shouldResponse) =>
+          shouldResponse,
+          applicationLeaseEpoch,
+          applicationLeaseOwnerId) =>
       logDebug(s"Received heartbeat from app $appId")
       checkAuth(context, appId)
       executeWithLeaderChecker(
-        context,
-        handleHeartbeatFromApplication(
-          context,
-          appId,
-          totalWritten,
-          fileCount,
-          shuffleCount,
-          applicationCount,
-          shuffleFallbackCounts,
-          applicationFallbackCounts,
-          needCheckedWorkerList,
-          requestId,
-          shouldResponse))
+        context, {
+          checkApplicationLease(appId, applicationLeaseEpoch, applicationLeaseOwnerId)
+          handleHeartbeatFromApplication(
+            context,
+            appId,
+            totalWritten,
+            fileCount,
+            shuffleCount,
+            applicationCount,
+            shuffleFallbackCounts,
+            applicationFallbackCounts,
+            needCheckedWorkerList,
+            requestId,
+            shouldResponse)
+        })
 
     case pbRegisterWorker: PbRegisterWorker =>
       val requestId = pbRegisterWorker.getRequestId
@@ -527,10 +536,29 @@ private[celeborn] class Master(
           userResourceConsumption,
           requestId))
 
-    case requestSlots @ RequestSlots(applicationId, _, _, _, _, _, _, _, _, _, _, _, _) =>
+    case requestSlots @ RequestSlots(
+          applicationId,
+          _,
+          _,
+          _,
+          _,
+          _,
+          _,
+          _,
+          _,
+          _,
+          _,
+          _,
+          _,
+          applicationLeaseEpoch,
+          applicationLeaseOwnerId) =>
       logTrace(s"Received RequestSlots request $requestSlots.")
       checkAuth(context, applicationId)
-      executeWithLeaderChecker(context, handleRequestSlots(context, requestSlots))
+      executeWithLeaderChecker(
+        context, {
+          checkApplicationLease(applicationId, applicationLeaseEpoch, applicationLeaseOwnerId)
+          handleRequestSlots(context, requestSlots)
+        })
 
     case pb: PbBatchUnregisterShuffles =>
       val applicationId = pb.getAppId
@@ -539,8 +567,13 @@ private[celeborn] class Master(
       logDebug(s"Received BatchUnregisterShuffle request $requestId, $applicationId, $shuffleIds")
       checkAuth(context, applicationId)
       executeWithLeaderChecker(
-        context,
-        batchHandleUnregisterShuffles(context, applicationId, shuffleIds, requestId))
+        context, {
+          checkApplicationLease(
+            applicationId,
+            pb.getApplicationLeaseEpoch,
+            pb.getApplicationLeaseOwnerId)
+          batchHandleUnregisterShuffles(context, applicationId, shuffleIds, requestId)
+        })
 
     case pb: PbUnregisterShuffle =>
       val applicationId = pb.getAppId
@@ -549,14 +582,23 @@ private[celeborn] class Master(
       logDebug(s"Received UnregisterShuffle request $requestId, $applicationId, $shuffleId")
       checkAuth(context, applicationId)
       executeWithLeaderChecker(
-        context,
-        handleUnregisterShuffle(context, applicationId, shuffleId, requestId))
+        context, {
+          checkApplicationLease(
+            applicationId,
+            pb.getApplicationLeaseEpoch,
+            pb.getApplicationLeaseOwnerId)
+          handleUnregisterShuffle(context, applicationId, shuffleId, requestId)
+        })
 
-    case ApplicationLost(appId, requestId) =>
+    case ApplicationLost(appId, requestId, applicationLeaseEpoch, applicationLeaseOwnerId) =>
       logDebug(
         s"Received ApplicationLost request $requestId, $appId from ${context.senderAddress}.")
       checkAuth(context, appId)
-      executeWithLeaderChecker(context, handleApplicationLost(context, appId, requestId))
+      executeWithLeaderChecker(
+        context, {
+          checkApplicationLease(appId, applicationLeaseEpoch, applicationLeaseOwnerId)
+          handleApplicationLost(context, appId, requestId)
+        })
 
     case HeartbeatFromWorker(
           host,
@@ -654,6 +696,34 @@ private[celeborn] class Master(
       checkAuth(context, pb.getAppId)
       executeWithLeaderChecker(context, handleRequestForApplicationMeta(context, pb))
 
+    case lease: PbApplicationLeaseControl =>
+      checkAuth(context, lease.getAppId)
+      executeWithLeaderChecker(context, handleApplicationLease(context, lease))
+
+    case request: PbPublishCommittedShuffleCatalog =>
+      checkAuth(context, request.getAppId)
+      executeWithLeaderChecker(context, handlePublishCommittedShuffleCatalog(context, request))
+
+    case request: PbResolveSourceRecoveryAnchor =>
+      checkAuth(context, request.getAppId)
+      executeWithLeaderChecker(context, handleResolveSourceRecoveryAnchor(context, request))
+
+    case request: PbPublishRecoveryTaskCommit =>
+      checkAuth(context, request.getAppId)
+      executeWithLeaderChecker(context, handlePublishRecoveryTaskCommit(context, request))
+
+    case request: PbGetRecoveryTaskCommit =>
+      checkAuth(context, request.getAppId)
+      executeWithLeaderChecker(context, handleGetRecoveryTaskCommit(context, request))
+
+    case request: PbBatchGetRecoveryTaskCommits =>
+      checkAuth(context, request.getAppId)
+      executeWithLeaderChecker(context, handleBatchGetRecoveryTaskCommits(context, request))
+
+    case request: PbGetCommittedShuffleCatalog =>
+      checkAuth(context, request.getAppId)
+      executeWithLeaderChecker(context, handleGetCommittedShuffleCatalog(context, request))
+
     case pb: PbRemoveWorkersUnavailableInfo =>
       val unavailableWorkers = new util.ArrayList[WorkerInfo](pb.getWorkerInfoList
         .asScala.map(PbSerDeUtils.fromPbWorkerInfo).toList.asJava)
@@ -710,9 +780,15 @@ private[celeborn] class Master(
     }
     statusSystem.appHeartbeatTime.asScala.foreach { case (appId, heartbeatTime) =>
       if (heartbeatTime < currentTime - appHeartbeatTimeoutMs) {
-        logWarning(s"Application $appId timeout, trigger applicationLost event.")
-        val requestId = MasterClient.genRequestId()
-        handleApplicationLost(null, appId, requestId)
+        val lease = statusSystem.applicationLeases.get(appId)
+        if (lease != null && currentTime < lease.expiresAtMs()) {
+          logInfo(s"Application $appId heartbeat timed out, retaining it until its recovery " +
+            s"lease expires at ${lease.expiresAtMs()}")
+        } else {
+          logWarning(s"Application $appId timeout, trigger applicationLost event.")
+          val requestId = MasterClient.genRequestId()
+          handleApplicationLost(null, appId, requestId)
+        }
       }
     }
   }
@@ -1219,6 +1295,305 @@ private[celeborn] class Master(
       requestId: String): Unit = {
     statusSystem.handleRegisterApplicationInfo(appId, userIdentifier, extraInfo, requestId)
     context.reply(OneWayMessageResponse)
+  }
+
+  private def handleApplicationLease(
+      context: RpcCallContext,
+      request: PbApplicationLeaseControl): Unit = {
+    val response = PbApplicationLeaseControlResponse.newBuilder()
+    try {
+      val nowMs = System.currentTimeMillis()
+      val currentLease = statusSystem.applicationLeases.get(request.getAppId)
+      if (!request.getRenewal && currentLease != null &&
+        currentLease.ownerId() != request.getOwnerId &&
+        nowMs < currentLease.expiresAtMs()) {
+        throw new IllegalStateException(
+          s"Application ${request.getAppId} is still leased to ${currentLease.ownerId()}")
+      }
+      if (!request.getRenewal && request.getExpectedEpoch == -1L && currentLease != null &&
+          currentLease.ownerId() == request.getOwnerId && nowMs < currentLease.expiresAtMs()) {
+        fenceApplicationWorkers(request.getAppId, currentLease)
+        response
+          .setSuccess(true)
+          .setEpoch(currentLease.epoch())
+          .setOwnerId(currentLease.ownerId())
+          .setExpiresAtMs(currentLease.expiresAtMs())
+        context.reply(response.build())
+        return
+      }
+      val expectedEpoch =
+        if (!request.getRenewal && request.getExpectedEpoch == -1L) {
+          Option(currentLease).map(_.epoch()).getOrElse(0L)
+        } else {
+          request.getExpectedEpoch
+        }
+      val newEpoch =
+        if (request.getRenewal) {
+          expectedEpoch
+        } else {
+          Math.addExact(expectedEpoch, 1L)
+        }
+      val expiresAtMs =
+        if (request.getLeaseDurationMs > 0) {
+          require(
+            request.getLeaseDurationMs <= applicationLeaseMaxDurationMs,
+            s"Application lease duration ${request.getLeaseDurationMs}ms exceeds maximum " +
+              s"${applicationLeaseMaxDurationMs}ms")
+          Math.addExact(nowMs, request.getLeaseDurationMs)
+        } else {
+          request.getExpiresAtMs
+        }
+      val lease = statusSystem.handleApplicationLease(
+        request.getAppId,
+        expectedEpoch,
+        newEpoch,
+        request.getOwnerId,
+        expiresAtMs,
+        request.getRenewal,
+        request.getRequestId)
+      fenceApplicationWorkers(request.getAppId, lease)
+      response
+        .setSuccess(true)
+        .setEpoch(lease.epoch())
+        .setOwnerId(lease.ownerId())
+        .setExpiresAtMs(lease.expiresAtMs())
+    } catch {
+      case NonFatal(e) =>
+        response.setSuccess(false).setMessage(Option(e.getMessage).getOrElse(e.getClass.getName))
+    }
+    context.reply(response.build())
+  }
+
+  private def handlePublishCommittedShuffleCatalog(
+      context: RpcCallContext,
+      request: PbPublishCommittedShuffleCatalog): Unit = {
+    val response = PbPublishCommittedShuffleCatalogResponse.newBuilder()
+    try {
+      requireValidApplicationLease(
+        request.getAppId,
+        request.getApplicationLeaseEpoch,
+        request.getApplicationLeaseOwnerId)
+      val bytes = request.getCatalog.toByteArray
+      statusSystem.handlePublishCommittedShuffleCatalog(
+        request.getAppId,
+        request.getShuffleId,
+        bytes,
+        request.getRequestId)
+      response.setSuccess(true).setSha256(
+        com.google.protobuf.ByteString.copyFrom(MessageDigest.getInstance("SHA-256").digest(bytes)))
+    } catch {
+      case NonFatal(e) =>
+        response.setSuccess(false).setMessage(Option(e.getMessage).getOrElse(e.getClass.getName))
+    }
+    context.reply(response.build())
+  }
+
+  private def handleResolveSourceRecoveryAnchor(
+      context: RpcCallContext,
+      request: PbResolveSourceRecoveryAnchor): Unit = {
+    val response = PbResolveSourceRecoveryAnchorResponse.newBuilder()
+    try {
+      requireValidApplicationLease(
+        request.getAppId,
+        request.getApplicationLeaseEpoch,
+        request.getApplicationLeaseOwnerId)
+      val anchor = statusSystem.handleResolveSourceRecoveryAnchor(
+        request.getAppId,
+        request.getRecoveryId,
+        request.getSourceId,
+        request.getCurrentAnchor,
+        request.getRequestId)
+      if (anchor == null || anchor.isEmpty) {
+        throw new IllegalStateException("Replicated source recovery anchor is empty")
+      }
+      response.setSuccess(true).setAnchor(anchor)
+    } catch {
+      case NonFatal(e) =>
+        response.setSuccess(false).setMessage(Option(e.getMessage).getOrElse(e.getClass.getName))
+    }
+    context.reply(response.build())
+  }
+
+  private def handlePublishRecoveryTaskCommit(
+      context: RpcCallContext,
+      request: PbPublishRecoveryTaskCommit): Unit = {
+    val response = PbPublishRecoveryTaskCommitResponse.newBuilder()
+    try {
+      RecoveryTaskCommitUtils.validateIdentity(
+        request.getAppId, request.getRecoveryId, request.getWriteId, request.getPartitionId)
+      RecoveryTaskCommitUtils.validatePayload(
+        request.getPayload.toByteArray,
+        request.getSha256.toByteArray,
+        recoveryTaskCommitMaxPayloadSize)
+      requireValidApplicationLease(
+        request.getAppId,
+        request.getApplicationLeaseEpoch,
+        request.getApplicationLeaseOwnerId)
+      val canonical = statusSystem.handlePublishRecoveryTaskCommit(
+        request.getAppId,
+        request.getRecoveryId,
+        request.getWriteId,
+        request.getPartitionId,
+        request.getPayload.toByteArray,
+        request.getSha256.toByteArray,
+        request.getApplicationLeaseEpoch,
+        request.getApplicationLeaseOwnerId,
+        request.getRequestId)
+      response
+        .setSuccess(true)
+        .setPayload(canonical.getPayload)
+        .setSha256(canonical.getSha256)
+        .setCanonicalDiffers(
+          !MessageDigest.isEqual(
+            request.getPayload.toByteArray,
+            canonical.getPayload.toByteArray) ||
+            !MessageDigest.isEqual(request.getSha256.toByteArray, canonical.getSha256.toByteArray))
+    } catch {
+      case NonFatal(e) =>
+        response.setSuccess(false).setMessage(Option(e.getMessage).getOrElse(e.getClass.getName))
+    }
+    context.reply(response.build())
+  }
+
+  private def handleGetRecoveryTaskCommit(
+      context: RpcCallContext,
+      request: PbGetRecoveryTaskCommit): Unit = {
+    val response = PbGetRecoveryTaskCommitResponse.newBuilder()
+    try {
+      RecoveryTaskCommitUtils.validateIdentity(
+        request.getAppId, request.getRecoveryId, request.getWriteId, request.getPartitionId)
+      requireValidApplicationLease(
+        request.getAppId,
+        request.getApplicationLeaseEpoch,
+        request.getApplicationLeaseOwnerId)
+      val record = statusSystem.getRecoveryTaskCommit(
+        request.getAppId, request.getRecoveryId, request.getWriteId, request.getPartitionId)
+      response.setSuccess(true)
+      if (record != null) {
+        response.setFound(true).setPayload(record.getPayload).setSha256(record.getSha256)
+      }
+    } catch {
+      case NonFatal(e) =>
+        response.setSuccess(false).setMessage(Option(e.getMessage).getOrElse(e.getClass.getName))
+    }
+    context.reply(response.build())
+  }
+
+  private def handleBatchGetRecoveryTaskCommits(
+      context: RpcCallContext,
+      request: PbBatchGetRecoveryTaskCommits): Unit = {
+    val response = PbBatchGetRecoveryTaskCommitsResponse.newBuilder()
+    try {
+      RecoveryTaskCommitUtils.validateIdentity(
+        request.getAppId, request.getRecoveryId, request.getWriteId, -1)
+      requireValidApplicationLease(
+        request.getAppId,
+        request.getApplicationLeaseEpoch,
+        request.getApplicationLeaseOwnerId)
+      require(request.getPartitionIdsCount > 0 && request.getPartitionIdsCount <= 1024,
+        s"Recovery task commit batch size ${request.getPartitionIdsCount} is outside [1, 1024]")
+      var responseBytes = 2L // serialized `success = true`
+      request.getPartitionIdsList.asScala.foreach { partitionId =>
+        RecoveryTaskCommitUtils.validateIdentity(
+          request.getAppId, request.getRecoveryId, request.getWriteId, partitionId)
+        val entry = PbRecoveryTaskCommitEntry.newBuilder().setPartitionId(partitionId)
+        val record = statusSystem.getRecoveryTaskCommit(
+          request.getAppId, request.getRecoveryId, request.getWriteId, partitionId)
+        if (record != null) {
+          entry.setFound(true).setPayload(record.getPayload).setSha256(record.getSha256)
+        }
+        val builtEntry = entry.build()
+        responseBytes = Math.addExact(
+          responseBytes,
+          com.google.protobuf.CodedOutputStream.computeMessageSize(2, builtEntry).toLong)
+        require(responseBytes <= recoveryTaskCommitMaxBatchResponseSize,
+          s"Recovery task commit batch response exceeds configured maximum " +
+            s"$recoveryTaskCommitMaxBatchResponseSize")
+        response.addEntries(builtEntry)
+      }
+      response.setSuccess(true)
+    } catch {
+      case NonFatal(e) =>
+        response.clearEntries().setSuccess(false)
+          .setMessage(Option(e.getMessage).getOrElse(e.getClass.getName))
+    }
+    context.reply(response.build())
+  }
+
+  private def handleGetCommittedShuffleCatalog(
+      context: RpcCallContext,
+      request: PbGetCommittedShuffleCatalog): Unit = {
+    val response = PbGetCommittedShuffleCatalogResponse.newBuilder()
+    try {
+      requireValidApplicationLease(
+        request.getAppId,
+        request.getApplicationLeaseEpoch,
+        request.getApplicationLeaseOwnerId)
+      val bytes = statusSystem.getCommittedShuffleCatalog(
+        request.getAppId,
+        request.getShuffleId,
+        request.getRecoveryKey)
+      response.setSuccess(true)
+      if (bytes != null) {
+        response
+          .setFound(true)
+          .setCatalog(bytes)
+          .setSha256(com.google.protobuf.ByteString.copyFrom(
+            MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray)))
+      }
+    } catch {
+      case NonFatal(e) =>
+        response
+          .setSuccess(false)
+          .setMessage(Option(e.getMessage).getOrElse(e.getClass.getName))
+    }
+    context.reply(response.build())
+  }
+
+  private def requireValidApplicationLease(appId: String, epoch: Long, ownerId: String): Unit = {
+    val lease = statusSystem.applicationLeases.get(appId)
+    if (lease == null || !lease.isValid(epoch, ownerId, System.currentTimeMillis())) {
+      throw new IllegalStateException(
+        s"A current application lease is required for $appId at epoch $epoch and owner $ownerId")
+    }
+  }
+
+  private def fenceApplicationWorkers(
+      appId: String,
+      lease: org.apache.celeborn.common.meta.ApplicationLease): Unit = {
+    val masterNowMs = System.currentTimeMillis()
+    val remainingDurationMs = Math.max(1L, lease.expiresAtMs() - masterNowMs)
+    val fence = FenceApplication(
+      appId,
+      lease.epoch(),
+      lease.ownerId(),
+      lease.expiresAtMs(),
+      remainingDurationMs)
+    val workerIds = statusSystem.applicationWorkers.getOrDefault(
+      appId,
+      java.util.Collections.emptySet[String]())
+    workerIds.asScala.foreach { workerId =>
+      val worker = statusSystem.workersMap.get(workerId)
+      if (worker == null) {
+        throw new IOException(s"Application $appId worker $workerId is unavailable for fencing")
+      }
+      val endpoint = rpcEnv.setupEndpointRef(
+        RpcAddress(worker.host, worker.rpcPort),
+        RpcNameConstants.WORKER_EP)
+      val result = endpoint.askSync[FenceApplicationResponse](fence)
+      if (!result.success) {
+        throw new IOException(
+          s"Worker ${worker.toUniqueId} rejected application fence: ${result.reason}")
+      }
+    }
+  }
+
+  private def checkApplicationLease(appId: String, epoch: Long, ownerId: String): Unit = {
+    val lease = statusSystem.applicationLeases.get(appId)
+    if (lease != null && !lease.isValid(epoch, ownerId, System.currentTimeMillis())) {
+      throw new IllegalStateException(
+        s"Application lease is not valid for $appId at epoch $epoch and owner $ownerId")
+    }
   }
 
   private def handleHeartbeatFromApplication(

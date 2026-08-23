@@ -31,6 +31,7 @@ import java.util.stream.Collectors;
 import scala.Option;
 import scala.Tuple2;
 
+import com.google.protobuf.ByteString;
 import com.google.common.annotations.VisibleForTesting;
 import org.apache.commons.lang3.tuple.ImmutablePair;
 import org.apache.commons.lang3.tuple.Pair;
@@ -42,6 +43,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.celeborn.common.CelebornConf;
 import org.apache.celeborn.common.identity.UserIdentifier;
 import org.apache.celeborn.common.meta.ApplicationInfo;
+import org.apache.celeborn.common.meta.ApplicationLease;
 import org.apache.celeborn.common.meta.ApplicationMeta;
 import org.apache.celeborn.common.meta.DiskInfo;
 import org.apache.celeborn.common.meta.WorkerEventInfo;
@@ -54,6 +56,7 @@ import org.apache.celeborn.common.quota.ResourceConsumption;
 import org.apache.celeborn.common.rpc.RpcEnv;
 import org.apache.celeborn.common.util.JavaUtils;
 import org.apache.celeborn.common.util.PbSerDeUtils;
+import org.apache.celeborn.common.util.RecoveryTaskCommitUtils;
 import org.apache.celeborn.common.util.Utils;
 import org.apache.celeborn.common.util.WorkerStatusUtils;
 
@@ -78,6 +81,24 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
   public final ConcurrentHashMap<WorkerInfo, WorkerEventInfo> workerEventInfos =
       JavaUtils.newConcurrentHashMap();
   public final ConcurrentHashMap<String, Long> appHeartbeatTime = JavaUtils.newConcurrentHashMap();
+  public final ConcurrentHashMap<String, ApplicationLease> applicationLeases =
+      JavaUtils.newConcurrentHashMap();
+  public final ConcurrentHashMap<String, Set<String>> applicationWorkers =
+      JavaUtils.newConcurrentHashMap();
+  public final ConcurrentHashMap<String, ByteString> committedShuffleCatalogs =
+      JavaUtils.newConcurrentHashMap();
+  public final ConcurrentHashMap<String, Integer> committedShuffleCatalogIndex =
+      JavaUtils.newConcurrentHashMap();
+  public final ConcurrentHashMap<String, String> sourceRecoveryAnchors =
+      JavaUtils.newConcurrentHashMap();
+  public final ConcurrentHashMap<String, ByteString> recoveryTaskCommits =
+      JavaUtils.newConcurrentHashMap();
+  private final AtomicLong recoveryTaskCommitInlineBytes = new AtomicLong();
+  private final AtomicLong recoveryTaskCommitInlineRecords = new AtomicLong();
+  private final ConcurrentHashMap<String, AtomicLong> recoveryTaskCommitBytesByRecovery =
+      JavaUtils.newConcurrentHashMap();
+  private final ConcurrentHashMap<String, AtomicLong> recoveryTaskCommitRecordsByRecovery =
+      JavaUtils.newConcurrentHashMap();
   public final Set<WorkerInfo> excludedWorkers = ConcurrentHashMap.newKeySet();
   public final Set<WorkerInfo> manuallyExcludedWorkers = ConcurrentHashMap.newKeySet();
   public final Set<WorkerInfo> shutdownWorkers = ConcurrentHashMap.newKeySet();
@@ -112,6 +133,384 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
         appId, new ApplicationInfo(appId, userIdentifier, extraInfo, System.currentTimeMillis()));
   }
 
+  /**
+   * Applies one lease transition replicated by the master metadata system.
+   *
+   * <p>The expected epoch is a compare-and-set fence. Replaying the exact transition is idempotent;
+   * any competing or stale transition fails closed.
+   */
+  public synchronized ApplicationLease updateApplicationLeaseMeta(
+      String appId, long expectedEpoch, long newEpoch, String ownerId, long expiresAtMs) {
+    if (appId == null || appId.isEmpty()) {
+      throw new IllegalArgumentException("Application id must be non-empty");
+    }
+    if (expectedEpoch < 0 || newEpoch != Math.addExact(expectedEpoch, 1L)) {
+      throw new IllegalArgumentException("Application lease epoch must advance by exactly one");
+    }
+
+    ApplicationLease requested = new ApplicationLease(newEpoch, ownerId, expiresAtMs);
+    ApplicationLease current = applicationLeases.get(appId);
+    if (requested.equals(current)) {
+      return current;
+    }
+    long currentEpoch = current == null ? 0L : current.epoch();
+    if (currentEpoch != expectedEpoch) {
+      throw new IllegalStateException(
+          "Stale application lease transition for "
+              + appId
+              + ": expected epoch "
+              + expectedEpoch
+              + ", current epoch "
+              + currentEpoch);
+    }
+    applicationLeases.put(appId, requested);
+    return requested;
+  }
+
+  /**
+   * Renews a lease without changing its fencing epoch.
+   *
+   * <p>The epoch and owner must still identify the current lease. Exact replay is idempotent, and
+   * expiry may only move forward. This method intentionally does not consult wall-clock time so
+   * that every metadata replica applies the same deterministic transition.
+   */
+  public synchronized ApplicationLease renewApplicationLeaseMeta(
+      String appId, long epoch, String ownerId, long expiresAtMs) {
+    if (appId == null || appId.isEmpty()) {
+      throw new IllegalArgumentException("Application id must be non-empty");
+    }
+    ApplicationLease current = applicationLeases.get(appId);
+    if (current == null || current.epoch() != epoch || !current.ownerId().equals(ownerId)) {
+      throw new IllegalStateException(
+          "Application lease renewal is fenced for " + appId + " at epoch " + epoch);
+    }
+    if (expiresAtMs < current.expiresAtMs()) {
+      throw new IllegalArgumentException("Application lease renewal cannot shorten expiry");
+    }
+    if (expiresAtMs == current.expiresAtMs()) {
+      return current;
+    }
+    ApplicationLease renewed = new ApplicationLease(epoch, ownerId, expiresAtMs);
+    applicationLeases.put(appId, renewed);
+    return renewed;
+  }
+
+  public boolean hasValidApplicationLease(String appId, long epoch, String ownerId, long nowMs) {
+    ApplicationLease lease = applicationLeases.get(appId);
+    return lease != null && lease.isValid(epoch, ownerId, nowMs);
+  }
+
+  /** State-machine-order fencing check; wall-clock expiry is checked by the RPC leader. */
+  public void requireApplicationLeaseOwnerMeta(String appId, long epoch, String ownerId) {
+    ApplicationLease lease = applicationLeases.get(appId);
+    if (lease == null || lease.epoch() != epoch || !lease.ownerId().equals(ownerId)) {
+      throw new IllegalStateException(
+          "Stale application lease owner for " + appId + " at epoch " + epoch);
+    }
+  }
+
+  /**
+   * Installs one fully committed shuffle catalog. Exact replay is idempotent; replacement is not.
+   */
+  public synchronized void updateCommittedShuffleCatalogMeta(
+      String appId, int shuffleId, byte[] catalogBytes) {
+    if (appId == null || appId.isEmpty() || shuffleId < 0 || catalogBytes == null) {
+      throw new IllegalArgumentException("Invalid committed shuffle catalog identity or payload");
+    }
+    org.apache.celeborn.common.protocol.PbCommittedShuffleCatalog catalog;
+    try {
+      catalog =
+          org.apache.celeborn.common.protocol.PbCommittedShuffleCatalog.parseFrom(catalogBytes);
+    } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+      throw new IllegalArgumentException("Malformed committed shuffle catalog", e);
+    }
+    if (!appId.equals(catalog.getAppId()) || shuffleId != catalog.getShuffleId()) {
+      throw new IllegalArgumentException("Committed shuffle catalog identity does not match key");
+    }
+    if (!catalog.getRecoveryKey().isEmpty() && catalog.getAppShuffleId() < 0) {
+      throw new IllegalArgumentException("Committed shuffle catalog has an invalid Spark identity");
+    }
+    if (catalog.getNumMappers() < 0
+        || catalog.getNumPartitions() <= 0
+        || catalog.getMapperAttemptsCount() != catalog.getNumMappers()
+        || catalog.getMapperAttemptsList().stream().anyMatch(attempt -> attempt < 0)
+        || catalog.getFileGroupsCount() != catalog.getNumPartitions()
+        || catalog.getFileGroupsMap().keySet().stream()
+            .anyMatch(id -> id < 0 || id >= catalog.getNumPartitions())
+        || catalog.getFileGroupsMap().entrySet().stream()
+            .anyMatch(
+                entry ->
+                    entry.getValue().getLocationsCount() == 0
+                        || entry.getValue().getLocationsList().stream()
+                            .anyMatch(location -> location.getId() != entry.getKey()))) {
+      throw new IllegalArgumentException("Committed shuffle catalog has inconsistent dimensions");
+    }
+    ByteString requested = ByteString.copyFrom(catalogBytes);
+    String key = Utils.makeShuffleKey(appId, shuffleId);
+    ByteString current = committedShuffleCatalogs.get(key);
+    if (current != null && !current.equals(requested)) {
+      throw new IllegalStateException("Committed shuffle catalog is immutable for " + key);
+    }
+    String recoveryIndexKey = null;
+    if (!catalog.getRecoveryKey().isEmpty()) {
+      recoveryIndexKey = committedCatalogRecoveryKey(appId, catalog.getRecoveryKey());
+      Integer indexedShuffle = committedShuffleCatalogIndex.get(recoveryIndexKey);
+      if (indexedShuffle != null && indexedShuffle != shuffleId) {
+        throw new IllegalStateException(
+            "Committed recovery key is immutable for " + catalog.getRecoveryKey());
+      }
+    }
+    committedShuffleCatalogs.putIfAbsent(key, requested);
+    if (recoveryIndexKey != null) {
+      committedShuffleCatalogIndex.putIfAbsent(recoveryIndexKey, shuffleId);
+    }
+  }
+
+  public ByteString getCommittedShuffleCatalog(String appId, int shuffleId, String recoveryKey) {
+    int resolvedShuffleId = shuffleId;
+    if (recoveryKey != null && !recoveryKey.isEmpty()) {
+      Integer indexed =
+          committedShuffleCatalogIndex.get(committedCatalogRecoveryKey(appId, recoveryKey));
+      if (indexed == null) {
+        return null;
+      }
+      resolvedShuffleId = indexed;
+    }
+    return committedShuffleCatalogs.get(Utils.makeShuffleKey(appId, resolvedShuffleId));
+  }
+
+  private static String committedCatalogRecoveryKey(String appId, String recoveryKey) {
+    return appId.length() + ":" + appId + recoveryKey;
+  }
+
+  public String updateSourceRecoveryAnchorMeta(
+      String appId, String recoveryId, String sourceId, String currentAnchor) {
+    if (appId == null
+        || appId.isEmpty()
+        || recoveryId == null
+        || recoveryId.isEmpty()
+        || sourceId == null
+        || sourceId.isEmpty()
+        || currentAnchor == null
+        || currentAnchor.isEmpty()) {
+      throw new IllegalArgumentException("Invalid source recovery anchor identity or value");
+    }
+    String key = sourceRecoveryAnchorKey(appId, recoveryId, sourceId);
+    String stored = sourceRecoveryAnchors.putIfAbsent(key, currentAnchor);
+    return stored != null ? stored : currentAnchor;
+  }
+
+  public String getSourceRecoveryAnchor(String appId, String recoveryId, String sourceId) {
+    return sourceRecoveryAnchors.get(sourceRecoveryAnchorKey(appId, recoveryId, sourceId));
+  }
+
+  private static String sourceRecoveryAnchorKey(
+      String appId, String recoveryId, String sourceId) {
+    return appId.length()
+        + ":"
+        + appId
+        + recoveryId.length()
+        + ":"
+        + recoveryId
+        + sourceId;
+  }
+
+  /**
+   * Publishes an immutable commit for one logical output task and returns the canonical winner.
+   * An exact retry is idempotent; a speculative attempt with different bytes loses without
+   * replacing the first durable value.
+   */
+  public synchronized org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord
+      updateRecoveryTaskCommitMeta(
+          String appId,
+          String recoveryId,
+          String writeId,
+          int partitionId,
+          byte[] payload,
+          byte[] sha256) {
+    validateRecoveryTaskCommitIdentity(appId, recoveryId, writeId, partitionId);
+    RecoveryTaskCommitUtils.validatePayload(
+        payload, sha256, conf.recoveryTaskCommitMaxPayloadSize());
+    org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord candidate =
+        org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord.newBuilder()
+            .setAppId(appId)
+            .setRecoveryId(recoveryId)
+            .setWriteId(writeId)
+            .setPartitionId(partitionId)
+            .setPayload(ByteString.copyFrom(payload))
+            .setSha256(ByteString.copyFrom(sha256))
+            .build();
+    String key = recoveryTaskCommitKey(appId, recoveryId, writeId, partitionId);
+    ByteString stored = recoveryTaskCommits.get(key);
+    if (stored != null) {
+      return parseAndValidateRecoveryTaskCommit(stored, key);
+    }
+    ByteString serialized = candidate.toByteString();
+    reserveRecoveryTaskCommitCapacity(appId, recoveryId, serialized.size(), 1L);
+    recoveryTaskCommits.put(key, serialized);
+    return candidate;
+  }
+
+  public synchronized org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord
+      getRecoveryTaskCommit(
+      String appId, String recoveryId, String writeId, int partitionId) {
+    validateRecoveryTaskCommitIdentity(appId, recoveryId, writeId, partitionId);
+    String key = recoveryTaskCommitKey(appId, recoveryId, writeId, partitionId);
+    ByteString stored = recoveryTaskCommits.get(key);
+    return stored == null ? null : parseAndValidateRecoveryTaskCommit(stored, key);
+  }
+
+  private static void validateRecoveryTaskCommitIdentity(
+      String appId, String recoveryId, String writeId, int partitionId) {
+    RecoveryTaskCommitUtils.validateIdentity(appId, recoveryId, writeId, partitionId);
+  }
+
+  private static String recoveryTaskCommitKey(
+      String appId, String recoveryId, String writeId, int partitionId) {
+    return appId.length() + ":" + appId
+        + recoveryId.length() + ":" + recoveryId
+        + writeId.length() + ":" + writeId
+        + partitionId;
+  }
+
+  private static String recoveryTaskCommitRecoveryKey(String appId, String recoveryId) {
+    return appId.length() + ":" + appId + recoveryId.length() + ":" + recoveryId;
+  }
+
+  private void reserveRecoveryTaskCommitCapacity(
+      String appId, String recoveryId, long bytes, long records) {
+    String recoveryKey = recoveryTaskCommitRecoveryKey(appId, recoveryId);
+    AtomicLong currentRecoveryBytes = recoveryTaskCommitBytesByRecovery.get(recoveryKey);
+    AtomicLong currentRecoveryRecords = recoveryTaskCommitRecordsByRecovery.get(recoveryKey);
+    long recoveryBytes = currentRecoveryBytes == null ? 0L : currentRecoveryBytes.get();
+    long recoveryRecords = currentRecoveryRecords == null ? 0L : currentRecoveryRecords.get();
+    long newRecoveryBytes = Math.addExact(recoveryBytes, bytes);
+    long newRecoveryRecords = Math.addExact(recoveryRecords, records);
+    long newGlobalBytes = Math.addExact(recoveryTaskCommitInlineBytes.get(), bytes);
+    long newGlobalRecords = Math.addExact(recoveryTaskCommitInlineRecords.get(), records);
+    if (newRecoveryBytes > conf.recoveryTaskCommitMaxInlineBytesPerRecovery()
+        || newRecoveryRecords > conf.recoveryTaskCommitMaxInlineRecordsPerRecovery()
+        || newGlobalBytes > conf.recoveryTaskCommitMaxInlineBytesGlobal()
+        || newGlobalRecords > conf.recoveryTaskCommitMaxInlineRecordsGlobal()) {
+      throw new IllegalStateException(
+          "Recovery task commit inline metadata capacity exceeded; use blob-backed storage");
+    }
+    recoveryTaskCommitBytesByRecovery
+        .computeIfAbsent(recoveryKey, ignored -> new AtomicLong())
+        .set(newRecoveryBytes);
+    recoveryTaskCommitRecordsByRecovery
+        .computeIfAbsent(recoveryKey, ignored -> new AtomicLong())
+        .set(newRecoveryRecords);
+    recoveryTaskCommitInlineBytes.set(newGlobalBytes);
+    recoveryTaskCommitInlineRecords.set(newGlobalRecords);
+  }
+
+  private void releaseRecoveryTaskCommitCapacity(
+      org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord record, int bytes) {
+    String recoveryKey = recoveryTaskCommitRecoveryKey(record.getAppId(), record.getRecoveryId());
+    recoveryTaskCommitInlineBytes.addAndGet(-bytes);
+    recoveryTaskCommitInlineRecords.decrementAndGet();
+    recoveryTaskCommitBytesByRecovery.computeIfPresent(
+        recoveryKey,
+        (ignored, value) -> value.addAndGet(-bytes) == 0 ? null : value);
+    recoveryTaskCommitRecordsByRecovery.computeIfPresent(
+        recoveryKey,
+        (ignored, value) -> value.decrementAndGet() == 0 ? null : value);
+  }
+
+  @VisibleForTesting
+  public long recoveryTaskCommitInlineBytes() {
+    return recoveryTaskCommitInlineBytes.get();
+  }
+
+  @VisibleForTesting
+  public long recoveryTaskCommitInlineRecords() {
+    return recoveryTaskCommitInlineRecords.get();
+  }
+
+  @VisibleForTesting
+  public int recoveryTaskCommitRecoveryBuckets() {
+    if (recoveryTaskCommitBytesByRecovery.size() != recoveryTaskCommitRecordsByRecovery.size()) {
+      throw new IllegalStateException("Recovery task commit capacity indexes are inconsistent");
+    }
+    return recoveryTaskCommitBytesByRecovery.size();
+  }
+
+  private org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord
+      parseAndValidateRecoveryTaskCommit(ByteString bytes, String expectedKey) {
+    try {
+      org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord record =
+          org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord.parseFrom(bytes);
+      validateRecoveryTaskCommitIdentity(
+          record.getAppId(), record.getRecoveryId(), record.getWriteId(), record.getPartitionId());
+      if (!expectedKey.equals(
+          recoveryTaskCommitKey(
+              record.getAppId(),
+              record.getRecoveryId(),
+              record.getWriteId(),
+              record.getPartitionId()))) {
+        throw new IllegalStateException("Corrupt recovery task commit metadata for " + expectedKey);
+      }
+      RecoveryTaskCommitUtils.validatePayload(
+          record.getPayload().toByteArray(),
+          record.getSha256().toByteArray(),
+          conf.recoveryTaskCommitMaxPayloadSize());
+      return record;
+    } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+      throw new IllegalStateException(
+          "Malformed recovery task commit metadata for " + expectedKey, e);
+    }
+  }
+
+  private RecoveryTaskCommitSnapshotState validateRecoveryTaskCommitSnapshot(
+      Map<String, ByteString> records) {
+    Map<String, Long> bytesByRecovery = new HashMap<>();
+    Map<String, Long> recordsByRecovery = new HashMap<>();
+    long totalBytes = 0L;
+    long totalRecords = 0L;
+    for (Map.Entry<String, ByteString> entry : records.entrySet()) {
+      org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord record =
+          parseAndValidateRecoveryTaskCommit(entry.getValue(), entry.getKey());
+      String recoveryKey =
+          recoveryTaskCommitRecoveryKey(record.getAppId(), record.getRecoveryId());
+      long recoveryBytes =
+          Math.addExact(bytesByRecovery.getOrDefault(recoveryKey, 0L), entry.getValue().size());
+      long recoveryRecords =
+          Math.addExact(recordsByRecovery.getOrDefault(recoveryKey, 0L), 1L);
+      totalBytes = Math.addExact(totalBytes, entry.getValue().size());
+      totalRecords = Math.addExact(totalRecords, 1L);
+      if (recoveryBytes > conf.recoveryTaskCommitMaxInlineBytesPerRecovery()
+          || recoveryRecords > conf.recoveryTaskCommitMaxInlineRecordsPerRecovery()
+          || totalBytes > conf.recoveryTaskCommitMaxInlineBytesGlobal()
+          || totalRecords > conf.recoveryTaskCommitMaxInlineRecordsGlobal()) {
+        throw new IllegalStateException(
+            "Recovery task commit snapshot exceeds configured inline metadata capacity");
+      }
+      bytesByRecovery.put(recoveryKey, recoveryBytes);
+      recordsByRecovery.put(recoveryKey, recoveryRecords);
+    }
+    return new RecoveryTaskCommitSnapshotState(
+        bytesByRecovery, recordsByRecovery, totalBytes, totalRecords);
+  }
+
+  private static final class RecoveryTaskCommitSnapshotState {
+    private final Map<String, Long> bytesByRecovery;
+    private final Map<String, Long> recordsByRecovery;
+    private final long totalBytes;
+    private final long totalRecords;
+
+    private RecoveryTaskCommitSnapshotState(
+        Map<String, Long> bytesByRecovery,
+        Map<String, Long> recordsByRecovery,
+        long totalBytes,
+        long totalRecords) {
+      this.bytesByRecovery = bytesByRecovery;
+      this.recordsByRecovery = recordsByRecovery;
+      this.totalBytes = totalBytes;
+      this.totalRecords = totalRecords;
+    }
+  }
+
   public void updateRequestSlotsMeta(
       String shuffleKey, String hostName, Map<String, Map<String, Integer>> workerWithAllocations) {
     Tuple2<String, Object> appIdShuffleId = Utils.splitShuffleKey(shuffleKey);
@@ -120,6 +519,9 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
         .add((Integer) appIdShuffleId._2);
 
     String appId = appIdShuffleId._1;
+    applicationWorkers
+        .computeIfAbsent(appId, ignored -> ConcurrentHashMap.newKeySet())
+        .addAll(workerWithAllocations.keySet());
     appHeartbeatTime.compute(
         appId,
         (applicationId, oldTimestamp) -> {
@@ -179,11 +581,36 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
     addFallbackCounts(this.applicationFallbackCounts, applicationFallbackCounts);
   }
 
-  public void updateAppLostMeta(String appId) {
+  public synchronized void updateAppLostMeta(String appId) {
     registeredAppAndShuffles.remove(appId);
     appHeartbeatTime.remove(appId);
     applicationMetas.remove(appId);
     applicationInfos.remove(appId);
+    applicationWorkers.remove(appId);
+    committedShuffleCatalogs.entrySet().removeIf(
+        entry -> {
+          try {
+            return appId.equals(
+                org.apache.celeborn.common.protocol.PbCommittedShuffleCatalog.parseFrom(
+                        entry.getValue())
+                    .getAppId());
+          } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+            throw new IllegalStateException("Malformed committed catalog in master state", e);
+          }
+        });
+    String recoveryIndexPrefix = appId.length() + ":" + appId;
+    committedShuffleCatalogIndex.keySet().removeIf(key -> key.startsWith(recoveryIndexPrefix));
+    sourceRecoveryAnchors.keySet().removeIf(key -> key.startsWith(recoveryIndexPrefix));
+    recoveryTaskCommits.entrySet().removeIf(
+        entry -> {
+          if (entry.getKey().startsWith(recoveryIndexPrefix)) {
+            releaseRecoveryTaskCommitCapacity(
+                parseAndValidateRecoveryTaskCommit(entry.getValue(), entry.getKey()),
+                entry.getValue().size());
+            return true;
+          }
+          return false;
+        });
   }
 
   @VisibleForTesting
@@ -394,7 +821,7 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
    * @param file
    * @throws IOException
    */
-  public void writeMetaInfoToFile(File file) throws IOException, RuntimeException {
+  public synchronized void writeMetaInfoToFile(File file) throws IOException, RuntimeException {
     byte[] snapshotBytes =
         PbSerDeUtils.toPbSnapshotMetaInfo(
                 estimatedPartitionSize,
@@ -404,6 +831,11 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
                 manuallyExcludedWorkers,
                 workerLostEvents,
                 appHeartbeatTime,
+                applicationLeases,
+                applicationWorkers,
+                committedShuffleCatalogs,
+                sourceRecoveryAnchors,
+                recoveryTaskCommits,
                 new HashSet(workersMap.values()),
                 partitionTotalWritten.sum(),
                 partitionTotalFileCount.sum(),
@@ -427,9 +859,13 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
    * @param file
    * @throws IOException
    */
-  public void restoreMetaFromFile(File file) throws IOException {
+  public synchronized void restoreMetaFromFile(File file) throws IOException {
     try (BufferedInputStream in = new BufferedInputStream(new FileInputStream(file))) {
       PbSnapshotMetaInfo snapshotMetaInfo = PbSnapshotMetaInfo.parseFrom(in);
+      // Validate task-commit identities, checksums, keys, and all aggregate limits before clearing
+      // live state. A corrupt or oversized snapshot must not leave a partially restored catalog.
+      RecoveryTaskCommitSnapshotState taskCommitState =
+          validateRecoveryTaskCommitSnapshot(snapshotMetaInfo.getRecoveryTaskCommitsMap());
       cleanUpState();
 
       estimatedPartitionSize = snapshotMetaInfo.getEstimatedPartitionSize();
@@ -454,6 +890,45 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
               .map(PbSerDeUtils::fromPbWorkerInfo)
               .collect(Collectors.toSet()));
       appHeartbeatTime.putAll(snapshotMetaInfo.getAppHeartbeatTimeMap());
+      snapshotMetaInfo
+          .getApplicationLeasesMap()
+          .forEach(
+              (appId, lease) ->
+                  applicationLeases.put(
+                      appId,
+                      new ApplicationLease(
+                          lease.getEpoch(), lease.getOwnerId(), lease.getExpiresAtMs())));
+      snapshotMetaInfo
+          .getApplicationWorkersMap()
+          .forEach(
+              (appId, workerIds) -> {
+                Set<String> restored = ConcurrentHashMap.newKeySet(workerIds.getWorkerIdsCount());
+                restored.addAll(workerIds.getWorkerIdsList());
+                applicationWorkers.put(appId, restored);
+              });
+      committedShuffleCatalogs.putAll(snapshotMetaInfo.getCommittedShuffleCatalogsMap());
+      sourceRecoveryAnchors.putAll(snapshotMetaInfo.getSourceRecoveryAnchorsMap());
+      recoveryTaskCommits.putAll(snapshotMetaInfo.getRecoveryTaskCommitsMap());
+      taskCommitState.bytesByRecovery.forEach(
+          (key, value) -> recoveryTaskCommitBytesByRecovery.put(key, new AtomicLong(value)));
+      taskCommitState.recordsByRecovery.forEach(
+          (key, value) -> recoveryTaskCommitRecordsByRecovery.put(key, new AtomicLong(value)));
+      recoveryTaskCommitInlineBytes.set(taskCommitState.totalBytes);
+      recoveryTaskCommitInlineRecords.set(taskCommitState.totalRecords);
+      committedShuffleCatalogs.values().forEach(
+          bytes -> {
+            try {
+              org.apache.celeborn.common.protocol.PbCommittedShuffleCatalog catalog =
+                  org.apache.celeborn.common.protocol.PbCommittedShuffleCatalog.parseFrom(bytes);
+              if (!catalog.getRecoveryKey().isEmpty()) {
+                committedShuffleCatalogIndex.put(
+                    committedCatalogRecoveryKey(catalog.getAppId(), catalog.getRecoveryKey()),
+                    catalog.getShuffleId());
+              }
+            } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+              throw new IllegalStateException("Snapshot contains a malformed committed catalog", e);
+            }
+          });
 
       registeredAppAndShuffles.forEach(
           (appId, shuffleId) -> {
@@ -552,6 +1027,16 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
     availableWorkers.clear();
     lostWorkers.clear();
     appHeartbeatTime.clear();
+    applicationLeases.clear();
+    applicationWorkers.clear();
+    committedShuffleCatalogs.clear();
+    committedShuffleCatalogIndex.clear();
+    sourceRecoveryAnchors.clear();
+    recoveryTaskCommits.clear();
+    recoveryTaskCommitInlineBytes.set(0L);
+    recoveryTaskCommitInlineRecords.set(0L);
+    recoveryTaskCommitBytesByRecovery.clear();
+    recoveryTaskCommitRecordsByRecovery.clear();
     excludedWorkers.clear();
     shutdownWorkers.clear();
     decommissionWorkers.clear();

@@ -28,6 +28,7 @@ import org.apache.commons.lang3.StringUtils
 import org.apache.celeborn.common.CelebornConf
 import org.apache.celeborn.common.client.MasterClient
 import org.apache.celeborn.common.internal.Logging
+import org.apache.celeborn.common.meta.ApplicationLease
 import org.apache.celeborn.common.protocol.PbReviseLostShufflesResponse
 import org.apache.celeborn.common.protocol.message.ControlMessages.{ApplicationLost, ApplicationLostResponse, CheckQuotaResponse, HeartbeatFromApplication, HeartbeatFromApplicationResponse, ReviseLostShuffles, ZERO_UUID}
 import org.apache.celeborn.common.protocol.message.StatusCode
@@ -42,6 +43,7 @@ class ApplicationHeartbeater(
         (Long, Long, Map[String, java.lang.Long], Map[String, java.lang.Long])),
     workerStatusTracker: WorkerStatusTracker,
     registeredShuffles: ConcurrentHashMap.KeySetView[Int, java.lang.Boolean],
+    applicationLease: () => ApplicationLease,
     cancelAllActiveStages: String => Unit) extends Logging {
 
   private var stopped = false
@@ -74,6 +76,7 @@ class ApplicationHeartbeater(
               s"application count: $tmpApplicationCount, application fallback counts: $tmpApplicationFallbackCounts")
             // UserResourceConsumption and DiskInfo are eliminated from WorkerInfo
             // during serialization of HeartbeatFromApplication
+            val lease = applicationLease()
             val appHeartbeat =
               HeartbeatFromApplication(
                 appId,
@@ -85,7 +88,9 @@ class ApplicationHeartbeater(
                 tmpApplicationFallbackCounts.asJava,
                 workerStatusTracker.getNeedCheckedWorkers().toList.asJava,
                 ZERO_UUID,
-                true)
+                shouldResponse = true,
+                applicationLeaseEpoch = Option(lease).map(_.epoch()).getOrElse(0L),
+                applicationLeaseOwnerId = Option(lease).map(_.ownerId()).getOrElse(""))
             val response = requestHeartbeat(appHeartbeat)
             if (response.statusCode == StatusCode.SUCCESS) {
               logDebug("Successfully send app heartbeat.")
@@ -153,8 +158,12 @@ class ApplicationHeartbeater(
   private def unregisterApplication(): Unit = {
     try {
       // Then unregister Application
+      val lease = applicationLease()
       val response = masterClient.askSync[ApplicationLostResponse](
-        ApplicationLost(appId),
+        ApplicationLost(
+          appId,
+          applicationLeaseEpoch = Option(lease).map(_.epoch()).getOrElse(0L),
+          applicationLeaseOwnerId = Option(lease).map(_.ownerId()).getOrElse("")),
         classOf[ApplicationLostResponse])
       logInfo(s"Unregister Application $appId with response status: ${response.status}")
     } catch {

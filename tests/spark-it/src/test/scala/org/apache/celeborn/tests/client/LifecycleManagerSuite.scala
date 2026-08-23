@@ -26,6 +26,7 @@ import org.scalatest.time.SpanSugar.convertIntToGrainOfTime
 import org.apache.celeborn.client.{LifecycleManager, WithShuffleClientSuite}
 import org.apache.celeborn.common.CelebornConf
 import org.apache.celeborn.common.identity.UserIdentifier
+import org.apache.celeborn.common.protocol.PartitionLocation
 import org.apache.celeborn.common.protocol.message.StatusCode
 import org.apache.celeborn.service.deploy.MiniClusterFeature
 
@@ -123,6 +124,63 @@ class LifecycleManagerSuite extends WithShuffleClientSuite with MiniClusterFeatu
       assert(appInfo.userIdentifier == userIdentifier)
       assert(appInfo.extraInfo.get("k1") == "v1")
       assert(appInfo.registrationTime > 0 && appInfo.registrationTime < System.currentTimeMillis())
+    }
+  }
+
+  test("driver resume adoption rejects malformed and conflicting shuffle identities") {
+    val lifecycleManager = new LifecycleManager(s"$APP-resume-adoption", celebornConf)
+    val fileGroups = new util.HashMap[Integer, util.Set[PartitionLocation]]()
+
+    try {
+      val malformed = intercept[IllegalArgumentException] {
+        lifecycleManager.adoptShuffle(
+          appShuffleId = 10,
+          appShuffleIdentifier = "10-0-0",
+          celebornShuffleId = 100,
+          numMappers = 1,
+          numPartitions = 1,
+          fileGroups = fileGroups,
+          mapperAttempts = Array.emptyIntArray)
+      }
+      assert(malformed.getMessage.contains("mapperAttempts.length=0 != numMappers=1"))
+      assert(!lifecycleManager.getShuffleIdMapping.containsKey(10))
+
+      assert(lifecycleManager.adoptShuffle(
+        appShuffleId = 10,
+        appShuffleIdentifier = "10-0-0",
+        celebornShuffleId = 100,
+        numMappers = 1,
+        numPartitions = 1,
+        fileGroups = fileGroups,
+        mapperAttempts = Array(0)))
+
+      // The Spark identity is already owned. A second anchor must not replace its catalog.
+      assert(!lifecycleManager.adoptShuffle(
+        appShuffleId = 10,
+        appShuffleIdentifier = "10-1-0",
+        celebornShuffleId = 101,
+        numMappers = 1,
+        numPartitions = 1,
+        fileGroups = fileGroups,
+        mapperAttempts = Array(0)))
+
+      // The Celeborn identity is already owned. Aliasing it to a different Spark shuffle would
+      // make reads for two logical shuffles address the same physical files.
+      assert(!lifecycleManager.adoptShuffle(
+        appShuffleId = 11,
+        appShuffleIdentifier = "11-0-0",
+        celebornShuffleId = 100,
+        numMappers = 1,
+        numPartitions = 1,
+        fileGroups = fileGroups,
+        mapperAttempts = Array(0)))
+
+      val adopted = lifecycleManager.getShuffleIdMapping.get(10)
+      assert(adopted.size == 1)
+      assert(adopted("10-0-0") == ((100, true)))
+      assert(!lifecycleManager.getShuffleIdMapping.containsKey(11))
+    } finally {
+      lifecycleManager.stop()
     }
   }
 

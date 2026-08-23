@@ -959,6 +959,18 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
     get(CLIENT_SHUFFLE_DYNAMIC_RESOURCE_ENABLED)
   def clientShuffleDynamicResourceFactor: Double = get(CLIENT_SHUFFLE_DYNAMIC_RESOURCE_FACTOR)
   def appHeartbeatTimeoutMs: Long = get(APPLICATION_HEARTBEAT_TIMEOUT)
+  def applicationLeaseMaxDurationMs: Long = get(APPLICATION_LEASE_MAX_DURATION)
+  def recoveryTaskCommitMaxPayloadSize: Long = get(RECOVERY_TASK_COMMIT_MAX_PAYLOAD_SIZE)
+  def recoveryTaskCommitMaxBatchResponseSize: Long =
+    get(RECOVERY_TASK_COMMIT_MAX_BATCH_RESPONSE_SIZE)
+  def recoveryTaskCommitMaxInlineBytesPerRecovery: Long =
+    get(RECOVERY_TASK_COMMIT_MAX_INLINE_BYTES_PER_RECOVERY)
+  def recoveryTaskCommitMaxInlineRecordsPerRecovery: Long =
+    get(RECOVERY_TASK_COMMIT_MAX_INLINE_RECORDS_PER_RECOVERY)
+  def recoveryTaskCommitMaxInlineBytesGlobal: Long =
+    get(RECOVERY_TASK_COMMIT_MAX_INLINE_BYTES_GLOBAL)
+  def recoveryTaskCommitMaxInlineRecordsGlobal: Long =
+    get(RECOVERY_TASK_COMMIT_MAX_INLINE_RECORDS_GLOBAL)
   def dfsExpireDirsTimeoutMS: Long = get(DFS_EXPIRE_DIRS_TIMEOUT)
   def appHeartbeatIntervalMs: Long = get(APPLICATION_HEARTBEAT_INTERVAL)
   def applicationUnregisterEnabled: Boolean = get(APPLICATION_UNREGISTER_ENABLED)
@@ -2534,6 +2546,74 @@ object CelebornConf extends Logging {
       .doc("Application heartbeat timeout.")
       .timeConf(TimeUnit.MILLISECONDS)
       .createWithDefaultString("300s")
+
+  val APPLICATION_LEASE_MAX_DURATION: ConfigEntry[Long] =
+    buildConf("celeborn.master.applicationLease.maxDuration")
+      .categories("master")
+      .version("1.0.0")
+      .doc("Maximum duration accepted for a driver-recovery application lease.")
+      .timeConf(TimeUnit.MILLISECONDS)
+      .checkValue(_ > 0, "Application lease maximum duration must be positive")
+      .createWithDefaultString("24h")
+
+  val RECOVERY_TASK_COMMIT_MAX_PAYLOAD_SIZE: ConfigEntry[Long] =
+    buildConf("celeborn.master.recovery.taskCommit.maxPayloadSize")
+      .categories("master")
+      .version("1.0.0")
+      .doc("Maximum inline payload accepted for one immutable recovery task commit. " +
+        "The bound protects Raft logs, master heap, and snapshots; larger envelopes require " +
+        "a durable blob-backed record codec.")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(value => value > 0 && value <= 16 * 1024 * 1024,
+        "Recovery task commit maximum payload must be between 1 byte and 16 MiB")
+      .createWithDefaultString("1m")
+
+  val RECOVERY_TASK_COMMIT_MAX_BATCH_RESPONSE_SIZE: ConfigEntry[Long] =
+    buildConf("celeborn.master.recovery.taskCommit.maxBatchResponseSize")
+      .categories("master")
+      .version("1.0.0")
+      .doc("Maximum serialized protobuf response bytes returned by one recovery task commit " +
+        "batch lookup, including entry framing, digests, payloads, and authoritative misses.")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(value => value > 0 && value <= 64 * 1024 * 1024,
+        "Recovery task commit batch response must be between 1 byte and 64 MiB")
+      .createWithDefaultString("16m")
+
+  val RECOVERY_TASK_COMMIT_MAX_INLINE_BYTES_PER_RECOVERY: ConfigEntry[Long] =
+    buildConf("celeborn.master.recovery.taskCommit.maxInlineBytesPerRecovery")
+      .categories("master")
+      .version("1.0.0")
+      .doc("Maximum serialized inline task-commit bytes retained for one recovery execution.")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(_ > 0, "Per-recovery inline byte bound must be positive")
+      .createWithDefaultString("256m")
+
+  val RECOVERY_TASK_COMMIT_MAX_INLINE_RECORDS_PER_RECOVERY: ConfigEntry[Long] =
+    buildConf("celeborn.master.recovery.taskCommit.maxInlineRecordsPerRecovery")
+      .categories("master")
+      .version("1.0.0")
+      .doc("Maximum number of inline task-commit records retained for one recovery execution.")
+      .longConf
+      .checkValue(_ > 0, "Per-recovery inline record bound must be positive")
+      .createWithDefault(200000L)
+
+  val RECOVERY_TASK_COMMIT_MAX_INLINE_BYTES_GLOBAL: ConfigEntry[Long] =
+    buildConf("celeborn.master.recovery.taskCommit.maxInlineBytesGlobal")
+      .categories("master")
+      .version("1.0.0")
+      .doc("Maximum serialized inline task-commit bytes retained by a master cluster.")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(_ > 0, "Global inline byte bound must be positive")
+      .createWithDefaultString("512m")
+
+  val RECOVERY_TASK_COMMIT_MAX_INLINE_RECORDS_GLOBAL: ConfigEntry[Long] =
+    buildConf("celeborn.master.recovery.taskCommit.maxInlineRecordsGlobal")
+      .categories("master")
+      .version("1.0.0")
+      .doc("Maximum number of inline task-commit records retained by a master cluster.")
+      .longConf
+      .checkValue(_ > 0, "Global inline record bound must be positive")
+      .createWithDefault(1000000L)
 
   val DFS_EXPIRE_DIRS_TIMEOUT: ConfigEntry[Long] =
     buildConf("celeborn.master.dfs.expireDirs.timeout")

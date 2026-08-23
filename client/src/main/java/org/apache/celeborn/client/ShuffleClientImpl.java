@@ -1878,6 +1878,94 @@ public class ShuffleClientImpl extends ShuffleClient {
     return true;
   }
 
+  @Override
+  public PbPublishRecoveryTaskCommitResponse publishRecoveryTaskCommit(
+      String recoveryId, String writeId, int partitionId, byte[] payload, byte[] sha256)
+      throws IOException {
+    RecoveryTaskCommitUtils.validateIdentity(appUniqueId, recoveryId, writeId, partitionId);
+    RecoveryTaskCommitUtils.validatePayload(
+        payload, sha256, conf.recoveryTaskCommitMaxPayloadSize());
+    if (lifecycleManagerRef == null) {
+      throw new CelebornIOException("Driver LifecycleManager endpoint is unavailable");
+    }
+    PbPublishRecoveryTaskCommitResponse response =
+        lifecycleManagerRef.askSync(
+            PbPublishRecoveryTaskCommit.newBuilder()
+                .setAppId(appUniqueId)
+                .setRecoveryId(recoveryId)
+                .setWriteId(writeId)
+                .setPartitionId(partitionId)
+                .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
+                .setSha256(com.google.protobuf.ByteString.copyFrom(sha256))
+                .build(),
+            rpcMaxRetries,
+            rpcRetryWait,
+            ClassTag$.MODULE$.apply(PbPublishRecoveryTaskCommitResponse.class));
+    if (!response.getSuccess()) {
+      throw new CelebornIOException(
+          "Recovery task commit publication failed: " + response.getMessage());
+    }
+    return response;
+  }
+
+  @Override
+  public PbGetRecoveryTaskCommitResponse getRecoveryTaskCommit(
+      String recoveryId, String writeId, int partitionId) throws IOException {
+    RecoveryTaskCommitUtils.validateIdentity(appUniqueId, recoveryId, writeId, partitionId);
+    if (lifecycleManagerRef == null) {
+      throw new CelebornIOException("Driver LifecycleManager endpoint is unavailable");
+    }
+    PbGetRecoveryTaskCommitResponse response =
+        lifecycleManagerRef.askSync(
+            PbGetRecoveryTaskCommit.newBuilder()
+                .setAppId(appUniqueId)
+                .setRecoveryId(recoveryId)
+                .setWriteId(writeId)
+                .setPartitionId(partitionId)
+                .build(),
+            rpcMaxRetries,
+            rpcRetryWait,
+            ClassTag$.MODULE$.apply(PbGetRecoveryTaskCommitResponse.class));
+    if (!response.getSuccess()) {
+      throw new CelebornIOException("Recovery task commit lookup failed: " + response.getMessage());
+    }
+    return response;
+  }
+
+  @Override
+  public PbBatchGetRecoveryTaskCommitsResponse batchGetRecoveryTaskCommits(
+      String recoveryId, String writeId, List<Integer> partitionIds) throws IOException {
+    RecoveryTaskCommitUtils.validateIdentity(appUniqueId, recoveryId, writeId, -1);
+    if (partitionIds == null || partitionIds.isEmpty() || partitionIds.size() > 1024) {
+      throw new IllegalArgumentException("partitionIds size must be within [1, 1024]");
+    }
+    for (Integer partitionId : partitionIds) {
+      if (partitionId == null) {
+        throw new IllegalArgumentException("partitionIds must not contain null");
+      }
+      RecoveryTaskCommitUtils.validateIdentity(appUniqueId, recoveryId, writeId, partitionId);
+    }
+    if (lifecycleManagerRef == null) {
+      throw new CelebornIOException("Driver LifecycleManager endpoint is unavailable");
+    }
+    PbBatchGetRecoveryTaskCommitsResponse response =
+        lifecycleManagerRef.askSync(
+            PbBatchGetRecoveryTaskCommits.newBuilder()
+                .setAppId(appUniqueId)
+                .setRecoveryId(recoveryId)
+                .setWriteId(writeId)
+                .addAllPartitionIds(partitionIds)
+                .build(),
+            rpcMaxRetries,
+            rpcRetryWait,
+            ClassTag$.MODULE$.apply(PbBatchGetRecoveryTaskCommitsResponse.class));
+    if (!response.getSuccess()) {
+      throw new CelebornIOException(
+          "Recovery task commit batch lookup failed: " + response.getMessage());
+    }
+    return response;
+  }
+
   protected Tuple3<ReduceFileGroups, String, Exception> loadFileGroupInternal(
       int shuffleId, boolean isSegmentGranularityVisible) {
     long getReducerFileGroupStartTime = System.nanoTime();

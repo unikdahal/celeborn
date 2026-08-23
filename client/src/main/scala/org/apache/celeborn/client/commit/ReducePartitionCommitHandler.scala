@@ -36,12 +36,12 @@ import org.apache.celeborn.common.{CelebornConf, CommitMetadata}
 import org.apache.celeborn.common.internal.Logging
 import org.apache.celeborn.common.meta.ShufflePartitionLocationInfo
 import org.apache.celeborn.common.network.protocol.SerdeVersion
-import org.apache.celeborn.common.protocol.{PartitionLocation, PartitionType, PbGetStageEndResponse}
+import org.apache.celeborn.common.protocol.{PartitionLocation, PartitionType, PbCommittedShuffleCatalog, PbGetStageEndResponse, PbPartitionLocationSet}
 import org.apache.celeborn.common.protocol.message.ControlMessages.GetReducerFileGroupResponse
 import org.apache.celeborn.common.protocol.message.StatusCode
 import org.apache.celeborn.common.rpc.RpcCallContext
 import org.apache.celeborn.common.rpc.netty.{LocalNettyRpcCallContext, RemoteNettyRpcCallContext}
-import org.apache.celeborn.common.util.JavaUtils
+import org.apache.celeborn.common.util.{JavaUtils, PbSerDeUtils}
 import org.apache.celeborn.common.write.LocationPushFailedBatches
 
 /**
@@ -69,6 +69,8 @@ class ReducePartitionCommitHandler(
     commitRetryScheduler)
   with Logging {
 
+  override protected def currentApplicationLease = lifecycleManager.currentApplicationLease
+
   class MultiSerdeVersionRpcContext(val ctx: RpcCallContext, val serdeVersion: SerdeVersion) {}
 
   private val getReducerFileGroupRequest =
@@ -77,6 +79,7 @@ class ReducePartitionCommitHandler(
   private val stageEndShuffleSet = ConcurrentHashMap.newKeySet[Int]()
   private val inProcessStageEndShuffleSet = ConcurrentHashMap.newKeySet[Int]()
   private val shuffleMapperAttempts = JavaUtils.newConcurrentHashMap[Int, Array[Int]]()
+  private val shuffleNumPartitions = JavaUtils.newConcurrentHashMap[Int, Int]()
   // TODO: Move this to native Int -> Int Map
   private val shuffleToCompletedMappers = JavaUtils.newConcurrentHashMap[Int, Int]()
   private val shuffleIdLocks = JavaUtils.newConcurrentHashMap[Int, Object]()
@@ -185,6 +188,7 @@ class ReducePartitionCommitHandler(
     stageEndShuffleSet.remove(shuffleId)
     inProcessStageEndShuffleSet.remove(shuffleId)
     shuffleMapperAttempts.remove(shuffleId)
+    shuffleNumPartitions.remove(shuffleId)
     shuffleToCompletedMappers.remove(shuffleId)
     shuffleIdLocks.remove(shuffleId)
     commitMetadataForReducer.remove(shuffleId)
@@ -212,21 +216,60 @@ class ReducePartitionCommitHandler(
 
     // ask allLocations workers holding partitions to commit files
     val allocatedWorkers = shuffleAllocatedWorkers.get(shuffleId)
-    val (dataLost, commitFailedWorkers) = handleFinalCommitFiles(shuffleId, allocatedWorkers)
-    recordWorkerFailure(commitFailedWorkers)
-    // reply
-    if (!dataLost) {
-      logInfo(s"Succeed to handle stageEnd for $shuffleId.")
-      // record in stageEndShuffleSet
-      setStageEnd(shuffleId)
-    } else {
-      logError(s"Failed to handle stageEnd for $shuffleId, lost file!")
-      dataLostShuffleSet.add(shuffleId)
-      // record in stageEndShuffleSet
-      setStageEnd(shuffleId)
+    try {
+      val (dataLost, commitFailedWorkers) = handleFinalCommitFiles(shuffleId, allocatedWorkers)
+      recordWorkerFailure(commitFailedWorkers)
+      // A catalog is resumable only after every worker commit succeeded and data-loss validation
+      // passed. Publishing is part of StageEnd: if the replicated master write fails, leave the
+      // stage unfinished so a retry can replay the exact immutable catalog.
+      if (!dataLost) {
+        publishCommittedCatalog(shuffleId)
+        logInfo(s"Succeed to handle stageEnd for $shuffleId.")
+        setStageEnd(shuffleId)
+      } else {
+        logError(s"Failed to handle stageEnd for $shuffleId, lost file!")
+        dataLostShuffleSet.add(shuffleId)
+        setStageEnd(shuffleId)
+      }
+      true
+    } finally {
+      inProcessStageEndShuffleSet.remove(shuffleId)
     }
-    inProcessStageEndShuffleSet.remove(shuffleId)
-    true
+  }
+
+  private def publishCommittedCatalog(shuffleId: Int): Unit = {
+    // Legacy applications that have not enabled lease-based resumability retain their existing
+    // behavior. A resumable application always owns a lease and therefore must publish or fail
+    // StageEnd; it can never silently fall back to an anchor-authored physical catalog.
+    if (currentApplicationLease == null) return
+    val attempts = shuffleMapperAttempts.get(shuffleId)
+    val groups = reducerFileGroupsMap.get(shuffleId)
+    if (attempts == null || groups == null) {
+      throw new IllegalStateException(s"Committed state missing for shuffle $shuffleId")
+    }
+    val catalog = PbCommittedShuffleCatalog.newBuilder()
+      .setAppId(appUniqueId)
+      .setShuffleId(shuffleId)
+      .setNumMappers(attempts.length)
+      .setNumPartitions(shuffleNumPartitions.get(shuffleId))
+      .addAllMapperAttempts(attempts.map(Int.box).toSeq.asJava)
+    lifecycleManager.recoveryIdentity(shuffleId).foreach { case (appShuffleId, recoveryKey) =>
+      catalog.setAppShuffleId(appShuffleId).setRecoveryKey(recoveryKey)
+    }
+    groups.asScala.toSeq.sortBy(_._1).foreach { case (partitionId, locations) =>
+      val locationSet = PbPartitionLocationSet.newBuilder()
+      locations.asScala.toSeq
+        .sortBy(location => (location.getUniqueId, location.getMode.mode()))
+        .foreach { location =>
+          locationSet.addLocations(PbSerDeUtils.toPbPartitionLocation(location))
+        }
+      catalog.putFileGroups(partitionId, locationSet.build())
+    }
+    val response = lifecycleManager.publishCommittedShuffleCatalog(shuffleId, catalog.build())
+    if (!response.getSuccess) {
+      throw new IllegalStateException(
+        s"Master rejected committed catalog for shuffle $shuffleId: ${response.getMessage}")
+    }
   }
 
   private def handleFinalCommitFiles(
@@ -384,6 +427,7 @@ class ReducePartitionCommitHandler(
       isSegmentGranularityVisible: Boolean,
       numPartitions: Int): Unit = {
     super.registerShuffle(shuffleId, numMappers, isSegmentGranularityVisible, numPartitions)
+    shuffleNumPartitions.put(shuffleId, numPartitions)
     getReducerFileGroupRequest.put(shuffleId, new util.HashSet[MultiSerdeVersionRpcContext]())
     initMapperAttempts(shuffleId, numMappers, numPartitions)
   }

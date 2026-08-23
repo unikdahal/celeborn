@@ -42,6 +42,10 @@ enum Type {
   ReviseLostShuffles = 29;
 
   RegisterApplicationInfo = 30;
+  ApplicationLease = 31;
+  PublishCommittedShuffleCatalog = 32;
+  ResolveSourceRecoveryAnchor = 33;
+  PublishRecoveryTaskCommit = 34;
 }
 
 enum WorkerEventType {
@@ -74,7 +78,35 @@ message ResourceRequest {
   optional ReportWorkerDecommissionRequest reportWorkerDecommissionRequest = 24;
   optional BatchUnregisterShuffleRequest batchUnregisterShuffleRequest = 25;
   optional RegisterApplicationInfoRequest registerApplicationInfoRequest = 26;
+  optional ApplicationLeaseRequest applicationLeaseRequest = 27;
+  optional PublishCommittedShuffleCatalogRequest publishCommittedShuffleCatalogRequest = 28;
+  optional ResolveSourceRecoveryAnchorRequest resolveSourceRecoveryAnchorRequest = 29;
+  optional PublishRecoveryTaskCommitRequest publishRecoveryTaskCommitRequest = 30;
   optional ReviseLostShufflesRequest reviseLostShufflesRequest = 102;
+}
+
+message PublishCommittedShuffleCatalogRequest {
+  string appId = 1;
+  int32 shuffleId = 2;
+  bytes catalog = 3;
+}
+
+message ResolveSourceRecoveryAnchorRequest {
+  string appId = 1;
+  string recoveryId = 2;
+  string sourceId = 3;
+  string currentAnchor = 4;
+}
+
+message PublishRecoveryTaskCommitRequest {
+  string appId = 1;
+  string recoveryId = 2;
+  string writeId = 3;
+  int32 partitionId = 4;
+  bytes payload = 5;
+  bytes sha256 = 6;
+  int64 applicationLeaseEpoch = 7;
+  string applicationLeaseOwnerId = 8;
 }
 
 message DiskInfo {
@@ -253,4 +285,13 @@ message RegisterApplicationInfoRequest {
   string appId = 1;
   UserIdentifier userIdentifier = 2;
   map<string, string> extraInfo = 3;
+}
+
+message ApplicationLeaseRequest {
+  string appId = 1;
+  int64 expectedEpoch = 2;
+  int64 newEpoch = 3;
+  string ownerId = 4;
+  int64 expiresAtMs = 5;
+  bool renewal = 6;
 }

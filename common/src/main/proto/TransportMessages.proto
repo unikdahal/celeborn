@@ -117,6 +117,22 @@ enum MessageType {
   READ_REDUCER_PARTITION_END = 94;
   READ_REDUCER_PARTITION_END_RESPONSE = 95;
   REGISTER_APPLICATION_INFO = 96;
+  APPLICATION_LEASE_CONTROL = 97;
+  APPLICATION_LEASE_CONTROL_RESPONSE = 98;
+  FENCE_APPLICATION = 99;
+  FENCE_APPLICATION_RESPONSE = 100;
+  PUBLISH_COMMITTED_SHUFFLE_CATALOG = 101;
+  PUBLISH_COMMITTED_SHUFFLE_CATALOG_RESPONSE = 102;
+  GET_COMMITTED_SHUFFLE_CATALOG = 103;
+  GET_COMMITTED_SHUFFLE_CATALOG_RESPONSE = 104;
+  RESOLVE_SOURCE_RECOVERY_ANCHOR = 105;
+  RESOLVE_SOURCE_RECOVERY_ANCHOR_RESPONSE = 106;
+  PUBLISH_RECOVERY_TASK_COMMIT = 107;
+  PUBLISH_RECOVERY_TASK_COMMIT_RESPONSE = 108;
+  GET_RECOVERY_TASK_COMMIT = 109;
+  GET_RECOVERY_TASK_COMMIT_RESPONSE = 110;
+  BATCH_GET_RECOVERY_TASK_COMMITS = 111;
+  BATCH_GET_RECOVERY_TASK_COMMITS_RESPONSE = 112;
 }
 
 enum StreamType {
@@ -323,6 +339,8 @@ message PbRequestSlots {
   repeated PbWorkerInfo excludedWorkerSet = 12;
   bool packed = 13;
   string tagsExpr = 14;
+  int64 applicationLeaseEpoch = 15;
+  string applicationLeaseOwnerId = 16;
 }
 
 message PbSlotInfo {
@@ -447,6 +465,8 @@ message PbUnregisterShuffle {
   string appId = 1;
   int32 shuffleId = 2;
   string requestId = 3;
+  int64 applicationLeaseEpoch = 4;
+  string applicationLeaseOwnerId = 5;
 }
 
 message PbMetaUnregisterShuffle {
@@ -457,6 +477,8 @@ message PbBatchUnregisterShuffles {
   string appId = 1;
   string requestId = 2;
   repeated int32 shuffleIds = 3;
+  int64 applicationLeaseEpoch = 4;
+  string applicationLeaseOwnerId = 5;
 }
 
 message PbMetaBatchUnregisterShuffles {
@@ -475,6 +497,8 @@ message PbBatchUnregisterShuffleResponse {
 message PbApplicationLost {
   string appId = 1;
   string requestId = 2;
+  int64 applicationLeaseEpoch = 3;
+  string applicationLeaseOwnerId = 4;
 }
 
 message PbApplicationLostResponse {
@@ -501,6 +525,8 @@ message PbHeartbeatFromApplication {
   int64 applicationCount = 9;
   map<string, int64> applicationFallbackCounts = 10;
   PbHeartbeatInfo heartbeatInfo = 11;
+  int64 applicationLeaseEpoch = 12;
+  string applicationLeaseOwnerId = 13;
 }
 
 message PbHeartbeatFromApplicationResponse {
@@ -568,6 +594,8 @@ message PbCommitFiles {
   repeated int32 mapAttempts = 5;
   int64 epoch = 6;
   bool mockFailure = 7;
+  int64 applicationLeaseEpoch = 8;
+  string applicationLeaseOwnerId = 9;
 }
 
 message PbCommitFilesResponse {
@@ -588,12 +616,28 @@ message PbDestroyWorkerSlots {
   repeated string primaryLocations = 2;
   repeated string replicaLocation = 3;
   bool mockFailure = 4;
+  int64 applicationLeaseEpoch = 5;
+  string applicationLeaseOwnerId = 6;
 }
 
 message PbDestroyWorkerSlotsResponse {
   int32 status = 1;
   repeated string failedPrimaries = 2;
   repeated string failedReplicas = 3;
+}
+
+message PbFenceApplication {
+  string applicationId = 1;
+  int64 epoch = 2;
+  string ownerId = 3;
+  int64 expiresAtMs = 4;
+  // Preferred over expiresAtMs: the worker derives an expiry in its own clock domain.
+  int64 leaseDurationMs = 5;
+}
+
+message PbFenceApplicationResponse {
+  bool success = 1;
+  string reason = 2;
 }
 
 message PbCheckForWorkerTimeout {
@@ -741,6 +785,48 @@ message PbSnapshotMetaInfo {
   int64 applicationTotalCount = 20;
   map<string, int64> applicationFallbackCounts = 21;
   map<string, PbApplicationInfo> applicationInfos = 22;
+  map<string, PbApplicationLease> applicationLeases = 23;
+  map<string, PbWorkerIdSet> applicationWorkers = 24;
+  // Immutable, Celeborn-authoritative catalogs for fully committed reduce shuffles. The key is
+  // Utils.makeShuffleKey(appId, shuffleId); the value is the exact serialized
+  // PbCommittedShuffleCatalog accepted through the replicated metadata state machine.
+  map<string, bytes> committedShuffleCatalogs = 25;
+  // Immutable source versions keyed by recovery execution and stable source identity.
+  map<string, string> sourceRecoveryAnchors = 26;
+  // Immutable task commit envelopes. Keys are length-delimited application/recovery/write
+  // identities plus the logical partition id; values are serialized PbRecoveryTaskCommitRecord.
+  map<string, bytes> recoveryTaskCommits = 27;
+}
+
+message PbWorkerIdSet {
+  repeated string workerIds = 1;
+}
+
+message PbApplicationLease {
+  int64 epoch = 1;
+  string ownerId = 2;
+  int64 expiresAtMs = 3;
+}
+
+// The durable hand-off record for a completed reduce shuffle. A catalog is published only after
+// StageEnd has successfully committed every worker file. Once published it is immutable: an exact
+// byte-for-byte replay is idempotent and every differing replacement is rejected.
+message PbCommittedShuffleCatalog {
+  string appId = 1;
+  int32 shuffleId = 2;
+  int32 numMappers = 3;
+  int32 numPartitions = 4;
+  repeated int32 mapperAttempts = 5;
+  map<int32, PbPartitionLocationSet> fileGroups = 6;
+  // Optional for legacy lease users. Resumable Spark registers these semantic fields before
+  // submitting any map task, allowing a replacement driver to discover the physical shuffle
+  // even when the original driver died before its post-stage callback.
+  int32 appShuffleId = 7;
+  string recoveryKey = 8;
+}
+
+message PbPartitionLocationSet {
+  repeated PbPartitionLocation locations = 1;
 }
 
 message PbOpenStream {
@@ -903,6 +989,147 @@ message PbApplicationMetaRequest {
   string appId = 1;
 }
 
+message PbApplicationLeaseControl {
+  string appId = 1;
+  int64 expectedEpoch = 2;
+  string ownerId = 3;
+  int64 expiresAtMs = 4;
+  bool renewal = 5;
+  string requestId = 6;
+  // Preferred over expiresAtMs. The master derives the absolute expiry from its own clock.
+  int64 leaseDurationMs = 7;
+}
+
+message PbApplicationLeaseControlResponse {
+  bool success = 1;
+  int64 epoch = 2;
+  string ownerId = 3;
+  int64 expiresAtMs = 4;
+  string message = 5;
+}
+
+message PbPublishCommittedShuffleCatalog {
+  string appId = 1;
+  int32 shuffleId = 2;
+  bytes catalog = 3;
+  int64 applicationLeaseEpoch = 4;
+  string applicationLeaseOwnerId = 5;
+  string requestId = 6;
+}
+
+message PbPublishCommittedShuffleCatalogResponse {
+  bool success = 1;
+  bytes sha256 = 2;
+  string message = 3;
+}
+
+message PbGetCommittedShuffleCatalog {
+  string appId = 1;
+  int32 shuffleId = 2;
+  int64 applicationLeaseEpoch = 3;
+  string applicationLeaseOwnerId = 4;
+  // When non-empty, lookup is by the durable semantic key and shuffleId is ignored.
+  string recoveryKey = 5;
+}
+
+message PbGetCommittedShuffleCatalogResponse {
+  bool found = 1;
+  bytes catalog = 2;
+  bytes sha256 = 3;
+  string message = 4;
+  // Distinguishes an authoritative absence from lease/lookup failure.
+  bool success = 5;
+}
+
+message PbResolveSourceRecoveryAnchor {
+  string appId = 1;
+  string recoveryId = 2;
+  string sourceId = 3;
+  string currentAnchor = 4;
+  int64 applicationLeaseEpoch = 5;
+  string applicationLeaseOwnerId = 6;
+  string requestId = 7;
+}
+
+message PbResolveSourceRecoveryAnchorResponse {
+  bool success = 1;
+  string anchor = 2;
+  string message = 3;
+}
+
+// The master stores and returns this record byte-for-byte. The digest covers payload only and is
+// checked before publication, on every read, and while restoring a metadata snapshot.
+message PbRecoveryTaskCommitRecord {
+  string appId = 1;
+  string recoveryId = 2;
+  string writeId = 3;
+  // Logical output partition. -1 is the reserved write-manifest record, published before tasks.
+  int32 partitionId = 4;
+  bytes payload = 5;
+  bytes sha256 = 6;
+}
+
+message PbPublishRecoveryTaskCommit {
+  string appId = 1;
+  string recoveryId = 2;
+  string writeId = 3;
+  int32 partitionId = 4;
+  bytes payload = 5;
+  bytes sha256 = 6;
+  int64 applicationLeaseEpoch = 7;
+  string applicationLeaseOwnerId = 8;
+  string requestId = 9;
+}
+
+message PbPublishRecoveryTaskCommitResponse {
+  bool success = 1;
+  bytes payload = 2;
+  bytes sha256 = 3;
+  // True when this attempt lost first-writer-wins arbitration to different canonical bytes.
+  bool canonicalDiffers = 4;
+  string message = 5;
+}
+
+message PbGetRecoveryTaskCommit {
+  string appId = 1;
+  string recoveryId = 2;
+  string writeId = 3;
+  int32 partitionId = 4;
+  int64 applicationLeaseEpoch = 5;
+  string applicationLeaseOwnerId = 6;
+}
+
+message PbGetRecoveryTaskCommitResponse {
+  bool success = 1;
+  bool found = 2;
+  bytes payload = 3;
+  bytes sha256 = 4;
+  string message = 5;
+}
+
+message PbBatchGetRecoveryTaskCommits {
+  string appId = 1;
+  string recoveryId = 2;
+  string writeId = 3;
+  repeated int32 partitionIds = 4;
+  int64 applicationLeaseEpoch = 5;
+  string applicationLeaseOwnerId = 6;
+}
+
+message PbRecoveryTaskCommitEntry {
+  int32 partitionId = 1;
+  bool found = 2;
+  bytes payload = 3;
+  bytes sha256 = 4;
+}
+
+message PbBatchGetRecoveryTaskCommitsResponse {
+  bool success = 1;
+  // Exactly one entry per requested partition, in request order, including authoritative misses.
+  repeated PbRecoveryTaskCommitEntry entries = 2;
+  string message = 3;
+}
+
 message PbPackedPartitionLocations {
   repeated int32 ids = 1;
   repeated int32 epoches = 2;
@@ -998,6 +1225,10 @@ enum PbMetaRequestType {
   BatchUnRegisterShuffle = 28;
   ReviseLostShuffles = 29;
   RegisterApplicationInfo = 30;
+  ApplicationLease = 31;
+  PublishCommittedShuffleCatalog = 32;
+  ResolveSourceRecoveryAnchor = 33;
+  PublishRecoveryTaskCommit = 34;
 }
 
 message PbMetaRequest {
@@ -1019,13 +1250,50 @@ message PbMetaRequest {
   PbReportWorkerDecommission reportWorkerDecommissionRequest = 24;
   PbMetaBatchUnregisterShuffles batchUnregisterShuffleRequest = 25;
   PbRegisterApplicationInfo registerApplicationInfoRequest = 26;
+  PbApplicationLeaseRequest applicationLeaseRequest = 27;
+  PbPublishCommittedShuffleCatalogRequest publishCommittedShuffleCatalogRequest = 28;
+  PbResolveSourceRecoveryAnchorRequest resolveSourceRecoveryAnchorRequest = 29;
+  PbPublishRecoveryTaskCommitRequest publishRecoveryTaskCommitRequest = 30;
   PbReviseLostShuffles reviseLostShufflesRequest = 102;
+}
+
+message PbPublishCommittedShuffleCatalogRequest {
+  string appId = 1;
+  int32 shuffleId = 2;
+  bytes catalog = 3;
+}
+
+message PbResolveSourceRecoveryAnchorRequest {
+  string appId = 1;
+  string recoveryId = 2;
+  string sourceId = 3;
+  string currentAnchor = 4;
+}
+
+message PbPublishRecoveryTaskCommitRequest {
+  string appId = 1;
+  string recoveryId = 2;
+  string writeId = 3;
+  int32 partitionId = 4;
+  bytes payload = 5;
+  bytes sha256 = 6;
+  int64 applicationLeaseEpoch = 7;
+  string applicationLeaseOwnerId = 8;
 }
 
 message PbMetaRequestSlotsRequest {
   string shuffleKey = 1;
   string hostName = 2;
   map<string, PbSlotInfo> workerAllocations = 3;
+}
+
+message PbApplicationLeaseRequest {
+  string appId = 1;
+  int64 expectedEpoch = 2;
+  int64 newEpoch = 3;
+  string ownerId = 4;
+  int64 expiresAtMs = 5;
+  bool renewal = 6;
 }
 
 message PbMetaAppHeartbeatRequest {

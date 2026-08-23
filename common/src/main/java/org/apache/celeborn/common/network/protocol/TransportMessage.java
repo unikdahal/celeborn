@@ -115,6 +115,38 @@ public class TransportMessage implements Serializable {
         return (T) PbApplicationMeta.parseFrom(payload);
       case APPLICATION_META_REQUEST_VALUE:
         return (T) PbApplicationMetaRequest.parseFrom(payload);
+      case APPLICATION_LEASE_CONTROL_VALUE:
+        return (T) PbApplicationLeaseControl.parseFrom(payload);
+      case APPLICATION_LEASE_CONTROL_RESPONSE_VALUE:
+        return (T) PbApplicationLeaseControlResponse.parseFrom(payload);
+      case FENCE_APPLICATION_VALUE:
+        return (T) PbFenceApplication.parseFrom(payload);
+      case FENCE_APPLICATION_RESPONSE_VALUE:
+        return (T) PbFenceApplicationResponse.parseFrom(payload);
+      case PUBLISH_COMMITTED_SHUFFLE_CATALOG_VALUE:
+        return (T) PbPublishCommittedShuffleCatalog.parseFrom(payload);
+      case PUBLISH_COMMITTED_SHUFFLE_CATALOG_RESPONSE_VALUE:
+        return (T) PbPublishCommittedShuffleCatalogResponse.parseFrom(payload);
+      case RESOLVE_SOURCE_RECOVERY_ANCHOR_VALUE:
+        return (T) PbResolveSourceRecoveryAnchor.parseFrom(payload);
+      case RESOLVE_SOURCE_RECOVERY_ANCHOR_RESPONSE_VALUE:
+        return (T) PbResolveSourceRecoveryAnchorResponse.parseFrom(payload);
+      case GET_COMMITTED_SHUFFLE_CATALOG_VALUE:
+        return (T) PbGetCommittedShuffleCatalog.parseFrom(payload);
+      case GET_COMMITTED_SHUFFLE_CATALOG_RESPONSE_VALUE:
+        return (T) PbGetCommittedShuffleCatalogResponse.parseFrom(payload);
+      case PUBLISH_RECOVERY_TASK_COMMIT_VALUE:
+        return (T) PbPublishRecoveryTaskCommit.parseFrom(payload);
+      case PUBLISH_RECOVERY_TASK_COMMIT_RESPONSE_VALUE:
+        return (T) PbPublishRecoveryTaskCommitResponse.parseFrom(payload);
+      case GET_RECOVERY_TASK_COMMIT_VALUE:
+        return (T) PbGetRecoveryTaskCommit.parseFrom(payload);
+      case GET_RECOVERY_TASK_COMMIT_RESPONSE_VALUE:
+        return (T) PbGetRecoveryTaskCommitResponse.parseFrom(payload);
+      case BATCH_GET_RECOVERY_TASK_COMMITS_VALUE:
+        return (T) PbBatchGetRecoveryTaskCommits.parseFrom(payload);
+      case BATCH_GET_RECOVERY_TASK_COMMITS_RESPONSE_VALUE:
+        return (T) PbBatchGetRecoveryTaskCommitsResponse.parseFrom(payload);
       case BATCH_OPEN_STREAM_VALUE:
         return (T) PbOpenStreamList.parseFrom(payload);
       case BATCH_OPEN_STREAM_RESPONSE_VALUE:

@@ -42,6 +42,9 @@ import org.apache.celeborn.common.exception.CelebornIOException;
 import org.apache.celeborn.common.identity.UserIdentifier;
 import org.apache.celeborn.common.network.client.TransportClientFactory;
 import org.apache.celeborn.common.protocol.PartitionLocation;
+import org.apache.celeborn.common.protocol.PbBatchGetRecoveryTaskCommitsResponse;
+import org.apache.celeborn.common.protocol.PbGetRecoveryTaskCommitResponse;
+import org.apache.celeborn.common.protocol.PbPublishRecoveryTaskCommitResponse;
 import org.apache.celeborn.common.protocol.PbStreamHandler;
 import org.apache.celeborn.common.protocol.StorageInfo;
 import org.apache.celeborn.common.protocol.message.ControlMessages;
@@ -452,6 +455,24 @@ public abstract class ShuffleClient {
       throws IOException;
 
   public abstract boolean cleanupShuffle(int shuffleId);
+
+  /** Publishes an immutable recovery envelope through the driver's fenced LifecycleManager. */
+  public PbPublishRecoveryTaskCommitResponse publishRecoveryTaskCommit(
+      String recoveryId, String writeId, int partitionId, byte[] payload, byte[] sha256)
+      throws IOException {
+    throw new CelebornIOException("Recovery task commit publication is not supported");
+  }
+
+  /** Returns an authoritative found/absent result through the driver's fenced LifecycleManager. */
+  public PbGetRecoveryTaskCommitResponse getRecoveryTaskCommit(
+      String recoveryId, String writeId, int partitionId) throws IOException {
+    throw new CelebornIOException("Recovery task commit lookup is not supported");
+  }
+
+  public PbBatchGetRecoveryTaskCommitsResponse batchGetRecoveryTaskCommits(
+      String recoveryId, String writeId, List<Integer> partitionIds) throws IOException {
+    throw new CelebornIOException("Recovery task commit batch lookup is not supported");
+  }
 
   public abstract void shutdown();
 

@@ -34,6 +34,7 @@ import org.apache.celeborn.client.LifecycleManager.{ShuffleFailedWorkers, Shuffl
 import org.apache.celeborn.common.{CelebornConf, CommitMetadata}
 import org.apache.celeborn.common.internal.Logging
 import org.apache.celeborn.common.meta.{ShufflePartitionLocationInfo, WorkerInfo}
+import org.apache.celeborn.common.meta.ApplicationLease
 import org.apache.celeborn.common.network.protocol.SerdeVersion
 import org.apache.celeborn.common.protocol.{PartitionLocation, PartitionType}
 import org.apache.celeborn.common.protocol.message.ControlMessages.{CommitFiles, CommitFilesResponse}
@@ -86,6 +87,8 @@ abstract class CommitHandler(
   val mockCommitFilesFailure = conf.testMockCommitFilesFailure
 
   def getPartitionType(): PartitionType
+
+  protected def currentApplicationLease: ApplicationLease
 
   def getShuffleFailedBatches(): ShufflePushFailedBatches = this.shufflePushFailedBatches
 
@@ -335,6 +338,7 @@ abstract class CommitHandler(
       !CollectionUtils.isEmpty(param.primaryIds) ||
         !CollectionUtils.isEmpty(param.replicaIds)) map { param =>
       Future {
+        val lease = currentApplicationLease
         val msg = CommitFiles(
           appUniqueId,
           shuffleId,
@@ -342,7 +346,9 @@ abstract class CommitHandler(
           param.replicaIds,
           getMapperAttempts(shuffleId),
           commitEpoch.incrementAndGet(),
-          mockCommitFilesFailure)
+          mockCommitFilesFailure,
+          if (lease == null) 0L else lease.epoch(),
+          if (lease == null) "" else lease.ownerId())
         val future = commitFiles(param.worker, msg)
 
         futures.add(CommitFutureWithStatus(future, msg, param.worker, 1, startTime))

@@ -115,6 +115,63 @@ public class MetaHandler {
       WorkerStatus workerStatus;
       List<Integer> lostShuffles;
       switch (metaRequestType) {
+        case PublishRecoveryTaskCommit:
+          org.apache.celeborn.service.deploy.master.clustermeta.ResourceProtos.PublishRecoveryTaskCommitRequest
+              taskCommitRequest = request.getPublishRecoveryTaskCommitRequest();
+          metaSystem.requireApplicationLeaseOwnerMeta(
+              taskCommitRequest.getAppId(),
+              taskCommitRequest.getApplicationLeaseEpoch(),
+              taskCommitRequest.getApplicationLeaseOwnerId());
+          metaSystem.updateRecoveryTaskCommitMeta(
+              taskCommitRequest.getAppId(),
+              taskCommitRequest.getRecoveryId(),
+              taskCommitRequest.getWriteId(),
+              taskCommitRequest.getPartitionId(),
+              taskCommitRequest.getPayload().toByteArray(),
+              taskCommitRequest.getSha256().toByteArray());
+          break;
+
+        case PublishCommittedShuffleCatalog:
+          PbPublishCommittedShuffleCatalogRequest catalogRequest =
+              request.getPublishCommittedShuffleCatalogRequest();
+          metaSystem.updateCommittedShuffleCatalogMeta(
+              catalogRequest.getAppId(),
+              catalogRequest.getShuffleId(),
+              catalogRequest.getCatalog().toByteArray());
+          break;
+
+        case ResolveSourceRecoveryAnchor:
+          PbResolveSourceRecoveryAnchorRequest anchorRequest =
+              request.getResolveSourceRecoveryAnchorRequest();
+          metaSystem.updateSourceRecoveryAnchorMeta(
+              anchorRequest.getAppId(),
+              anchorRequest.getRecoveryId(),
+              anchorRequest.getSourceId(),
+              anchorRequest.getCurrentAnchor());
+          break;
+
+        case ApplicationLease:
+          PbApplicationLeaseRequest leaseRequest = request.getApplicationLeaseRequest();
+          if (leaseRequest.getRenewal()) {
+            metaSystem.renewApplicationLeaseMeta(
+                leaseRequest.getAppId(),
+                leaseRequest.getNewEpoch(),
+                leaseRequest.getOwnerId(),
+                leaseRequest.getExpiresAtMs());
+          } else {
+            metaSystem.updateApplicationLeaseMeta(
+                leaseRequest.getAppId(),
+                leaseRequest.getExpectedEpoch(),
+                leaseRequest.getNewEpoch(),
+                leaseRequest.getOwnerId(),
+                leaseRequest.getExpiresAtMs());
+          }
+          LOG.debug(
+              "Handle application lease for {} at epoch {}",
+              leaseRequest.getAppId(),
+              leaseRequest.getNewEpoch());
+          break;
+
         case ReviseLostShuffles:
           appId = request.getReviseLostShufflesRequest().getAppId();
           lostShuffles = request.getReviseLostShufflesRequest().getLostShufflesList();
@@ -126,8 +183,15 @@ public class MetaHandler {
         case RequestSlots:
           shuffleKey = request.getRequestSlotsRequest().getShuffleKey();
           LOG.debug("Handle request slots for {}", shuffleKey);
+          Map<String, Map<String, Integer>> workerAllocations = new HashMap<>();
+          request
+              .getRequestSlotsRequest()
+              .getWorkerAllocationsMap()
+              .forEach(
+                  (workerId, slots) ->
+                      workerAllocations.put(workerId, new HashMap<>(slots.getSlotMap())));
           metaSystem.updateRequestSlotsMeta(
-              shuffleKey, request.getRequestSlotsRequest().getHostName(), new HashMap<>());
+              shuffleKey, request.getRequestSlotsRequest().getHostName(), workerAllocations);
           break;
 
         case UnRegisterShuffle:
@@ -324,7 +388,7 @@ public class MetaHandler {
           throw new IOException("Can not parse this command!" + request);
       }
       responseBuilder.setStatus(PbMetaRequestStatus.OK);
-    } catch (IOException e) {
+    } catch (IOException | RuntimeException e) {
       LOG.warn("Handle meta write request {} failed!", metaRequestType, e);
       responseBuilder.setSuccess(false);
       responseBuilder.setStatus(PbMetaRequestStatus.INTERNAL_ERROR);

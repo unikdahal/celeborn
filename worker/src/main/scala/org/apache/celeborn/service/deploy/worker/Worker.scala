@@ -184,6 +184,13 @@ private[celeborn] class Worker(
   }
 
   val storageManager = new StorageManager(conf, workerSource)
+  private val applicationLeaseWorkerId =
+    s"$host-$rpcPort".replaceAll("[^A-Za-z0-9_.-]", "_")
+  val applicationLeaseStore = new ApplicationLeaseStore(
+    new File(
+      conf.workerGracefulShutdownRecoverPath,
+      s"application-leases-$applicationLeaseWorkerId"),
+    conf.workerRpcPort != 0 && conf.workerRpcPort == rpcPort)
 
   val memoryManager: MemoryManager = MemoryManager.initialize(conf, storageManager, workerSource)
   memoryManager.registerMemoryListener(storageManager)
@@ -663,6 +670,7 @@ private[celeborn] class Worker(
       workerSource.appActiveConnections.clear()
       partitionsSorter.close(exitKind)
       storageManager.close(exitKind)
+      applicationLeaseStore.close()
       memoryManager.close()
       Option(CongestionController.instance()).foreach(_.close())
 

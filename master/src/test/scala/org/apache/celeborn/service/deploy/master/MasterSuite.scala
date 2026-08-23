@@ -17,7 +17,9 @@
 
 package org.apache.celeborn.service.deploy.master
 
+import java.io.IOException
 import java.nio.file.Files
+import java.security.MessageDigest
 import java.util
 
 import org.mockito.ArgumentCaptor
@@ -26,10 +28,11 @@ import org.scalatest.{BeforeAndAfterAll, BeforeAndAfterEach}
 import org.scalatest.funsuite.AnyFunSuite
 
 import org.apache.celeborn.common.CelebornConf
+import org.apache.celeborn.common.client.MasterClient
 import org.apache.celeborn.common.identity.UserIdentifier
 import org.apache.celeborn.common.network.client.{RpcResponseCallback, TransportClient}
-import org.apache.celeborn.common.protocol.{PbApplicationMetaRequest, PbCheckForWorkerTimeout, PbRegisterWorker}
-import org.apache.celeborn.common.protocol.message.ControlMessages.{RequestSlots, RequestSlotsResponse, ReviseLostShuffles}
+import org.apache.celeborn.common.protocol.{PbApplicationLeaseControl, PbApplicationLeaseControlResponse, PbApplicationMetaRequest, PbBatchGetRecoveryTaskCommits, PbBatchGetRecoveryTaskCommitsResponse, PbCheckForWorkerTimeout, PbGetRecoveryTaskCommit, PbGetRecoveryTaskCommitResponse, PbPublishRecoveryTaskCommit, PbPublishRecoveryTaskCommitResponse, PbRegisterWorker, PbResolveSourceRecoveryAnchor, PbResolveSourceRecoveryAnchorResponse, PbUnregisterShuffle}
+import org.apache.celeborn.common.protocol.message.ControlMessages.{ApplicationLost, HeartbeatFromApplication, RequestSlots, RequestSlotsResponse, ReviseLostShuffles}
 import org.apache.celeborn.common.protocol.message.StatusCode
 import org.apache.celeborn.common.rpc.{RpcAddress, RpcCallContext}
 import org.apache.celeborn.common.rpc.netty.{NettyRpcEnv, RemoteNettyRpcCallContext}
@@ -237,6 +240,231 @@ class MasterSuite extends AnyFunSuite
 
       // A worker carries no client id, so the guard is a no-op and the request is served.
       master.receiveAndReply(contextForClient(null)).applyOrElse(request, unhandled)
+    } finally {
+      master.rpcEnv.shutdown()
+    }
+  }
+
+  test("application lease RPC acquires, renews, and rejects a competing stale owner") {
+    val conf = new CelebornConf()
+    conf.set(CelebornConf.HA_ENABLED.key, "false")
+    conf.set(CelebornConf.RECOVERY_TASK_COMMIT_MAX_PAYLOAD_SIZE.key, "16b")
+    conf.set(CelebornConf.RECOVERY_TASK_COMMIT_MAX_BATCH_RESPONSE_SIZE.key, "64b")
+    val master = new Master(
+      conf,
+      new MasterArguments(
+        Array("-h", "localhost", "-p", selectRandomPort().toString),
+        conf))
+
+    def send(request: PbApplicationLeaseControl): PbApplicationLeaseControlResponse = {
+      val context = mock(classOf[RpcCallContext])
+      val captor = ArgumentCaptor.forClass(classOf[Any])
+      master.receiveAndReply(context).applyOrElse(
+        request,
+        (_: Any) => fail("PbApplicationLeaseControl was not handled"))
+      verify(context).reply(captor.capture())
+      captor.getValue.asInstanceOf[PbApplicationLeaseControlResponse]
+    }
+
+    def request(
+        expectedEpoch: Long,
+        ownerId: String,
+        expiresAtMs: Long,
+        renewal: Boolean): PbApplicationLeaseControl = {
+      PbApplicationLeaseControl.newBuilder()
+        .setAppId("logical-app")
+        .setExpectedEpoch(expectedEpoch)
+        .setOwnerId(ownerId)
+        .setExpiresAtMs(expiresAtMs)
+        .setRenewal(renewal)
+        .setRequestId(MasterClient.genRequestId())
+        .build()
+    }
+
+    try {
+      val unauthorized = request(0L, "driver-1", Long.MaxValue - 2L, renewal = false)
+      val authError = intercept[IllegalStateException] {
+        master.receiveAndReply(contextForClient("other-app")).applyOrElse(
+          unauthorized,
+          (_: Any) => fail("PbApplicationLeaseControl was not handled"))
+      }
+      assert(authError.getMessage.contains("not authorized for application logical-app"))
+
+      val acquired = send(request(0L, "driver-1", Long.MaxValue - 2L, renewal = false))
+      assert(acquired.getSuccess)
+      assert(acquired.getEpoch == 1L)
+
+      def resolveAnchor(epoch: Long, owner: String, current: String) = {
+        val context = mock(classOf[RpcCallContext])
+        val captor = ArgumentCaptor.forClass(classOf[Any])
+        master.receiveAndReply(context).applyOrElse(
+          PbResolveSourceRecoveryAnchor.newBuilder()
+            .setAppId("logical-app")
+            .setRecoveryId("query-1")
+            .setSourceId("iceberg:catalog.db.table")
+            .setCurrentAnchor(current)
+            .setApplicationLeaseEpoch(epoch)
+            .setApplicationLeaseOwnerId(owner)
+            .setRequestId(MasterClient.genRequestId())
+            .build(),
+          (_: Any) => fail("PbResolveSourceRecoveryAnchor was not handled"))
+        verify(context).reply(captor.capture())
+        captor.getValue.asInstanceOf[PbResolveSourceRecoveryAnchorResponse]
+      }
+
+      val firstAnchor = resolveAnchor(1L, "driver-1", "snapshot:41")
+      assert(firstAnchor.getSuccess)
+      assert(firstAnchor.getAnchor == "snapshot:41")
+      val replayedAnchor = resolveAnchor(1L, "driver-1", "snapshot:42")
+      assert(replayedAnchor.getSuccess)
+      assert(replayedAnchor.getAnchor == "snapshot:41")
+      val staleAnchor = resolveAnchor(0L, "driver-0", "snapshot:43")
+      assert(!staleAnchor.getSuccess)
+      assert(staleAnchor.getMessage.contains("current application lease is required"))
+
+      def rpc[T](request: Any, responseClass: Class[T]): T = {
+        val context = mock(classOf[RpcCallContext])
+        val captor = ArgumentCaptor.forClass(classOf[Any])
+        master.receiveAndReply(context).applyOrElse(
+          request, (_: Any) => fail(s"${request.getClass.getSimpleName} was not handled"))
+        verify(context).reply(captor.capture())
+        responseClass.cast(captor.getValue)
+      }
+      def publish(epoch: Long, owner: String, partitionId: Int, value: String) = {
+        val bytes = value.getBytes("UTF-8")
+        rpc(PbPublishRecoveryTaskCommit.newBuilder()
+          .setAppId("logical-app").setRecoveryId("query-1").setWriteId("write-1")
+          .setPartitionId(partitionId)
+          .setPayload(com.google.protobuf.ByteString.copyFrom(bytes))
+          .setSha256(com.google.protobuf.ByteString.copyFrom(
+            MessageDigest.getInstance("SHA-256").digest(bytes)))
+          .setApplicationLeaseEpoch(epoch).setApplicationLeaseOwnerId(owner)
+          .setRequestId(MasterClient.genRequestId()).build(),
+          classOf[PbPublishRecoveryTaskCommitResponse])
+      }
+
+      val taskWinner = publish(1L, "driver-1", 0, "winner")
+      assert(taskWinner.getSuccess)
+      assert(taskWinner.getPayload.toStringUtf8 == "winner")
+      val speculativeLoser = publish(1L, "driver-1", 0, "loser")
+      assert(speculativeLoser.getSuccess)
+      assert(speculativeLoser.getCanonicalDiffers)
+      assert(speculativeLoser.getPayload.toStringUtf8 == "winner")
+      assert(!publish(0L, "driver-0", 1, "stale").getSuccess)
+      assert(!publish(1L, "driver-1", 1, "payload-too-large").getSuccess)
+
+      val get = rpc(PbGetRecoveryTaskCommit.newBuilder()
+        .setAppId("logical-app").setRecoveryId("query-1").setWriteId("write-1")
+        .setPartitionId(0).setApplicationLeaseEpoch(1L)
+        .setApplicationLeaseOwnerId("driver-1").build(),
+        classOf[PbGetRecoveryTaskCommitResponse])
+      assert(get.getSuccess && get.getFound && get.getPayload.toStringUtf8 == "winner")
+
+      val batch = rpc(PbBatchGetRecoveryTaskCommits.newBuilder()
+        .setAppId("logical-app").setRecoveryId("query-1").setWriteId("write-1")
+        .addPartitionIds(1).addPartitionIds(0).setApplicationLeaseEpoch(1L)
+        .setApplicationLeaseOwnerId("driver-1").build(),
+        classOf[PbBatchGetRecoveryTaskCommitsResponse])
+      assert(batch.getSuccess)
+      assert(batch.getEntriesCount == 2)
+      assert(!batch.getEntries(0).getFound)
+      assert(batch.getEntries(1).getFound)
+      assert(batch.getEntries(1).getPayload.toStringUtf8 == "winner")
+
+      val oversizedBatch = rpc(PbBatchGetRecoveryTaskCommits.newBuilder()
+        .setAppId("logical-app").setRecoveryId("query-1").setWriteId("write-1")
+        .addPartitionIds(0).addPartitionIds(0).setApplicationLeaseEpoch(1L)
+        .setApplicationLeaseOwnerId("driver-1").build(),
+        classOf[PbBatchGetRecoveryTaskCommitsResponse])
+      assert(!oversizedBatch.getSuccess)
+      assert(oversizedBatch.getEntriesCount == 0)
+      assert(oversizedBatch.getMessage.contains("batch response exceeds"))
+
+      val beforeDurationLease = System.currentTimeMillis()
+      val durationLease = send(PbApplicationLeaseControl.newBuilder()
+        .setAppId("duration-app")
+        .setExpectedEpoch(-1L)
+        .setOwnerId("duration-driver")
+        .setLeaseDurationMs(60000L)
+        .setRequestId(MasterClient.genRequestId())
+        .build())
+      assert(durationLease.getSuccess)
+      assert(durationLease.getEpoch == 1L)
+      assert(durationLease.getExpiresAtMs >= beforeDurationLease + 60000L)
+      assert(durationLease.getExpiresAtMs <= System.currentTimeMillis() + 60000L)
+
+      val repeatedDurationLease = send(PbApplicationLeaseControl.newBuilder()
+        .setAppId("duration-app")
+        .setExpectedEpoch(-1L)
+        .setOwnerId("duration-driver")
+        .setLeaseDurationMs(60000L)
+        .setRequestId(MasterClient.genRequestId())
+        .build())
+      assert(repeatedDurationLease == durationLease)
+
+      val staleSlots = RequestSlots(
+        "logical-app",
+        1,
+        new util.ArrayList[Integer](),
+        "localhost",
+        shouldReplicate = false,
+        shouldRackAware = false,
+        new UserIdentifier("tenant", "user"),
+        maxWorkers = 0,
+        availableStorageTypes = 0)
+      val staleSlotsContext = mock(classOf[RpcCallContext])
+      master.receiveAndReply(staleSlotsContext).applyOrElse(
+        staleSlots,
+        (_: Any) => fail("RequestSlots was not handled"))
+      val staleFailure = ArgumentCaptor.forClass(classOf[IOException])
+      verify(staleSlotsContext).sendFailure(staleFailure.capture())
+      assert(staleFailure.getValue.getMessage.contains("Application lease is not valid"))
+
+      val validSlotsContext = mock(classOf[RpcCallContext])
+      master.receiveAndReply(validSlotsContext).applyOrElse(
+        staleSlots.copy(applicationLeaseEpoch = 1L, applicationLeaseOwnerId = "driver-1"),
+        (_: Any) => fail("RequestSlots was not handled"))
+      val validSlotsCaptor = ArgumentCaptor.forClass(classOf[Any])
+      verify(validSlotsContext).reply(validSlotsCaptor.capture())
+      assert(validSlotsCaptor.getValue.asInstanceOf[RequestSlotsResponse].status ===
+        StatusCode.WORKER_EXCLUDED)
+
+      def assertLeaseRejected(message: Any): Unit = {
+        val staleContext = mock(classOf[RpcCallContext])
+        master.receiveAndReply(staleContext).applyOrElse(
+          message,
+          (_: Any) => fail(s"${message.getClass.getSimpleName} was not handled"))
+        val failure = ArgumentCaptor.forClass(classOf[IOException])
+        verify(staleContext).sendFailure(failure.capture())
+        assert(failure.getValue.getMessage.contains("Application lease is not valid"))
+      }
+
+      assertLeaseRejected(HeartbeatFromApplication(
+        "logical-app",
+        0L,
+        0L,
+        0L,
+        0L,
+        new util.HashMap[String, java.lang.Long](),
+        new util.HashMap[String, java.lang.Long](),
+        new util.ArrayList[org.apache.celeborn.common.meta.WorkerInfo](),
+        MasterClient.genRequestId(),
+        shouldResponse = true))
+      assertLeaseRejected(PbUnregisterShuffle.newBuilder()
+        .setAppId("logical-app")
+        .setShuffleId(1)
+        .setRequestId(MasterClient.genRequestId())
+        .build())
+      assertLeaseRejected(ApplicationLost("logical-app"))
+
+      val renewed = send(request(1L, "driver-1", Long.MaxValue - 1L, renewal = true))
+      assert(renewed.getSuccess)
+      assert(renewed.getEpoch == 1L)
+      assert(renewed.getExpiresAtMs == Long.MaxValue - 1L)
+
+      val conflict = send(request(0L, "driver-2", Long.MaxValue, renewal = false))
+      assert(!conflict.getSuccess)
+      assert(conflict.getMessage.contains("Stale application lease transition"))
     } finally {
       master.rpcEnv.shutdown()
     }

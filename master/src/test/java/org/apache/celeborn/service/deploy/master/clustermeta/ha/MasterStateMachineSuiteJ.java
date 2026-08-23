@@ -42,9 +42,12 @@ import org.apache.celeborn.common.client.MasterClient;
 import org.apache.celeborn.common.identity.UserIdentifier;
 import org.apache.celeborn.common.meta.DiskInfo;
 import org.apache.celeborn.common.meta.WorkerInfo;
+import org.apache.celeborn.common.protocol.PbApplicationLeaseRequest;
 import org.apache.celeborn.common.protocol.PbMetaRequest;
 import org.apache.celeborn.common.protocol.PbMetaRequestResponse;
 import org.apache.celeborn.common.protocol.PbMetaRequestSlotsRequest;
+import org.apache.celeborn.common.protocol.PbPublishRecoveryTaskCommitRequest;
+import org.apache.celeborn.common.protocol.PbResolveSourceRecoveryAnchorRequest;
 import org.apache.celeborn.common.protocol.PbSlotInfo;
 import org.apache.celeborn.common.quota.ResourceConsumption;
 import org.apache.celeborn.common.rpc.RpcEnv;
@@ -55,6 +58,153 @@ import org.apache.celeborn.service.deploy.master.clustermeta.ResourceProtos;
 public class MasterStateMachineSuiteJ extends RatisBaseSuiteJ {
 
   private final AtomicLong callerId = new AtomicLong();
+
+  @Test
+  public void testApplicationLeaseWireCompatibilityAndConflictRejection()
+      throws InvalidProtocolBufferException {
+    ResourceProtos.ResourceRequest resourceRequest =
+        ResourceProtos.ResourceRequest.newBuilder()
+            .setCmdType(ResourceProtos.Type.ApplicationLease)
+            .setRequestId(UUID.randomUUID().toString())
+            .setApplicationLeaseRequest(
+                ResourceProtos.ApplicationLeaseRequest.newBuilder()
+                    .setAppId("logical-app")
+                    .setExpectedEpoch(0L)
+                    .setNewEpoch(1L)
+                    .setOwnerId("driver-1")
+                    .setExpiresAtMs(1000L))
+            .build();
+
+    PbMetaRequest request = PbMetaRequest.parseFrom(resourceRequest.toByteArray());
+    Assert.assertEquals(
+        org.apache.celeborn.common.protocol.PbMetaRequestType.ApplicationLease,
+        request.getMetaRequestType());
+    Assert.assertEquals("logical-app", request.getApplicationLeaseRequest().getAppId());
+    Assert.assertEquals(0L, request.getApplicationLeaseRequest().getExpectedEpoch());
+    Assert.assertEquals(1L, request.getApplicationLeaseRequest().getNewEpoch());
+    Assert.assertEquals("driver-1", request.getApplicationLeaseRequest().getOwnerId());
+    Assert.assertEquals(1000L, request.getApplicationLeaseRequest().getExpiresAtMs());
+    Assert.assertFalse(request.getApplicationLeaseRequest().getRenewal());
+
+    StateMachine stateMachine = ratisServer.getMasterStateMachine();
+    Assert.assertTrue(stateMachine.runCommand(request, -1).getSuccess());
+
+    PbMetaRequest conflictingRequest =
+        request
+            .toBuilder()
+            .setApplicationLeaseRequest(
+                PbApplicationLeaseRequest.newBuilder(request.getApplicationLeaseRequest())
+                    .setOwnerId("driver-2"))
+            .build();
+    PbMetaRequestResponse response = stateMachine.runCommand(conflictingRequest, -1);
+    Assert.assertFalse(response.getSuccess());
+    Assert.assertEquals(
+        org.apache.celeborn.common.protocol.PbMetaRequestStatus.INTERNAL_ERROR,
+        response.getStatus());
+
+    PbMetaRequest renewalRequest =
+        request
+            .toBuilder()
+            .setApplicationLeaseRequest(
+                PbApplicationLeaseRequest.newBuilder(request.getApplicationLeaseRequest())
+                    .setExpectedEpoch(1L)
+                    .setNewEpoch(1L)
+                    .setExpiresAtMs(2000L)
+                    .setRenewal(true))
+            .build();
+    Assert.assertTrue(stateMachine.runCommand(renewalRequest, -1).getSuccess());
+
+    ResourceProtos.ResourceRequest sourceAnchorRequest =
+        ResourceProtos.ResourceRequest.newBuilder()
+            .setCmdType(ResourceProtos.Type.ResolveSourceRecoveryAnchor)
+            .setRequestId(UUID.randomUUID().toString())
+            .setResolveSourceRecoveryAnchorRequest(
+                ResourceProtos.ResolveSourceRecoveryAnchorRequest.newBuilder()
+                    .setAppId("logical-app")
+                    .setRecoveryId("query-1")
+                    .setSourceId("iceberg:catalog.db.table")
+                    .setCurrentAnchor("snapshot:41"))
+            .build();
+    PbMetaRequest sourceAnchor = PbMetaRequest.parseFrom(sourceAnchorRequest.toByteArray());
+    Assert.assertEquals(
+        org.apache.celeborn.common.protocol.PbMetaRequestType.ResolveSourceRecoveryAnchor,
+        sourceAnchor.getMetaRequestType());
+    Assert.assertTrue(stateMachine.runCommand(sourceAnchor, -1).getSuccess());
+
+    PbMetaRequest advancedSource =
+        sourceAnchor
+            .toBuilder()
+            .setResolveSourceRecoveryAnchorRequest(
+                PbResolveSourceRecoveryAnchorRequest.newBuilder(
+                        sourceAnchor.getResolveSourceRecoveryAnchorRequest())
+                    .setCurrentAnchor("snapshot:42"))
+            .build();
+    Assert.assertTrue(stateMachine.runCommand(advancedSource, -1).getSuccess());
+    Assert.assertEquals(
+        "snapshot:41",
+        statusSystem.getSourceRecoveryAnchor(
+            "logical-app", "query-1", "iceberg:catalog.db.table"));
+
+    byte[] payload = "task-envelope".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    byte[] digest;
+    try {
+      digest = java.security.MessageDigest.getInstance("SHA-256").digest(payload);
+    } catch (java.security.NoSuchAlgorithmException e) {
+      throw new AssertionError(e);
+    }
+    ResourceProtos.ResourceRequest taskCommitRequest =
+        ResourceProtos.ResourceRequest.newBuilder()
+            .setCmdType(ResourceProtos.Type.PublishRecoveryTaskCommit)
+            .setRequestId(UUID.randomUUID().toString())
+            .setPublishRecoveryTaskCommitRequest(
+                ResourceProtos.PublishRecoveryTaskCommitRequest.newBuilder()
+                    .setAppId("logical-app")
+                    .setRecoveryId("query-1")
+                    .setWriteId("write-1")
+                    .setPartitionId(2)
+                    .setPayload(ByteString.copyFrom(payload))
+                    .setSha256(ByteString.copyFrom(digest))
+                    .setApplicationLeaseEpoch(1L)
+                    .setApplicationLeaseOwnerId("driver-1"))
+            .build();
+    PbMetaRequest taskCommit = PbMetaRequest.parseFrom(taskCommitRequest.toByteArray());
+    Assert.assertEquals(
+        org.apache.celeborn.common.protocol.PbMetaRequestType.PublishRecoveryTaskCommit,
+        taskCommit.getMetaRequestType());
+    Assert.assertTrue(stateMachine.runCommand(taskCommit, -1).getSuccess());
+    Assert.assertArrayEquals(
+        payload,
+        statusSystem
+            .getRecoveryTaskCommit("logical-app", "query-1", "write-1", 2)
+            .getPayload()
+            .toByteArray());
+
+    PbMetaRequest takeover =
+        request
+            .toBuilder()
+            .setRequestId(UUID.randomUUID().toString())
+            .setApplicationLeaseRequest(
+                PbApplicationLeaseRequest.newBuilder()
+                    .setAppId("logical-app")
+                    .setExpectedEpoch(1L)
+                    .setNewEpoch(2L)
+                    .setOwnerId("driver-2")
+                    .setExpiresAtMs(3000L))
+            .build();
+    Assert.assertTrue(stateMachine.runCommand(takeover, -1).getSuccess());
+    PbMetaRequest staleTaskCommit =
+        taskCommit
+            .toBuilder()
+            .setRequestId(UUID.randomUUID().toString())
+            .setPublishRecoveryTaskCommitRequest(
+                PbPublishRecoveryTaskCommitRequest.newBuilder(
+                        taskCommit.getPublishRecoveryTaskCommitRequest())
+                    .setPartitionId(3))
+            .build();
+    Assert.assertFalse(stateMachine.runCommand(staleTaskCommit, -1).getSuccess());
+    Assert.assertNull(
+        statusSystem.getRecoveryTaskCommit("logical-app", "query-1", "write-1", 3));
+  }
 
   @Test
   public void testRunCommandByTransportMessage() throws InvalidProtocolBufferException {

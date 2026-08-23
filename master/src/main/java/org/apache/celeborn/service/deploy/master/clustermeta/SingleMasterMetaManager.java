@@ -25,6 +25,7 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.celeborn.common.CelebornConf;
 import org.apache.celeborn.common.identity.UserIdentifier;
+import org.apache.celeborn.common.meta.ApplicationLease;
 import org.apache.celeborn.common.meta.ApplicationMeta;
 import org.apache.celeborn.common.meta.DiskInfo;
 import org.apache.celeborn.common.meta.WorkerInfo;
@@ -34,6 +35,55 @@ import org.apache.celeborn.common.quota.ResourceConsumption;
 import org.apache.celeborn.common.rpc.RpcEnv;
 
 public class SingleMasterMetaManager extends AbstractMetaManager {
+  @Override
+  public org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord
+      handlePublishRecoveryTaskCommit(
+          String appId,
+          String recoveryId,
+          String writeId,
+          int partitionId,
+          byte[] payload,
+          byte[] sha256,
+          long applicationLeaseEpoch,
+          String applicationLeaseOwnerId,
+          String requestId) {
+    requireApplicationLeaseOwnerMeta(appId, applicationLeaseEpoch, applicationLeaseOwnerId);
+    return updateRecoveryTaskCommitMeta(
+        appId, recoveryId, writeId, partitionId, payload, sha256);
+  }
+
+  @Override
+  public void handlePublishCommittedShuffleCatalog(
+      String appId, int shuffleId, byte[] catalog, String requestId) {
+    updateCommittedShuffleCatalogMeta(appId, shuffleId, catalog);
+  }
+
+  @Override
+  public String handleResolveSourceRecoveryAnchor(
+      String appId,
+      String recoveryId,
+      String sourceId,
+      String currentAnchor,
+      String requestId) {
+    return updateSourceRecoveryAnchorMeta(appId, recoveryId, sourceId, currentAnchor);
+  }
+
+  @Override
+  public ApplicationLease handleApplicationLease(
+      String appId,
+      long expectedEpoch,
+      long newEpoch,
+      String ownerId,
+      long expiresAtMs,
+      boolean renewal,
+      String requestId) {
+    if (renewal) {
+      return renewApplicationLeaseMeta(appId, newEpoch, ownerId, expiresAtMs);
+    } else {
+      return updateApplicationLeaseMeta(appId, expectedEpoch, newEpoch, ownerId, expiresAtMs);
+    }
+  }
+
   private static final Logger LOG = LoggerFactory.getLogger(SingleMasterMetaManager.class);
 
   public SingleMasterMetaManager(RpcEnv rpcEnv, CelebornConf conf) {

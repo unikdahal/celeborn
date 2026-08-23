@@ -174,7 +174,9 @@ object ControlMessages extends Logging {
       excludedWorkerSet: Set[WorkerInfo] = Set.empty,
       packed: Boolean = false,
       tagsExpr: String = "",
-      override var requestId: String = ZERO_UUID)
+      override var requestId: String = ZERO_UUID,
+      applicationLeaseEpoch: Long = 0L,
+      applicationLeaseOwnerId: String = "")
     extends MasterRequestMessage
 
   case class RequestSlotsResponse(
@@ -328,11 +330,15 @@ object ControlMessages extends Logging {
     def apply(
         appId: String,
         shuffleId: Int,
-        requestId: String): PbUnregisterShuffle =
+        requestId: String,
+        applicationLeaseEpoch: Long = 0L,
+        applicationLeaseOwnerId: String = ""): PbUnregisterShuffle =
       PbUnregisterShuffle.newBuilder()
         .setAppId(appId)
         .setShuffleId(shuffleId)
         .setRequestId(requestId)
+        .setApplicationLeaseEpoch(applicationLeaseEpoch)
+        .setApplicationLeaseOwnerId(applicationLeaseOwnerId)
         .build()
   }
 
@@ -340,11 +346,15 @@ object ControlMessages extends Logging {
     def apply(
         appId: String,
         shuffleIds: util.List[Integer],
-        requestId: String): PbBatchUnregisterShuffles =
+        requestId: String,
+        applicationLeaseEpoch: Long = 0L,
+        applicationLeaseOwnerId: String = ""): PbBatchUnregisterShuffles =
       PbBatchUnregisterShuffles.newBuilder()
         .setAppId(appId)
         .addAllShuffleIds(shuffleIds)
         .setRequestId(requestId)
+        .setApplicationLeaseEpoch(applicationLeaseEpoch)
+        .setApplicationLeaseOwnerId(applicationLeaseOwnerId)
         .build()
   }
 
@@ -368,7 +378,9 @@ object ControlMessages extends Logging {
 
   case class ApplicationLost(
       appId: String,
-      override var requestId: String = ZERO_UUID) extends MasterRequestMessage
+      override var requestId: String = ZERO_UUID,
+      applicationLeaseEpoch: Long = 0L,
+      applicationLeaseOwnerId: String = "") extends MasterRequestMessage
 
   case class ApplicationLostResponse(status: StatusCode) extends MasterMessage
 
@@ -389,7 +401,9 @@ object ControlMessages extends Logging {
       applicationFallbackCounts: util.Map[String, java.lang.Long],
       needCheckedWorkerList: util.List[WorkerInfo],
       override var requestId: String = ZERO_UUID,
-      shouldResponse: Boolean = false) extends MasterRequestMessage
+      shouldResponse: Boolean = false,
+      applicationLeaseEpoch: Long = 0L,
+      applicationLeaseOwnerId: String = "") extends MasterRequestMessage
 
   case class HeartbeatFromApplicationResponse(
       statusCode: StatusCode,
@@ -496,7 +510,9 @@ object ControlMessages extends Logging {
       replicaIds: util.List[String],
       mapAttempts: Array[Int],
       epoch: Long,
-      var mockFailure: Boolean = false)
+      var mockFailure: Boolean = false,
+      applicationLeaseEpoch: Long = 0L,
+      applicationLeaseOwnerId: String = "")
     extends WorkerMessage
 
   case class CommitFilesResponse(
@@ -518,13 +534,43 @@ object ControlMessages extends Logging {
       shuffleKey: String,
       primaryLocations: util.List[String],
       replicaLocations: util.List[String],
-      var mockFailure: Boolean = false)
+      var mockFailure: Boolean = false,
+      applicationLeaseEpoch: Long = 0L,
+      applicationLeaseOwnerId: String = "")
     extends WorkerMessage
 
   case class DestroyWorkerSlotsResponse(
       status: StatusCode,
       failedPrimarys: util.List[String],
       failedReplicas: util.List[String])
+    extends WorkerMessage
+
+  case class FenceApplication(
+      applicationId: String,
+      epoch: Long,
+      ownerId: String,
+      expiresAtMs: Long,
+      leaseDurationMs: Long = 0L) extends WorkerMessage
+
+  case class FenceApplicationResponse(success: Boolean, reason: String = "")
+    extends WorkerMessage
+
+  /** Immutable committed-file facts used to validate a shuffle before driver recovery. */
+  case class ShuffleFileDescriptor(
+      fileName: String,
+      fileSize: Long,
+      chunkOffsets: util.List[java.lang.Long]) extends Serializable
+
+  /**
+   * Validate exact committed files against the worker's authoritative storage catalog. This is a
+   * read-only request: successful validation neither adopts nor extends the lifetime of data.
+   */
+  case class ValidateShuffleFiles(
+      applicationId: String,
+      shuffleId: Int,
+      files: util.List[ShuffleFileDescriptor]) extends WorkerMessage
+
+  case class ValidateShuffleFilesResponse(status: StatusCode, reason: String = "")
     extends WorkerMessage
 
   /**
@@ -660,7 +706,9 @@ object ControlMessages extends Logging {
           excludedWorkerSet,
           packed,
           tagsExpr,
-          requestId) =>
+          requestId,
+          applicationLeaseEpoch,
+          applicationLeaseOwnerId) =>
       val payload = PbRequestSlots.newBuilder()
         .setApplicationId(applicationId)
         .setShuffleId(shuffleId)
@@ -676,6 +724,8 @@ object ControlMessages extends Logging {
           PbSerDeUtils.toPbWorkerInfo(_, true, true)).asJava)
         .setPacked(packed)
         .setTagsExpr(tagsExpr)
+        .setApplicationLeaseEpoch(applicationLeaseEpoch)
+        .setApplicationLeaseOwnerId(applicationLeaseOwnerId)
         .build().toByteArray
       new TransportMessage(MessageType.REQUEST_SLOTS, payload)
 
@@ -834,9 +884,11 @@ object ControlMessages extends Logging {
     case pb: PbBatchUnregisterShuffleResponse =>
       new TransportMessage(MessageType.BATCH_UNREGISTER_SHUFFLE_RESPONSE, pb.toByteArray)
 
-    case ApplicationLost(appId, requestId) =>
+    case ApplicationLost(appId, requestId, applicationLeaseEpoch, applicationLeaseOwnerId) =>
       val payload = PbApplicationLost.newBuilder()
         .setAppId(appId).setRequestId(requestId)
+        .setApplicationLeaseEpoch(applicationLeaseEpoch)
+        .setApplicationLeaseOwnerId(applicationLeaseOwnerId)
         .build().toByteArray
       new TransportMessage(MessageType.APPLICATION_LOST, payload)
 
@@ -868,7 +920,9 @@ object ControlMessages extends Logging {
           applicationFallbackCounts,
           needCheckedWorkerList,
           requestId,
-          shouldResponse) =>
+          shouldResponse,
+          applicationLeaseEpoch,
+          applicationLeaseOwnerId) =>
       val payload = PbHeartbeatFromApplication.newBuilder()
         .setAppId(appId)
         .setRequestId(requestId)
@@ -881,6 +935,8 @@ object ControlMessages extends Logging {
         .addAllNeedCheckedWorkerList(needCheckedWorkerList.asScala.map(
           PbSerDeUtils.toPbWorkerInfo(_, true, true)).toList.asJava)
         .setShouldResponse(shouldResponse)
+        .setApplicationLeaseEpoch(applicationLeaseEpoch)
+        .setApplicationLeaseOwnerId(applicationLeaseOwnerId)
         .build().toByteArray
       new TransportMessage(MessageType.HEARTBEAT_FROM_APPLICATION, payload)
 
@@ -991,7 +1047,9 @@ object ControlMessages extends Logging {
           replicaIds,
           mapAttempts,
           epoch,
-          mockFailure) =>
+          mockFailure,
+          applicationLeaseEpoch,
+          applicationLeaseOwnerId) =>
       val payload = PbCommitFiles.newBuilder()
         .setApplicationId(applicationId)
         .setShuffleId(shuffleId)
@@ -1000,6 +1058,8 @@ object ControlMessages extends Logging {
         .addAllMapAttempts(mapAttempts.map(Integer.valueOf).toIterable.asJava)
         .setEpoch(epoch)
         .setMockFailure(mockFailure)
+        .setApplicationLeaseEpoch(applicationLeaseEpoch)
+        .setApplicationLeaseOwnerId(applicationLeaseOwnerId)
         .build().toByteArray
       new TransportMessage(MessageType.COMMIT_FILES, payload)
 
@@ -1032,12 +1092,20 @@ object ControlMessages extends Logging {
       val payload = builder.build().toByteArray
       new TransportMessage(MessageType.COMMIT_FILES_RESPONSE, payload)
 
-    case DestroyWorkerSlots(shuffleKey, primaryLocations, replicaLocations, mockFailure) =>
+    case DestroyWorkerSlots(
+          shuffleKey,
+          primaryLocations,
+          replicaLocations,
+          mockFailure,
+          applicationLeaseEpoch,
+          applicationLeaseOwnerId) =>
       val payload = PbDestroyWorkerSlots.newBuilder()
         .setShuffleKey(shuffleKey)
         .addAllPrimaryLocations(primaryLocations)
         .addAllReplicaLocation(replicaLocations)
         .setMockFailure(mockFailure)
+        .setApplicationLeaseEpoch(applicationLeaseEpoch)
+        .setApplicationLeaseOwnerId(applicationLeaseOwnerId)
         .build().toByteArray
       new TransportMessage(MessageType.DESTROY, payload)
 
@@ -1048,6 +1116,23 @@ object ControlMessages extends Logging {
       builder.addAllFailedReplicas(failedReplicas)
       val payload = builder.build().toByteArray
       new TransportMessage(MessageType.DESTROY_RESPONSE, payload)
+
+    case FenceApplication(applicationId, epoch, ownerId, expiresAtMs, leaseDurationMs) =>
+      val payload = PbFenceApplication.newBuilder()
+        .setApplicationId(applicationId)
+        .setEpoch(epoch)
+        .setOwnerId(ownerId)
+        .setExpiresAtMs(expiresAtMs)
+        .setLeaseDurationMs(leaseDurationMs)
+        .build().toByteArray
+      new TransportMessage(MessageType.FENCE_APPLICATION, payload)
+
+    case FenceApplicationResponse(success, reason) =>
+      val payload = PbFenceApplicationResponse.newBuilder()
+        .setSuccess(success)
+        .setReason(reason)
+        .build().toByteArray
+      new TransportMessage(MessageType.FENCE_APPLICATION_RESPONSE, payload)
 
     case pb: PbPartitionSplit =>
       new TransportMessage(MessageType.PARTITION_SPLIT, pb.toByteArray)
@@ -1066,6 +1151,48 @@ object ControlMessages extends Logging {
 
     case pb: PbApplicationMetaRequest =>
       new TransportMessage(MessageType.APPLICATION_META_REQUEST, pb.toByteArray)
+
+    case pb: PbApplicationLeaseControl =>
+      new TransportMessage(MessageType.APPLICATION_LEASE_CONTROL, pb.toByteArray)
+
+    case pb: PbApplicationLeaseControlResponse =>
+      new TransportMessage(MessageType.APPLICATION_LEASE_CONTROL_RESPONSE, pb.toByteArray)
+
+    case pb: PbPublishCommittedShuffleCatalog =>
+      new TransportMessage(MessageType.PUBLISH_COMMITTED_SHUFFLE_CATALOG, pb.toByteArray)
+
+    case pb: PbPublishCommittedShuffleCatalogResponse =>
+      new TransportMessage(MessageType.PUBLISH_COMMITTED_SHUFFLE_CATALOG_RESPONSE, pb.toByteArray)
+
+    case pb: PbResolveSourceRecoveryAnchor =>
+      new TransportMessage(MessageType.RESOLVE_SOURCE_RECOVERY_ANCHOR, pb.toByteArray)
+
+    case pb: PbResolveSourceRecoveryAnchorResponse =>
+      new TransportMessage(MessageType.RESOLVE_SOURCE_RECOVERY_ANCHOR_RESPONSE, pb.toByteArray)
+
+    case pb: PbGetCommittedShuffleCatalog =>
+      new TransportMessage(MessageType.GET_COMMITTED_SHUFFLE_CATALOG, pb.toByteArray)
+
+    case pb: PbGetCommittedShuffleCatalogResponse =>
+      new TransportMessage(MessageType.GET_COMMITTED_SHUFFLE_CATALOG_RESPONSE, pb.toByteArray)
+
+    case pb: PbPublishRecoveryTaskCommit =>
+      new TransportMessage(MessageType.PUBLISH_RECOVERY_TASK_COMMIT, pb.toByteArray)
+
+    case pb: PbPublishRecoveryTaskCommitResponse =>
+      new TransportMessage(MessageType.PUBLISH_RECOVERY_TASK_COMMIT_RESPONSE, pb.toByteArray)
+
+    case pb: PbGetRecoveryTaskCommit =>
+      new TransportMessage(MessageType.GET_RECOVERY_TASK_COMMIT, pb.toByteArray)
+
+    case pb: PbGetRecoveryTaskCommitResponse =>
+      new TransportMessage(MessageType.GET_RECOVERY_TASK_COMMIT_RESPONSE, pb.toByteArray)
+
+    case pb: PbBatchGetRecoveryTaskCommits =>
+      new TransportMessage(MessageType.BATCH_GET_RECOVERY_TASK_COMMITS, pb.toByteArray)
+
+    case pb: PbBatchGetRecoveryTaskCommitsResponse =>
+      new TransportMessage(MessageType.BATCH_GET_RECOVERY_TASK_COMMITS_RESPONSE, pb.toByteArray)
   }
 
   // TODO change return type to GeneratedMessageV3
@@ -1161,7 +1288,9 @@ object ControlMessages extends Logging {
           excludedWorkerInfoSet,
           pbRequestSlots.getPacked,
           pbRequestSlots.getTagsExpr,
-          pbRequestSlots.getRequestId)
+          pbRequestSlots.getRequestId,
+          pbRequestSlots.getApplicationLeaseEpoch,
+          pbRequestSlots.getApplicationLeaseOwnerId)
 
       case REQUEST_SLOTS_RESPONSE_VALUE =>
         val pbRequestSlotsResponse = PbRequestSlotsResponse.parseFrom(message.getPayload)
@@ -1345,7 +1474,11 @@ object ControlMessages extends Logging {
 
       case APPLICATION_LOST_VALUE =>
         val pbApplicationLost = PbApplicationLost.parseFrom(message.getPayload)
-        ApplicationLost(pbApplicationLost.getAppId, pbApplicationLost.getRequestId)
+        ApplicationLost(
+          pbApplicationLost.getAppId,
+          pbApplicationLost.getRequestId,
+          pbApplicationLost.getApplicationLeaseEpoch,
+          pbApplicationLost.getApplicationLeaseOwnerId)
 
       case APPLICATION_LOST_RESPONSE_VALUE =>
         val pbApplicationLostResponse = PbApplicationLostResponse.parseFrom(message.getPayload)
@@ -1365,7 +1498,9 @@ object ControlMessages extends Logging {
             pbHeartbeatFromApplication.getNeedCheckedWorkerListList.asScala
               .map(PbSerDeUtils.fromPbWorkerInfo).toList.asJava),
           pbHeartbeatFromApplication.getRequestId,
-          pbHeartbeatFromApplication.getShouldResponse)
+          pbHeartbeatFromApplication.getShouldResponse,
+          pbHeartbeatFromApplication.getApplicationLeaseEpoch,
+          pbHeartbeatFromApplication.getApplicationLeaseOwnerId)
 
       case HEARTBEAT_FROM_APPLICATION_RESPONSE_VALUE =>
         val pbHeartbeatFromApplicationResponse =
@@ -1468,7 +1603,9 @@ object ControlMessages extends Logging {
           pbCommitFiles.getReplicaIdsList,
           pbCommitFiles.getMapAttemptsList.asScala.map(_.toInt).toArray,
           pbCommitFiles.getEpoch,
-          pbCommitFiles.getMockFailure)
+          pbCommitFiles.getMockFailure,
+          pbCommitFiles.getApplicationLeaseEpoch,
+          pbCommitFiles.getApplicationLeaseOwnerId)
 
       case COMMIT_FILES_RESPONSE_VALUE =>
         val pbCommitFilesResponse = PbCommitFilesResponse.parseFrom(message.getPayload)
@@ -1500,7 +1637,9 @@ object ControlMessages extends Logging {
           pbDestroy.getShuffleKey,
           pbDestroy.getPrimaryLocationsList,
           pbDestroy.getReplicaLocationList,
-          pbDestroy.getMockFailure)
+          pbDestroy.getMockFailure,
+          pbDestroy.getApplicationLeaseEpoch,
+          pbDestroy.getApplicationLeaseOwnerId)
 
       case DESTROY_RESPONSE_VALUE =>
         val pbDestroyResponse = PbDestroyWorkerSlotsResponse.parseFrom(message.getPayload)
@@ -1508,6 +1647,19 @@ object ControlMessages extends Logging {
           StatusCode.fromValue(pbDestroyResponse.getStatus),
           pbDestroyResponse.getFailedPrimariesList,
           pbDestroyResponse.getFailedReplicasList)
+
+      case FENCE_APPLICATION_VALUE =>
+        val fence = PbFenceApplication.parseFrom(message.getPayload)
+        FenceApplication(
+          fence.getApplicationId,
+          fence.getEpoch,
+          fence.getOwnerId,
+          fence.getExpiresAtMs,
+          fence.getLeaseDurationMs)
+
+      case FENCE_APPLICATION_RESPONSE_VALUE =>
+        val fence = PbFenceApplicationResponse.parseFrom(message.getPayload)
+        FenceApplicationResponse(fence.getSuccess, fence.getReason)
 
       case REMOVE_EXPIRED_SHUFFLE_VALUE =>
         RemoveExpiredShuffle
@@ -1552,6 +1704,48 @@ object ControlMessages extends Logging {
 
       case APPLICATION_META_REQUEST_VALUE =>
         PbApplicationMetaRequest.parseFrom(message.getPayload)
+
+      case APPLICATION_LEASE_CONTROL_VALUE =>
+        PbApplicationLeaseControl.parseFrom(message.getPayload)
+
+      case APPLICATION_LEASE_CONTROL_RESPONSE_VALUE =>
+        PbApplicationLeaseControlResponse.parseFrom(message.getPayload)
+
+      case PUBLISH_COMMITTED_SHUFFLE_CATALOG_VALUE =>
+        PbPublishCommittedShuffleCatalog.parseFrom(message.getPayload)
+
+      case PUBLISH_COMMITTED_SHUFFLE_CATALOG_RESPONSE_VALUE =>
+        PbPublishCommittedShuffleCatalogResponse.parseFrom(message.getPayload)
+
+      case RESOLVE_SOURCE_RECOVERY_ANCHOR_VALUE =>
+        PbResolveSourceRecoveryAnchor.parseFrom(message.getPayload)
+
+      case RESOLVE_SOURCE_RECOVERY_ANCHOR_RESPONSE_VALUE =>
+        PbResolveSourceRecoveryAnchorResponse.parseFrom(message.getPayload)
+
+      case GET_COMMITTED_SHUFFLE_CATALOG_VALUE =>
+        PbGetCommittedShuffleCatalog.parseFrom(message.getPayload)
+
+      case GET_COMMITTED_SHUFFLE_CATALOG_RESPONSE_VALUE =>
+        PbGetCommittedShuffleCatalogResponse.parseFrom(message.getPayload)
+
+      case PUBLISH_RECOVERY_TASK_COMMIT_VALUE =>
+        PbPublishRecoveryTaskCommit.parseFrom(message.getPayload)
+
+      case PUBLISH_RECOVERY_TASK_COMMIT_RESPONSE_VALUE =>
+        PbPublishRecoveryTaskCommitResponse.parseFrom(message.getPayload)
+
+      case GET_RECOVERY_TASK_COMMIT_VALUE =>
+        PbGetRecoveryTaskCommit.parseFrom(message.getPayload)
+
+      case GET_RECOVERY_TASK_COMMIT_RESPONSE_VALUE =>
+        PbGetRecoveryTaskCommitResponse.parseFrom(message.getPayload)
+
+      case BATCH_GET_RECOVERY_TASK_COMMITS_VALUE =>
+        PbBatchGetRecoveryTaskCommits.parseFrom(message.getPayload)
+
+      case BATCH_GET_RECOVERY_TASK_COMMITS_RESPONSE_VALUE =>
+        PbBatchGetRecoveryTaskCommitsResponse.parseFrom(message.getPayload)
 
       case REPORT_BARRIER_STAGE_ATTEMPT_FAILURE_VALUE =>
         PbReportBarrierStageAttemptFailure.parseFrom(message.getPayload)

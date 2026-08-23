@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 
 import org.apache.celeborn.common.identity.UserIdentifier;
+import org.apache.celeborn.common.meta.ApplicationLease;
 import org.apache.celeborn.common.meta.ApplicationMeta;
 import org.apache.celeborn.common.meta.DiskInfo;
 import org.apache.celeborn.common.meta.WorkerInfo;
@@ -28,6 +29,36 @@ import org.apache.celeborn.common.meta.WorkerStatus;
 import org.apache.celeborn.common.quota.ResourceConsumption;
 
 public interface IMetadataHandler {
+  org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord handlePublishRecoveryTaskCommit(
+      String appId,
+      String recoveryId,
+      String writeId,
+      int partitionId,
+      byte[] payload,
+      byte[] sha256,
+      long applicationLeaseEpoch,
+      String applicationLeaseOwnerId,
+      String requestId);
+
+  void handlePublishCommittedShuffleCatalog(
+      String appId, int shuffleId, byte[] catalog, String requestId);
+
+  String handleResolveSourceRecoveryAnchor(
+      String appId,
+      String recoveryId,
+      String sourceId,
+      String currentAnchor,
+      String requestId);
+
+  ApplicationLease handleApplicationLease(
+      String appId,
+      long expectedEpoch,
+      long newEpoch,
+      String ownerId,
+      long expiresAtMs,
+      boolean renewal,
+      String requestId);
+
   void handleRegisterApplicationInfo(
       String appId, UserIdentifier userIdentifier, Map<String, String> extraInfo, String requestId);
 

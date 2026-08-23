@@ -25,7 +25,7 @@ import scala.collection.JavaConverters._
 import com.google.protobuf.InvalidProtocolBufferException
 
 import org.apache.celeborn.common.identity.UserIdentifier
-import org.apache.celeborn.common.meta.{ApplicationInfo, ApplicationMeta, DeviceInfo, DiskFileInfo, DiskInfo, MapFileMeta, ReduceFileMeta, WorkerEventInfo, WorkerInfo, WorkerStatus}
+import org.apache.celeborn.common.meta.{ApplicationInfo, ApplicationLease, ApplicationMeta, DeviceInfo, DiskFileInfo, DiskInfo, MapFileMeta, ReduceFileMeta, WorkerEventInfo, WorkerInfo, WorkerStatus}
 import org.apache.celeborn.common.meta.MapFileMeta.SegmentIndex
 import org.apache.celeborn.common.protocol._
 import org.apache.celeborn.common.protocol.PartitionLocation.Mode
@@ -443,6 +443,11 @@ object PbSerDeUtils {
       manuallyExcludedWorkers: java.util.Set[WorkerInfo],
       workerLostEvent: java.util.Set[WorkerInfo],
       appHeartbeatTime: java.util.Map[String, java.lang.Long],
+      applicationLeases: java.util.Map[String, ApplicationLease],
+      applicationWorkers: java.util.Map[String, java.util.Set[String]],
+      committedShuffleCatalogs: java.util.Map[String, com.google.protobuf.ByteString],
+      sourceRecoveryAnchors: java.util.Map[String, String],
+      recoveryTaskCommits: java.util.Map[String, com.google.protobuf.ByteString],
       workers: java.util.Set[WorkerInfo],
       partitionTotalWritten: java.lang.Long,
       partitionTotalFileCount: java.lang.Long,
@@ -467,6 +472,19 @@ object PbSerDeUtils {
         .map(toPbWorkerInfo(_, true, false)).asJava)
       .addAllWorkerLostEvents(workerLostEvent.asScala.map(toPbWorkerInfo(_, true, false)).asJava)
       .putAllAppHeartbeatTime(appHeartbeatTime)
+      .putAllApplicationLeases(applicationLeases.asScala.map { case (appId, lease) =>
+        appId -> PbApplicationLease.newBuilder()
+          .setEpoch(lease.epoch())
+          .setOwnerId(lease.ownerId())
+          .setExpiresAtMs(lease.expiresAtMs())
+          .build()
+      }.asJava)
+      .putAllApplicationWorkers(applicationWorkers.asScala.map { case (appId, workerIds) =>
+        appId -> PbWorkerIdSet.newBuilder().addAllWorkerIds(workerIds).build()
+      }.asJava)
+      .putAllCommittedShuffleCatalogs(committedShuffleCatalogs)
+      .putAllSourceRecoveryAnchors(sourceRecoveryAnchors)
+      .putAllRecoveryTaskCommits(recoveryTaskCommits)
       .addAllWorkers(workers.asScala.map(toPbWorkerInfo(_, true, false)).asJava)
       .setPartitionTotalWritten(partitionTotalWritten)
       .setPartitionTotalFileCount(partitionTotalFileCount)

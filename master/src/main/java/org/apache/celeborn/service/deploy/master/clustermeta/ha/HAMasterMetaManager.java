@@ -28,6 +28,7 @@ import org.apache.celeborn.common.CelebornConf;
 import org.apache.celeborn.common.client.MasterClient;
 import org.apache.celeborn.common.exception.CelebornRuntimeException;
 import org.apache.celeborn.common.identity.UserIdentifier;
+import org.apache.celeborn.common.meta.ApplicationLease;
 import org.apache.celeborn.common.meta.ApplicationMeta;
 import org.apache.celeborn.common.meta.DiskInfo;
 import org.apache.celeborn.common.meta.WorkerInfo;
@@ -42,6 +43,90 @@ import org.apache.celeborn.service.deploy.master.clustermeta.ResourceProtos.Reso
 import org.apache.celeborn.service.deploy.master.clustermeta.ResourceProtos.Type;
 
 public class HAMasterMetaManager extends AbstractMetaManager {
+  @Override
+  public org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord
+      handlePublishRecoveryTaskCommit(
+          String appId,
+          String recoveryId,
+          String writeId,
+          int partitionId,
+          byte[] payload,
+          byte[] sha256,
+          long applicationLeaseEpoch,
+          String applicationLeaseOwnerId,
+          String requestId) {
+    ResourceProtos.ResourceResponse response =
+        ratisServer.submitRequest(
+            ResourceRequest.newBuilder()
+                .setCmdType(Type.PublishRecoveryTaskCommit)
+                .setRequestId(requestId)
+                .setPublishRecoveryTaskCommitRequest(
+                    ResourceProtos.PublishRecoveryTaskCommitRequest.newBuilder()
+                        .setAppId(appId)
+                        .setRecoveryId(recoveryId)
+                        .setWriteId(writeId)
+                        .setPartitionId(partitionId)
+                        .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
+                        .setSha256(com.google.protobuf.ByteString.copyFrom(sha256))
+                        .setApplicationLeaseEpoch(applicationLeaseEpoch)
+                        .setApplicationLeaseOwnerId(applicationLeaseOwnerId)
+                        .build())
+                .build());
+    if (!response.getSuccess()) {
+      throw new CelebornRuntimeException(
+          response.hasMessage() ? response.getMessage() : "Task commit publication failed");
+    }
+    return getRecoveryTaskCommit(appId, recoveryId, writeId, partitionId);
+  }
+
+  @Override
+  public void handlePublishCommittedShuffleCatalog(
+      String appId, int shuffleId, byte[] catalog, String requestId) {
+    ResourceProtos.ResourceResponse response =
+        ratisServer.submitRequest(
+            ResourceRequest.newBuilder()
+                .setCmdType(Type.PublishCommittedShuffleCatalog)
+                .setRequestId(requestId)
+                .setPublishCommittedShuffleCatalogRequest(
+                    ResourceProtos.PublishCommittedShuffleCatalogRequest.newBuilder()
+                        .setAppId(appId)
+                        .setShuffleId(shuffleId)
+                        .setCatalog(com.google.protobuf.ByteString.copyFrom(catalog))
+                        .build())
+                .build());
+    if (!response.getSuccess()) {
+      throw new CelebornRuntimeException(
+          response.hasMessage() ? response.getMessage() : "Catalog publication failed");
+    }
+  }
+
+  @Override
+  public String handleResolveSourceRecoveryAnchor(
+      String appId,
+      String recoveryId,
+      String sourceId,
+      String currentAnchor,
+      String requestId) {
+    ResourceProtos.ResourceResponse response =
+        ratisServer.submitRequest(
+            ResourceRequest.newBuilder()
+                .setCmdType(Type.ResolveSourceRecoveryAnchor)
+                .setRequestId(requestId)
+                .setResolveSourceRecoveryAnchorRequest(
+                    ResourceProtos.ResolveSourceRecoveryAnchorRequest.newBuilder()
+                        .setAppId(appId)
+                        .setRecoveryId(recoveryId)
+                        .setSourceId(sourceId)
+                        .setCurrentAnchor(currentAnchor)
+                        .build())
+                .build());
+    if (!response.getSuccess()) {
+      throw new CelebornRuntimeException(
+          response.hasMessage() ? response.getMessage() : "Source anchor resolution failed");
+    }
+    return getSourceRecoveryAnchor(appId, recoveryId, sourceId);
+  }
+
   private static final Logger LOG = LoggerFactory.getLogger(HAMasterMetaManager.class);
 
   protected HARaftServer ratisServer;
@@ -68,6 +153,50 @@ public class HAMasterMetaManager extends AbstractMetaManager {
 
   public void setRatisServer(HARaftServer ratisServer) {
     this.ratisServer = ratisServer;
+  }
+
+  @Override
+  public ApplicationLease handleApplicationLease(
+      String appId,
+      long expectedEpoch,
+      long newEpoch,
+      String ownerId,
+      long expiresAtMs,
+      boolean renewal,
+      String requestId) {
+    try {
+      ResourceProtos.ResourceResponse response =
+          ratisServer.submitRequest(
+              ResourceRequest.newBuilder()
+                  .setCmdType(Type.ApplicationLease)
+                  .setRequestId(requestId)
+                  .setApplicationLeaseRequest(
+                      ResourceProtos.ApplicationLeaseRequest.newBuilder()
+                          .setAppId(appId)
+                          .setExpectedEpoch(expectedEpoch)
+                          .setNewEpoch(newEpoch)
+                          .setOwnerId(ownerId)
+                          .setExpiresAtMs(expiresAtMs)
+                          .setRenewal(renewal)
+                          .build())
+                  .build());
+      if (!response.getSuccess()) {
+        throw new CelebornRuntimeException(
+            response.hasMessage() ? response.getMessage() : "Application lease transition failed");
+      }
+      ApplicationLease lease = applicationLeases.get(appId);
+      if (lease == null
+          || lease.epoch() != newEpoch
+          || !lease.ownerId().equals(ownerId)
+          || lease.expiresAtMs() != expiresAtMs) {
+        throw new CelebornRuntimeException(
+            "Replicated application lease does not match the requested transition for " + appId);
+      }
+      return lease;
+    } catch (CelebornRuntimeException e) {
+      LOG.error("Handle application lease for {} failed!", appId, e);
+      throw e;
+    }
   }
 
   @Override
@@ -109,6 +238,10 @@ public class HAMasterMetaManager extends AbstractMetaManager {
           ResourceProtos.RequestSlotsRequest.newBuilder()
               .setShuffleKey(shuffleKey)
               .setHostName(hostName);
+      workerToAllocatedSlots.forEach(
+          (workerId, slots) ->
+              builder.putWorkerAllocations(
+                  workerId, ResourceProtos.SlotInfo.newBuilder().putAllSlot(slots).build()));
       ratisServer.submitRequest(
           ResourceRequest.newBuilder()
               .setCmdType(Type.RequestSlots)

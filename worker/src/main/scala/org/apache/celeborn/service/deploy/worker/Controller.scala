@@ -49,6 +49,7 @@ private[deploy] class Controller(
   extends RpcEndpoint with Logging {
 
   var storageManager: StorageManager = _
+  var applicationLeaseStore: ApplicationLeaseStore = _
   var shuffleMapperAttempts: ConcurrentHashMap[String, AtomicIntegerArray] = _
   // shuffleKey -> (epoch -> CommitInfo)
   var shuffleCommitInfos: ConcurrentHashMap[String, ConcurrentHashMap[Long, CommitInfo]] = _
@@ -76,6 +77,7 @@ private[deploy] class Controller(
 
   def init(worker: Worker): Unit = {
     storageManager = worker.storageManager
+    applicationLeaseStore = worker.applicationLeaseStore
     shufflePartitionType = worker.shufflePartitionType
     shufflePushDataTimeout = worker.shufflePushDataTimeout
     shuffleMapperAttempts = worker.shuffleMapperAttempts
@@ -145,8 +147,15 @@ private[deploy] class Controller(
           replicaIds,
           mapAttempts,
           epoch,
-          mockFailure) =>
+          mockFailure,
+          applicationLeaseEpoch,
+          applicationLeaseOwnerId) =>
       checkAuth(context, applicationId)
+      applicationLeaseStore.validate(
+        applicationId,
+        applicationLeaseEpoch,
+        applicationLeaseOwnerId,
+        System.currentTimeMillis())
       val shuffleKey = Utils.makeShuffleKey(applicationId, shuffleId)
       logDebug(s"Received CommitFiles request, $shuffleKey, primary files" +
         s" ${primaryIds.asScala.mkString(",")}; replica files ${replicaIds.asScala.mkString(",")}.")
@@ -163,9 +172,123 @@ private[deploy] class Controller(
       logDebug(s"Done processed CommitFiles request with shuffleKey $shuffleKey, in " +
         s"$commitFilesTimeMs ms.")
 
-    case DestroyWorkerSlots(shuffleKey, primaryLocations, replicaLocations, mockFailure) =>
-      checkAuth(context, Utils.splitShuffleKey(shuffleKey)._1)
+    case DestroyWorkerSlots(
+          shuffleKey,
+          primaryLocations,
+          replicaLocations,
+          mockFailure,
+          applicationLeaseEpoch,
+          applicationLeaseOwnerId) =>
+      val applicationId = Utils.splitShuffleKey(shuffleKey)._1
+      checkAuth(context, applicationId)
+      applicationLeaseStore.validate(
+        applicationId,
+        applicationLeaseEpoch,
+        applicationLeaseOwnerId,
+        System.currentTimeMillis())
       handleDestroy(context, shuffleKey, primaryLocations, replicaLocations, mockFailure)
+
+    case ValidateShuffleFiles(applicationId, shuffleId, files) =>
+      checkAuth(context, applicationId)
+      handleValidateShuffleFiles(context, applicationId, shuffleId, files)
+
+    case FenceApplication(applicationId, epoch, ownerId, expiresAtMs, leaseDurationMs) =>
+      checkAuth(context, applicationId)
+      try {
+        val workerExpiresAtMs = if (leaseDurationMs > 0L) {
+          Math.addExact(System.currentTimeMillis(), leaseDurationMs)
+        } else {
+          expiresAtMs
+        }
+        applicationLeaseStore.install(
+          applicationId,
+          new org.apache.celeborn.common.meta.ApplicationLease(epoch, ownerId, workerExpiresAtMs))
+        context.reply(FenceApplicationResponse(success = true))
+      } catch {
+        case e: Exception =>
+          context.reply(FenceApplicationResponse(
+            success = false,
+            Option(e.getMessage).getOrElse(e.getClass.getName)))
+      }
+  }
+
+  private def handleValidateShuffleFiles(
+      context: RpcCallContext,
+      applicationId: String,
+      shuffleId: Int,
+      files: jList[ShuffleFileDescriptor]): Unit = {
+    context.reply(validateShuffleFiles(applicationId, shuffleId, files))
+  }
+
+  private[worker] def validateShuffleFiles(
+      applicationId: String,
+      shuffleId: Int,
+      files: jList[ShuffleFileDescriptor]): ValidateShuffleFilesResponse = {
+    if (applicationId == null || applicationId.isEmpty) {
+      return ValidateShuffleFilesResponse(StatusCode.REQUEST_FAILED, "application id is empty")
+    }
+    if (shuffleId < 0) {
+      return ValidateShuffleFilesResponse(StatusCode.REQUEST_FAILED, "shuffle id is negative")
+    }
+    if (files == null || files.isEmpty) {
+      return ValidateShuffleFilesResponse(StatusCode.REQUEST_FAILED, "no committed files supplied")
+    }
+
+    val shuffleKey = Utils.makeShuffleKey(applicationId, shuffleId)
+    val duplicateFile = files.asScala.filter(_ != null).groupBy(_.fileName).collectFirst {
+      case (fileName, descriptors) if descriptors.size > 1 => fileName
+    }
+    if (duplicateFile.isDefined) {
+      return ValidateShuffleFilesResponse(
+        StatusCode.REQUEST_FAILED,
+        s"duplicate file ${duplicateFile.get}")
+    }
+
+    val failure = files.asScala.iterator.map { expected =>
+      if (expected == null) {
+        Some("null file descriptor")
+      } else if (expected.fileName == null || expected.fileName.isEmpty) {
+        Some("empty file name")
+      } else if (expected.fileSize < 0) {
+        Some(s"file ${expected.fileName} has negative expected length")
+      } else if (expected.chunkOffsets == null) {
+        Some(s"file ${expected.fileName} has null chunk offsets")
+      } else if (!validChunkOffsets(expected.chunkOffsets, expected.fileSize)) {
+        Some(s"file ${expected.fileName} has invalid expected chunk offsets")
+      } else {
+        val actual = storageManager.getFileInfo(shuffleKey, expected.fileName)
+        if (actual == null) {
+          Some(s"missing file ${expected.fileName}")
+        } else if (actual.getFileLength != expected.fileSize) {
+          Some(s"file ${expected.fileName} has length ${actual.getFileLength}, " +
+            s"expected ${expected.fileSize}")
+        } else if (!expected.chunkOffsets.isEmpty && !actual.isReduceFileMeta) {
+          Some(s"file ${expected.fileName} is not a reduce file")
+        } else if (!expected.chunkOffsets.isEmpty &&
+          !actual.getReduceFileMeta.getChunkOffsets.equals(expected.chunkOffsets)) {
+          Some(s"file ${expected.fileName} has different chunk offsets")
+        } else {
+          None
+        }
+      }
+    }.collectFirst { case Some(reason) => reason }
+
+    failure match {
+      case Some(reason) =>
+        ValidateShuffleFilesResponse(StatusCode.REQUEST_FAILED, reason)
+      case None =>
+        ValidateShuffleFilesResponse(StatusCode.SUCCESS)
+    }
+  }
+
+  private def validChunkOffsets(offsets: jList[java.lang.Long], fileSize: Long): Boolean = {
+    offsets.asScala.forall(_ != null) &&
+    (offsets.isEmpty || offsets.get(0) == 0L) &&
+    offsets.asScala.sliding(2).forall {
+      case Seq(previous, next) => previous < next
+      case _ => true
+    } &&
+    (offsets.isEmpty || offsets.get(offsets.size() - 1) <= fileSize)
   }
 
   private def handleReserveSlots(
