@@ -36,17 +36,17 @@ import org.apache.spark.sql.SparkSessionExtensions;
 import org.apache.spark.sql.execution.SparkPlan;
 
 import org.apache.celeborn.client.LifecycleManager;
+import org.apache.celeborn.common.CelebornConf;
 import org.apache.celeborn.common.protocol.PbApplicationLeaseControlResponse;
 import org.apache.celeborn.common.protocol.PbResolveSourceRecoveryAnchorResponse;
 
 /**
  * Installs Celeborn's driver-recovery provider into Spark's optional shuffle-stage recovery SPI.
- * Reflection keeps ordinary Celeborn artifacts binary-compatible with Spark releases predating
- * that SPI; enabling recovery against such a release fails during session construction.
+ * Reflection keeps ordinary Celeborn artifacts binary-compatible with Spark releases predating that
+ * SPI; enabling recovery against such a release fails during session construction.
  */
 public final class CelebornShuffleStageRecoveryExtension
-    extends AbstractFunction1<SparkSessionExtensions, BoxedUnit>
-    implements Serializable {
+    extends AbstractFunction1<SparkSessionExtensions, BoxedUnit> implements Serializable {
 
   static final String ENABLED = "spark.celeborn.driverRecovery.enabled";
   static final String RECOVERY_ID = "spark.celeborn.driverRecovery.id";
@@ -54,12 +54,31 @@ public final class CelebornShuffleStageRecoveryExtension
   static final String LEASE_DURATION = "spark.celeborn.driverRecovery.leaseDuration";
   static final String PROBE_TIMEOUT = "spark.celeborn.driverRecovery.probeTimeout";
 
+  /**
+   * Recovery turns Celeborn's optional authentication into a correctness dependency: with
+   * authentication off, {@code checkAuth} on the master and workers is a no-op, so an
+   * unauthenticated peer that learns an application's recovery identity can pre-publish a
+   * task-commit record and make the real writer discard its own output. Recovery therefore refuses
+   * to install unless the client authenticates.
+   */
+  static void requireAuthenticatedClient(SparkConf conf) {
+    if (!SparkUtils.fromSparkConf(conf).authEnabledOnClient()) {
+      throw new IllegalStateException(
+          "Celeborn driver recovery requires authentication: set "
+              + CelebornConf.AUTH_ENABLED().key()
+              + "=true (as spark.celeborn.auth.enabled in Spark). Without it, checkAuth on the"
+              + " Celeborn master and workers accepts any peer, so an unauthenticated client could"
+              + " publish task-commit records for this application's recovery identity");
+    }
+  }
+
   @Override
   public BoxedUnit apply(SparkSessionExtensions extensions) {
-    Method injection = Arrays.stream(extensions.getClass().getMethods())
-        .filter(method -> method.getName().equals("injectShuffleStageRecovery"))
-        .findFirst()
-        .orElse(null);
+    Method injection =
+        Arrays.stream(extensions.getClass().getMethods())
+            .filter(method -> method.getName().equals("injectShuffleStageRecovery"))
+            .findFirst()
+            .orElse(null);
     if (injection == null) {
       throw new IllegalStateException(
           "Celeborn driver recovery requires a Spark build with ShuffleStageRecovery support");
@@ -101,6 +120,7 @@ public final class CelebornShuffleStageRecoveryExtension
         throw new IllegalStateException(
             "CelebornShuffleStageRecoveryExtension is configured but recovery is disabled");
       }
+      requireAuthenticatedClient(conf);
       this.recoveryId = required(RECOVERY_ID);
       this.stableAppId = required(STABLE_APP_ID);
       this.leaseDurationMs = conf.getTimeAsMs(LEASE_DURATION, "10m");
@@ -112,10 +132,11 @@ public final class CelebornShuffleStageRecoveryExtension
 
     private Object proxy() {
       try {
-        Class<?> recoveryClass = Class.forName(
-            "org.apache.spark.sql.execution.adaptive.ShuffleStageRecovery",
-            true,
-            session.getClass().getClassLoader());
+        Class<?> recoveryClass =
+            Class.forName(
+                "org.apache.spark.sql.execution.adaptive.ShuffleStageRecovery",
+                true,
+                session.getClass().getClassLoader());
         return Proxy.newProxyInstance(
             recoveryClass.getClassLoader(), new Class<?>[] {recoveryClass}, this);
       } catch (ClassNotFoundException e) {
@@ -182,8 +203,8 @@ public final class CelebornShuffleStageRecoveryExtension
       checkRenewalFailure();
       String sourceId = stringProperty(info, "sourceId");
       String currentAnchor = stringProperty(info, "currentAnchor");
-      PbResolveSourceRecoveryAnchorResponse response = lifecycleManager()
-          .resolveSourceRecoveryAnchor(recoveryId, sourceId, currentAnchor);
+      PbResolveSourceRecoveryAnchorResponse response =
+          lifecycleManager().resolveSourceRecoveryAnchor(recoveryId, sourceId, currentAnchor);
       if (!response.getSuccess()) {
         throw new IllegalStateException(
             "Unable to resolve durable source anchor: " + response.getMessage());
@@ -199,8 +220,8 @@ public final class CelebornShuffleStageRecoveryExtension
       checkRenewalFailure();
       String sinkId = stringProperty(info, "sinkId");
       String currentWriteId = stringProperty(info, "currentWriteId");
-      PbResolveSourceRecoveryAnchorResponse response = lifecycleManager()
-          .resolveWriteRecoveryId(recoveryId, sinkId, currentWriteId);
+      PbResolveSourceRecoveryAnchorResponse response =
+          lifecycleManager().resolveWriteRecoveryId(recoveryId, sinkId, currentWriteId);
       if (!response.getSuccess()) {
         throw new IllegalStateException(
             "Unable to resolve durable write ID: " + response.getMessage());
@@ -235,8 +256,10 @@ public final class CelebornShuffleStageRecoveryExtension
       }
       if (!stableAppId.equals(candidate.appUniqueId())) {
         throw new IllegalStateException(
-            "Celeborn app identity is " + candidate.appUniqueId()
-                + ", expected stable recovery identity " + stableAppId);
+            "Celeborn app identity is "
+                + candidate.appUniqueId()
+                + ", expected stable recovery identity "
+                + stableAppId);
       }
       PbApplicationLeaseControlResponse acquired =
           candidate.takeOverApplicationLease(ownerId, leaseDurationMs);
@@ -251,11 +274,12 @@ public final class CelebornShuffleStageRecoveryExtension
     }
 
     private void startRenewer() {
-      ThreadFactory factory = runnable -> {
-        Thread thread = new Thread(runnable, "celeborn-recovery-lease-renewer");
-        thread.setDaemon(true);
-        return thread;
-      };
+      ThreadFactory factory =
+          runnable -> {
+            Thread thread = new Thread(runnable, "celeborn-recovery-lease-renewer");
+            thread.setDaemon(true);
+            return thread;
+          };
       renewer = Executors.newSingleThreadScheduledExecutor(factory);
       long intervalMs = Math.max(1000L, leaseDurationMs / 3L);
       renewer.scheduleWithFixedDelay(
@@ -276,12 +300,15 @@ public final class CelebornShuffleStageRecoveryExtension
           intervalMs,
           intervalMs,
           TimeUnit.MILLISECONDS);
-      session.sparkContext().addSparkListener(new SparkListener() {
-        @Override
-        public void onApplicationEnd(SparkListenerApplicationEnd applicationEnd) {
-          renewer.shutdownNow();
-        }
-      });
+      session
+          .sparkContext()
+          .addSparkListener(
+              new SparkListener() {
+                @Override
+                public void onApplicationEnd(SparkListenerApplicationEnd applicationEnd) {
+                  renewer.shutdownNow();
+                }
+              });
     }
 
     private Object recoveredShuffleStage(long[] bytesByPartitionId) throws Exception {
@@ -291,13 +318,13 @@ public final class CelebornShuffleStageRecoveryExtension
         bytes.$plus$eq(Long.valueOf(size));
         dataSize = Math.addExact(dataSize, size);
       }
-      Class<?> recoveredClass = Class.forName(
-          "org.apache.spark.sql.execution.adaptive.RecoveredShuffleStage",
-          true,
-          session.getClass().getClassLoader());
-      return recoveredClass
-          .getConstructors()[0]
-          .newInstance(bytes.toSeq(), dataSize, Option.empty());
+      Class<?> recoveredClass =
+          Class.forName(
+              "org.apache.spark.sql.execution.adaptive.RecoveredShuffleStage",
+              true,
+              session.getClass().getClassLoader());
+      return recoveredClass.getConstructors()[0].newInstance(
+          bytes.toSeq(), dataSize, Option.empty());
     }
 
     private String recoveryKey(Object info, int numMappers, int numPartitions) throws Exception {
@@ -305,11 +332,20 @@ public final class CelebornShuffleStageRecoveryExtension
           (SparkPlan) info.getClass().getMethod("canonicalizedPlan").invoke(info);
       SparkPlan canonicalizedQuery =
           (SparkPlan) info.getClass().getMethod("canonicalizedQueryPlan").invoke(info);
-      String material = session.version() + '\n' + recoveryId + '\n' + numMappers + '\n'
-          + numPartitions + '\n' + canonicalizedQuery.treeString() + '\n'
-          + canonicalized.treeString();
-      byte[] digest = MessageDigest.getInstance("SHA-256")
-          .digest(material.getBytes(StandardCharsets.UTF_8));
+      String material =
+          session.version()
+              + '\n'
+              + recoveryId
+              + '\n'
+              + numMappers
+              + '\n'
+              + numPartitions
+              + '\n'
+              + canonicalizedQuery.treeString()
+              + '\n'
+              + canonicalized.treeString();
+      byte[] digest =
+          MessageDigest.getInstance("SHA-256").digest(material.getBytes(StandardCharsets.UTF_8));
       StringBuilder hex = new StringBuilder(digest.length * 2);
       for (byte value : digest) {
         hex.append(String.format("%02x", value & 0xff));
