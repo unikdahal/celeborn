@@ -796,6 +796,10 @@ message PbSnapshotMetaInfo {
   // Immutable task commit envelopes. Keys are length-delimited application/recovery/write
   // identities plus the logical partition id; values are serialized PbRecoveryTaskCommitRecord.
   map<string, bytes> recoveryTaskCommits = 27;
+  // Immutable pointers to worker-replicated recovery payloads. Keys use the same length-delimited
+  // identity encoding as recoveryTaskCommits; values are serialized PbRecoveryBlobPointer. The
+  // payload itself never enters replicated state, only its content identity and locations.
+  map<string, bytes> recoveryBlobPointers = 28;
 }
 
 message PbWorkerIdSet {
@@ -1067,6 +1071,23 @@ message PbRecoveryTaskCommitRecord {
   int32 partitionId = 4;
   bytes payload = 5;
   bytes sha256 = 6;
+}
+
+// A pointer to a recovery payload stored on workers under its own SHA-256. Replicated state holds
+// this record rather than the payload, so a large write costs a bounded number of bytes per
+// partition in the Raft log and in every snapshot.
+message PbRecoveryBlobPointer {
+  string appId = 1;
+  string recoveryId = 2;
+  string writeId = 3;
+  int32 partitionId = 4;
+  bytes sha256 = 5;
+  int64 length = 6;
+  // Advances only when replicas are repaired; the digest and length never change.
+  int64 generation = 7;
+  int32 formatVersion = 8;
+  repeated string workerIds = 9;
+  int64 createdAtMs = 10;
 }
 
 message PbPublishRecoveryTaskCommit {

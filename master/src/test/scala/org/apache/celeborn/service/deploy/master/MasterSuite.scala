@@ -467,9 +467,17 @@ class MasterSuite extends AnyFunSuite
       assert(renewed.getEpoch == 1L)
       assert(renewed.getExpiresAtMs == Long.MaxValue - 1L)
 
+      // A competing owner is refused while the current lease is still valid, before any epoch
+      // arithmetic happens: ownership, not epoch order, is what fences a live driver.
       val conflict = send(request(0L, "driver-2", Long.MaxValue, renewal = false))
       assert(!conflict.getSuccess)
-      assert(conflict.getMessage.contains("Stale application lease transition"))
+      assert(conflict.getMessage.contains("is still leased to driver-1"))
+
+      // The current owner presenting the wrong epoch is a stale transition, which the replicated
+      // state machine rejects even though ownership matches.
+      val staleEpoch = send(request(5L, "driver-1", Long.MaxValue, renewal = false))
+      assert(!staleEpoch.getSuccess)
+      assert(staleEpoch.getMessage.contains("Stale application lease transition"))
     } finally {
       master.rpcEnv.shutdown()
     }

@@ -448,6 +448,7 @@ object PbSerDeUtils {
       committedShuffleCatalogs: java.util.Map[String, com.google.protobuf.ByteString],
       sourceRecoveryAnchors: java.util.Map[String, String],
       recoveryTaskCommits: java.util.Map[String, com.google.protobuf.ByteString],
+      recoveryBlobPointers: java.util.Map[String, com.google.protobuf.ByteString],
       workers: java.util.Set[WorkerInfo],
       partitionTotalWritten: java.lang.Long,
       partitionTotalFileCount: java.lang.Long,
@@ -485,6 +486,7 @@ object PbSerDeUtils {
       .putAllCommittedShuffleCatalogs(committedShuffleCatalogs)
       .putAllSourceRecoveryAnchors(sourceRecoveryAnchors)
       .putAllRecoveryTaskCommits(recoveryTaskCommits)
+      .putAllRecoveryBlobPointers(recoveryBlobPointers)
       .addAllWorkers(workers.asScala.map(toPbWorkerInfo(_, true, false)).asJava)
       .setPartitionTotalWritten(partitionTotalWritten)
       .setPartitionTotalFileCount(partitionTotalFileCount)

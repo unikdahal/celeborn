@@ -93,6 +93,8 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
       JavaUtils.newConcurrentHashMap();
   public final ConcurrentHashMap<String, ByteString> recoveryTaskCommits =
       JavaUtils.newConcurrentHashMap();
+  public final ConcurrentHashMap<String, ByteString> recoveryBlobPointers =
+      JavaUtils.newConcurrentHashMap();
   private final AtomicLong recoveryTaskCommitInlineBytes = new AtomicLong();
   private final AtomicLong recoveryTaskCommitInlineRecords = new AtomicLong();
   private final ConcurrentHashMap<String, AtomicLong> recoveryTaskCommitBytesByRecovery =
@@ -405,7 +407,11 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
 
   private void releaseRecoveryTaskCommitCapacity(
       org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord record, int bytes) {
-    String recoveryKey = recoveryTaskCommitRecoveryKey(record.getAppId(), record.getRecoveryId());
+    releaseRecoveryTaskCommitCapacity(record.getAppId(), record.getRecoveryId(), bytes);
+  }
+
+  private void releaseRecoveryTaskCommitCapacity(String appId, String recoveryId, int bytes) {
+    String recoveryKey = recoveryTaskCommitRecoveryKey(appId, recoveryId);
     recoveryTaskCommitInlineBytes.addAndGet(-bytes);
     recoveryTaskCommitInlineRecords.decrementAndGet();
     recoveryTaskCommitBytesByRecovery.computeIfPresent(
@@ -432,6 +438,165 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
     return recoveryTaskCommitBytesByRecovery.size();
   }
 
+  /**
+   * Publishes an immutable pointer to a worker-replicated recovery payload and returns the
+   * canonical winner.
+   *
+   * <p>The payload never enters replicated state; only its content identity, length, and replica
+   * locations do. Arbitration is unchanged from the inline backend: the first pointer under an
+   * identity wins, an exact replay is idempotent, and a losing attempt receives the winner so it
+   * can discard its own upload.
+   */
+  public synchronized org.apache.celeborn.common.protocol.PbRecoveryBlobPointer
+      updateRecoveryBlobPointerMeta(
+          String appId,
+          String recoveryId,
+          String writeId,
+          int partitionId,
+          byte[] sha256,
+          long length,
+          int formatVersion,
+          List<String> workerIds,
+          long createdAtMs) {
+    validateRecoveryTaskCommitIdentity(appId, recoveryId, writeId, partitionId);
+    validateBlobPointer(sha256, length, formatVersion, workerIds);
+
+    String key = recoveryTaskCommitKey(appId, recoveryId, writeId, partitionId);
+    ByteString stored = recoveryBlobPointers.get(key);
+    if (stored != null) {
+      return parseAndValidateRecoveryBlobPointer(stored, key);
+    }
+
+    org.apache.celeborn.common.protocol.PbRecoveryBlobPointer candidate =
+        org.apache.celeborn.common.protocol.PbRecoveryBlobPointer.newBuilder()
+            .setAppId(appId)
+            .setRecoveryId(recoveryId)
+            .setWriteId(writeId)
+            .setPartitionId(partitionId)
+            .setSha256(ByteString.copyFrom(sha256))
+            .setLength(length)
+            .setGeneration(0L)
+            .setFormatVersion(formatVersion)
+            .addAllWorkerIds(workerIds)
+            .setCreatedAtMs(createdAtMs)
+            .build();
+    ByteString serialized = candidate.toByteString();
+    // Pointers share the inline budget so that a flood of pointers cannot exhaust master state any
+    // more than a flood of inline records could.
+    reserveRecoveryTaskCommitCapacity(appId, recoveryId, serialized.size(), 1L);
+    recoveryBlobPointers.put(key, serialized);
+    return candidate;
+  }
+
+  /**
+   * Replaces the replica locations of an existing pointer after a repair.
+   *
+   * <p>The digest and length may never change, so a repair cannot alter what a recovery reads; the
+   * generation must advance so that a stale repair cannot overwrite a newer replica set.
+   */
+  public synchronized org.apache.celeborn.common.protocol.PbRecoveryBlobPointer
+      repairRecoveryBlobPointerMeta(
+          String appId,
+          String recoveryId,
+          String writeId,
+          int partitionId,
+          long generation,
+          List<String> workerIds) {
+    validateRecoveryTaskCommitIdentity(appId, recoveryId, writeId, partitionId);
+    if (workerIds == null || workerIds.isEmpty()) {
+      throw new IllegalArgumentException("A recovery blob pointer requires at least one replica");
+    }
+
+    String key = recoveryTaskCommitKey(appId, recoveryId, writeId, partitionId);
+    ByteString stored = recoveryBlobPointers.get(key);
+    if (stored == null) {
+      throw new IllegalStateException("No recovery blob pointer exists for " + key);
+    }
+
+    org.apache.celeborn.common.protocol.PbRecoveryBlobPointer current =
+        parseAndValidateRecoveryBlobPointer(stored, key);
+    if (generation <= current.getGeneration()) {
+      throw new IllegalStateException(
+          "Stale recovery blob repair for "
+              + key
+              + ": generation "
+              + generation
+              + " does not advance "
+              + current.getGeneration());
+    }
+
+    org.apache.celeborn.common.protocol.PbRecoveryBlobPointer repaired =
+        current
+            .toBuilder()
+            .setGeneration(generation)
+            .clearWorkerIds()
+            .addAllWorkerIds(workerIds)
+            .build();
+    ByteString serialized = repaired.toByteString();
+    long delta = serialized.size() - stored.size();
+    if (delta > 0) {
+      reserveRecoveryTaskCommitCapacity(appId, recoveryId, delta, 0L);
+    }
+    recoveryBlobPointers.put(key, serialized);
+    return repaired;
+  }
+
+  public synchronized org.apache.celeborn.common.protocol.PbRecoveryBlobPointer
+      getRecoveryBlobPointer(String appId, String recoveryId, String writeId, int partitionId) {
+    validateRecoveryTaskCommitIdentity(appId, recoveryId, writeId, partitionId);
+    String key = recoveryTaskCommitKey(appId, recoveryId, writeId, partitionId);
+    ByteString stored = recoveryBlobPointers.get(key);
+    return stored == null ? null : parseAndValidateRecoveryBlobPointer(stored, key);
+  }
+
+  private org.apache.celeborn.common.protocol.PbRecoveryBlobPointer
+      parseAndValidateRecoveryBlobPointer(ByteString bytes, String expectedKey) {
+    try {
+      org.apache.celeborn.common.protocol.PbRecoveryBlobPointer pointer =
+          org.apache.celeborn.common.protocol.PbRecoveryBlobPointer.parseFrom(bytes);
+      validateRecoveryTaskCommitIdentity(
+          pointer.getAppId(),
+          pointer.getRecoveryId(),
+          pointer.getWriteId(),
+          pointer.getPartitionId());
+      String key =
+          recoveryTaskCommitKey(
+              pointer.getAppId(),
+              pointer.getRecoveryId(),
+              pointer.getWriteId(),
+              pointer.getPartitionId());
+      if (!key.equals(expectedKey)) {
+        throw new IllegalStateException(
+            "Recovery blob pointer identity does not match its key " + expectedKey);
+      }
+      validateBlobPointer(
+          pointer.getSha256().toByteArray(),
+          pointer.getLength(),
+          pointer.getFormatVersion(),
+          pointer.getWorkerIdsList());
+      return pointer;
+    } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+      throw new IllegalStateException("Malformed recovery blob pointer in master state", e);
+    }
+  }
+
+  private static void validateBlobPointer(
+      byte[] sha256, long length, int formatVersion, List<String> workerIds) {
+    if (sha256 == null || sha256.length != 32) {
+      throw new IllegalArgumentException("A recovery blob pointer requires a 32-byte SHA-256");
+    }
+    if (length <= 0) {
+      throw new IllegalArgumentException("A recovery blob pointer requires a positive length");
+    }
+    if (formatVersion <= 0) {
+      throw new IllegalArgumentException(
+          "A recovery blob pointer requires a positive format version");
+    }
+    if (workerIds == null || workerIds.isEmpty()) {
+      throw new IllegalArgumentException("A recovery blob pointer requires at least one replica");
+    }
+  }
+
   private org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord
       parseAndValidateRecoveryTaskCommit(ByteString bytes, String expectedKey) {
     try {
@@ -456,6 +621,43 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
       throw new IllegalStateException(
           "Malformed recovery task commit metadata for " + expectedKey, e);
     }
+  }
+
+  /**
+   * Folds replicated blob pointers into the capacity state already computed for inline commits.
+   *
+   * <p>Pointers and inline records share one budget, so a restore must account for both. Restoring
+   * a pointer without accounting for it would leave the counters below zero when the application is
+   * later dropped, because cleanup releases capacity for every record it removes.
+   */
+  private RecoveryTaskCommitSnapshotState validateRecoveryBlobPointerSnapshot(
+      Map<String, ByteString> pointers, RecoveryTaskCommitSnapshotState base) {
+    Map<String, Long> bytesByRecovery = new HashMap<>(base.bytesByRecovery);
+    Map<String, Long> recordsByRecovery = new HashMap<>(base.recordsByRecovery);
+    long totalBytes = base.totalBytes;
+    long totalRecords = base.totalRecords;
+    for (Map.Entry<String, ByteString> entry : pointers.entrySet()) {
+      org.apache.celeborn.common.protocol.PbRecoveryBlobPointer pointer =
+          parseAndValidateRecoveryBlobPointer(entry.getValue(), entry.getKey());
+      String recoveryKey =
+          recoveryTaskCommitRecoveryKey(pointer.getAppId(), pointer.getRecoveryId());
+      long recoveryBytes =
+          Math.addExact(bytesByRecovery.getOrDefault(recoveryKey, 0L), entry.getValue().size());
+      long recoveryRecords = Math.addExact(recordsByRecovery.getOrDefault(recoveryKey, 0L), 1L);
+      totalBytes = Math.addExact(totalBytes, entry.getValue().size());
+      totalRecords = Math.addExact(totalRecords, 1L);
+      if (recoveryBytes > conf.recoveryTaskCommitMaxInlineBytesPerRecovery()
+          || recoveryRecords > conf.recoveryTaskCommitMaxInlineRecordsPerRecovery()
+          || totalBytes > conf.recoveryTaskCommitMaxInlineBytesGlobal()
+          || totalRecords > conf.recoveryTaskCommitMaxInlineRecordsGlobal()) {
+        throw new IllegalStateException(
+            "Recovery blob pointer snapshot exceeds configured inline metadata capacity");
+      }
+      bytesByRecovery.put(recoveryKey, recoveryBytes);
+      recordsByRecovery.put(recoveryKey, recoveryRecords);
+    }
+    return new RecoveryTaskCommitSnapshotState(
+        bytesByRecovery, recordsByRecovery, totalBytes, totalRecords);
   }
 
   private RecoveryTaskCommitSnapshotState validateRecoveryTaskCommitSnapshot(
@@ -605,6 +807,19 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
                 releaseRecoveryTaskCommitCapacity(
                     parseAndValidateRecoveryTaskCommit(entry.getValue(), entry.getKey()),
                     entry.getValue().size());
+                return true;
+              }
+              return false;
+            });
+    recoveryBlobPointers
+        .entrySet()
+        .removeIf(
+            entry -> {
+              if (entry.getKey().startsWith(recoveryIndexPrefix)) {
+                org.apache.celeborn.common.protocol.PbRecoveryBlobPointer pointer =
+                    parseAndValidateRecoveryBlobPointer(entry.getValue(), entry.getKey());
+                releaseRecoveryTaskCommitCapacity(
+                    pointer.getAppId(), pointer.getRecoveryId(), entry.getValue().size());
                 return true;
               }
               return false;
@@ -834,6 +1049,7 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
                 committedShuffleCatalogs,
                 sourceRecoveryAnchors,
                 recoveryTaskCommits,
+                recoveryBlobPointers,
                 new HashSet(workersMap.values()),
                 partitionTotalWritten.sum(),
                 partitionTotalFileCount.sum(),
@@ -863,7 +1079,9 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
       // Validate task-commit identities, checksums, keys, and all aggregate limits before clearing
       // live state. A corrupt or oversized snapshot must not leave a partially restored catalog.
       RecoveryTaskCommitSnapshotState taskCommitState =
-          validateRecoveryTaskCommitSnapshot(snapshotMetaInfo.getRecoveryTaskCommitsMap());
+          validateRecoveryBlobPointerSnapshot(
+              snapshotMetaInfo.getRecoveryBlobPointersMap(),
+              validateRecoveryTaskCommitSnapshot(snapshotMetaInfo.getRecoveryTaskCommitsMap()));
       cleanUpState();
 
       estimatedPartitionSize = snapshotMetaInfo.getEstimatedPartitionSize();
@@ -907,6 +1125,7 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
       committedShuffleCatalogs.putAll(snapshotMetaInfo.getCommittedShuffleCatalogsMap());
       sourceRecoveryAnchors.putAll(snapshotMetaInfo.getSourceRecoveryAnchorsMap());
       recoveryTaskCommits.putAll(snapshotMetaInfo.getRecoveryTaskCommitsMap());
+      recoveryBlobPointers.putAll(snapshotMetaInfo.getRecoveryBlobPointersMap());
       taskCommitState.bytesByRecovery.forEach(
           (key, value) -> recoveryTaskCommitBytesByRecovery.put(key, new AtomicLong(value)));
       taskCommitState.recordsByRecovery.forEach(
@@ -1035,6 +1254,7 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
     committedShuffleCatalogIndex.clear();
     sourceRecoveryAnchors.clear();
     recoveryTaskCommits.clear();
+    recoveryBlobPointers.clear();
     recoveryTaskCommitInlineBytes.set(0L);
     recoveryTaskCommitInlineRecords.set(0L);
     recoveryTaskCommitBytesByRecovery.clear();
