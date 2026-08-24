@@ -193,6 +193,7 @@ private[celeborn] class Master(
   private val appHeartbeatTimeoutMs = conf.appHeartbeatTimeoutMs
   private val applicationLeaseMaxDurationMs = conf.applicationLeaseMaxDurationMs
   private val recoveryTaskCommitMaxPayloadSize = conf.recoveryTaskCommitMaxPayloadSize
+  private val recoveryBlobQuorum = conf.recoveryBlobQuorum
   private val recoveryTaskCommitMaxBatchResponseSize = conf.recoveryTaskCommitMaxBatchResponseSize
   private val workerUnavailableInfoExpireTimeoutMs = conf.workerUnavailableInfoExpireTimeout
   private val allowWorkerHostPattern = conf.allowWorkerHostPattern
@@ -723,6 +724,14 @@ private[celeborn] class Master(
     case request: PbPublishRecoveryTaskCommit =>
       checkAuth(context, request.getAppId)
       executeWithLeaderChecker(context, handlePublishRecoveryTaskCommit(context, request))
+
+    case request: PbPublishRecoveryBlobPointer =>
+      checkAuth(context, request.getAppId)
+      executeWithLeaderChecker(context, handlePublishRecoveryBlobPointer(context, request))
+
+    case request: PbGetRecoveryBlobPointer =>
+      checkAuth(context, request.getAppId)
+      executeWithLeaderChecker(context, handleGetRecoveryBlobPointer(context, request))
 
     case request: PbGetRecoveryTaskCommit =>
       checkAuth(context, request.getAppId)
@@ -1502,6 +1511,93 @@ private[celeborn] class Master(
         masterSource.incRecovery(
           MasterSource.RECOVERY_TASK_COMMIT_PUBLISH_COUNT,
           recoveryFailureOutcome(e))
+        response.setSuccess(false).setMessage(Option(e.getMessage).getOrElse(e.getClass.getName))
+    }
+    context.reply(response.build())
+  }
+
+  private def handlePublishRecoveryBlobPointer(
+      context: RpcCallContext,
+      request: PbPublishRecoveryBlobPointer): Unit = {
+    val response = PbPublishRecoveryBlobPointerResponse.newBuilder()
+    try {
+      RecoveryTaskCommitUtils.validateIdentity(
+        request.getAppId,
+        request.getRecoveryId,
+        request.getWriteId,
+        request.getPartitionId)
+      require(
+        request.getWorkerIdsCount >= recoveryBlobQuorum,
+        s"A recovery blob pointer needs at least $recoveryBlobQuorum replicas, " +
+          s"got ${request.getWorkerIdsCount}")
+      requireValidApplicationLease(
+        request.getAppId,
+        request.getApplicationLeaseEpoch,
+        request.getApplicationLeaseOwnerId)
+      val canonical = statusSystem.handlePublishRecoveryBlobPointer(
+        request.getAppId,
+        request.getRecoveryId,
+        request.getWriteId,
+        request.getPartitionId,
+        request.getSha256.toByteArray,
+        request.getLength,
+        request.getFormatVersion,
+        request.getWorkerIdsList,
+        request.getCreatedAtMs,
+        request.getApplicationLeaseEpoch,
+        request.getApplicationLeaseOwnerId,
+        request.getRequestId)
+      response.setSuccess(true).setPointer(canonical)
+      val won = MessageDigest.isEqual(
+        request.getSha256.toByteArray,
+        canonical.getSha256.toByteArray)
+      masterSource.incRecovery(
+        MasterSource.RECOVERY_TASK_COMMIT_PUBLISH_COUNT,
+        if (won) MasterSource.RECOVERY_OUTCOME_ACCEPTED
+        else MasterSource.RECOVERY_OUTCOME_DUPLICATE)
+    } catch {
+      case NonFatal(e) =>
+        masterSource.incRecovery(
+          MasterSource.RECOVERY_TASK_COMMIT_PUBLISH_COUNT,
+          recoveryFailureOutcome(e))
+        response.setSuccess(false).setMessage(Option(e.getMessage).getOrElse(e.getClass.getName))
+    }
+    context.reply(response.build())
+  }
+
+  private def handleGetRecoveryBlobPointer(
+      context: RpcCallContext,
+      request: PbGetRecoveryBlobPointer): Unit = {
+    val response = PbGetRecoveryBlobPointerResponse.newBuilder()
+    try {
+      RecoveryTaskCommitUtils.validateIdentity(
+        request.getAppId,
+        request.getRecoveryId,
+        request.getWriteId,
+        request.getPartitionId)
+      requireValidApplicationLease(
+        request.getAppId,
+        request.getApplicationLeaseEpoch,
+        request.getApplicationLeaseOwnerId)
+      val pointer = statusSystem.getRecoveryBlobPointer(
+        request.getAppId,
+        request.getRecoveryId,
+        request.getWriteId,
+        request.getPartitionId)
+      response.setSuccess(true)
+      if (pointer != null) {
+        response.setFound(true).setPointer(pointer)
+        masterSource.incRecovery(
+          MasterSource.RECOVERY_LOOKUP_COUNT,
+          MasterSource.RECOVERY_OUTCOME_HIT)
+      } else {
+        masterSource.incRecovery(
+          MasterSource.RECOVERY_LOOKUP_COUNT,
+          MasterSource.RECOVERY_OUTCOME_MISS)
+      }
+    } catch {
+      case NonFatal(e) =>
+        masterSource.incRecovery(MasterSource.RECOVERY_LOOKUP_COUNT, recoveryFailureOutcome(e))
         response.setSuccess(false).setMessage(Option(e.getMessage).getOrElse(e.getClass.getName))
     }
     context.reply(response.build())

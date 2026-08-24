@@ -133,6 +133,14 @@ enum MessageType {
   GET_RECOVERY_TASK_COMMIT_RESPONSE = 110;
   BATCH_GET_RECOVERY_TASK_COMMITS = 111;
   BATCH_GET_RECOVERY_TASK_COMMITS_RESPONSE = 112;
+  PUSH_RECOVERY_BLOB = 113;
+  PUSH_RECOVERY_BLOB_RESPONSE = 114;
+  FETCH_RECOVERY_BLOB = 115;
+  FETCH_RECOVERY_BLOB_RESPONSE = 116;
+  PUBLISH_RECOVERY_BLOB_POINTER = 117;
+  PUBLISH_RECOVERY_BLOB_POINTER_RESPONSE = 118;
+  GET_RECOVERY_BLOB_POINTER = 119;
+  GET_RECOVERY_BLOB_POINTER_RESPONSE = 120;
 }
 
 enum StreamType {
@@ -1073,6 +1081,73 @@ message PbRecoveryTaskCommitRecord {
   bytes sha256 = 6;
 }
 
+// Carries a recovery payload to a worker. The worker stores it under sha256 and answers only after
+// the bytes are durable, because the pointer published afterwards promises the payload is readable.
+// Publishes a pointer once its payload is durable on a quorum of workers. The master applies the
+// same first-writer-wins rule it applies to inline commits.
+message PbPublishRecoveryBlobPointer {
+  string appId = 1;
+  string recoveryId = 2;
+  string writeId = 3;
+  int32 partitionId = 4;
+  bytes sha256 = 5;
+  int64 length = 6;
+  int32 formatVersion = 7;
+  repeated string workerIds = 8;
+  int64 createdAtMs = 9;
+  int64 applicationLeaseEpoch = 10;
+  string applicationLeaseOwnerId = 11;
+  string requestId = 12;
+}
+
+message PbPublishRecoveryBlobPointerResponse {
+  bool success = 1;
+  // The canonical pointer, which is this request's own when it won and the earlier winner
+  // otherwise. A loser uses it to delete the blob it just uploaded.
+  PbRecoveryBlobPointer pointer = 2;
+  string message = 3;
+}
+
+message PbGetRecoveryBlobPointer {
+  string appId = 1;
+  string recoveryId = 2;
+  string writeId = 3;
+  int32 partitionId = 4;
+  int64 applicationLeaseEpoch = 5;
+  string applicationLeaseOwnerId = 6;
+}
+
+message PbGetRecoveryBlobPointerResponse {
+  bool found = 1;
+  PbRecoveryBlobPointer pointer = 2;
+  bool success = 3;
+  string message = 4;
+}
+
+message PbPushRecoveryBlob {
+  string applicationId = 1;
+  bytes sha256 = 2;
+  bytes payload = 3;
+}
+
+message PbPushRecoveryBlobResponse {
+  bool success = 1;
+  string reason = 2;
+}
+
+message PbFetchRecoveryBlob {
+  string applicationId = 1;
+  bytes sha256 = 2;
+}
+
+message PbFetchRecoveryBlobResponse {
+  // Distinguishes "this worker does not hold the blob" from "this worker could not serve it".
+  bool found = 1;
+  bytes payload = 2;
+  bool success = 3;
+  string reason = 4;
+}
+
 // A pointer to a recovery payload stored on workers under its own SHA-256. Replicated state holds
 // this record rather than the payload, so a large write costs a bounded number of bytes per
 // partition in the Raft log and in every snapshot.
@@ -1088,6 +1163,20 @@ message PbRecoveryBlobPointer {
   int32 formatVersion = 8;
   repeated string workerIds = 9;
   int64 createdAtMs = 10;
+}
+
+message PbPublishRecoveryBlobPointerRequest {
+  string appId = 1;
+  string recoveryId = 2;
+  string writeId = 3;
+  int32 partitionId = 4;
+  bytes sha256 = 5;
+  int64 length = 6;
+  int32 formatVersion = 7;
+  repeated string workerIds = 8;
+  int64 createdAtMs = 9;
+  int64 applicationLeaseEpoch = 10;
+  string applicationLeaseOwnerId = 11;
 }
 
 message PbPublishRecoveryTaskCommit {
@@ -1250,6 +1339,7 @@ enum PbMetaRequestType {
   PublishCommittedShuffleCatalog = 32;
   ResolveSourceRecoveryAnchor = 33;
   PublishRecoveryTaskCommit = 34;
+  PublishRecoveryBlobPointer = 35;
 }
 
 message PbMetaRequest {
@@ -1275,6 +1365,7 @@ message PbMetaRequest {
   PbPublishCommittedShuffleCatalogRequest publishCommittedShuffleCatalogRequest = 28;
   PbResolveSourceRecoveryAnchorRequest resolveSourceRecoveryAnchorRequest = 29;
   PbPublishRecoveryTaskCommitRequest publishRecoveryTaskCommitRequest = 30;
+  PbPublishRecoveryBlobPointerRequest publishRecoveryBlobPointerRequest = 31;
   PbReviseLostShuffles reviseLostShufflesRequest = 102;
 }
 

@@ -86,7 +86,9 @@ class RecoveryBlobReplicationSuite extends AnyFunSuite {
     }
 
     assert(error.getMessage.contains("reached 1 of 2 required replicas"))
-    assert(error.getMessage.contains("worker-2"), "the failure detail names the workers that failed")
+    assert(
+      error.getMessage.contains("worker-2"),
+      "the failure detail names the workers that failed")
   }
 
   test("reaching quorum without the full replication factor still succeeds") {
@@ -100,7 +102,10 @@ class RecoveryBlobReplicationSuite extends AnyFunSuite {
   test("a payload that does not match its digest never reaches a worker") {
     val transport = new FakeTransport()
     intercept[IllegalArgumentException] {
-      replication(transport).upload(Seq("worker-1"), digest, "other".getBytes(StandardCharsets.UTF_8))
+      replication(transport).upload(
+        Seq("worker-1"),
+        digest,
+        "other".getBytes(StandardCharsets.UTF_8))
     }
     assert(transport.stored.isEmpty)
   }
@@ -144,11 +149,16 @@ class RecoveryBlobReplicationSuite extends AnyFunSuite {
 
     assert(
       blobs.replicasToRepair(
-        Seq("worker-1", "worker-2", "worker-3"), live, Seq("worker-4", "worker-5")) ===
+        Seq("worker-1", "worker-2", "worker-3"),
+        live,
+        Seq("worker-4", "worker-5")) ===
         Seq("worker-4"),
       "one replica is dead, so exactly one replacement is needed")
     assert(
-      blobs.replicasToRepair(Seq("worker-1", "worker-3", "worker-4"), live, Seq("worker-5")).isEmpty,
+      blobs.replicasToRepair(
+        Seq("worker-1", "worker-3", "worker-4"),
+        live,
+        Seq("worker-5")).isEmpty,
       "a healthy replica set needs no repair")
     assert(
       blobs.replicasToRepair(Seq("worker-2"), live, Seq("worker-1", "worker-3", "worker-4")) ===

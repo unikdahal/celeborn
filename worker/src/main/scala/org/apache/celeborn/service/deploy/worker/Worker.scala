@@ -192,6 +192,12 @@ private[celeborn] class Worker(
       s"application-leases-$applicationLeaseWorkerId"),
     conf.workerRpcPort != 0 && conf.workerRpcPort == rpcPort)
 
+  val recoveryBlobStore = new RecoveryBlobStore(
+    new File(
+      conf.workerGracefulShutdownRecoverPath,
+      s"recovery-blobs-$applicationLeaseWorkerId"),
+    conf.recoveryBlobMaxPayloadSize)
+
   val memoryManager: MemoryManager = MemoryManager.initialize(conf, storageManager, workerSource)
   memoryManager.registerMemoryListener(storageManager)
 

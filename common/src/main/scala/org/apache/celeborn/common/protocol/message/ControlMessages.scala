@@ -553,6 +553,19 @@ object ControlMessages extends Logging {
       leaseDurationMs: Long = 0L) extends WorkerMessage
 
   case class FenceApplicationResponse(success: Boolean, reason: String = "")
+
+  case class PushRecoveryBlob(applicationId: String, sha256: Array[Byte], payload: Array[Byte])
+    extends WorkerMessage
+
+  case class PushRecoveryBlobResponse(success: Boolean, reason: String = "")
+
+  case class FetchRecoveryBlob(applicationId: String, sha256: Array[Byte]) extends WorkerMessage
+
+  case class FetchRecoveryBlobResponse(
+      found: Boolean,
+      payload: Array[Byte],
+      success: Boolean,
+      reason: String = "")
     extends WorkerMessage
 
   /** Immutable committed-file facts used to validate a shuffle before driver recovery. */
@@ -1134,6 +1147,38 @@ object ControlMessages extends Logging {
         .build().toByteArray
       new TransportMessage(MessageType.FENCE_APPLICATION_RESPONSE, payload)
 
+    case PushRecoveryBlob(applicationId, sha256, payload) =>
+      val message = PbPushRecoveryBlob.newBuilder()
+        .setApplicationId(applicationId)
+        .setSha256(ByteString.copyFrom(sha256))
+        .setPayload(ByteString.copyFrom(payload))
+        .build().toByteArray
+      new TransportMessage(MessageType.PUSH_RECOVERY_BLOB, message)
+
+    case PushRecoveryBlobResponse(success, reason) =>
+      val message = PbPushRecoveryBlobResponse.newBuilder()
+        .setSuccess(success)
+        .setReason(reason)
+        .build().toByteArray
+      new TransportMessage(MessageType.PUSH_RECOVERY_BLOB_RESPONSE, message)
+
+    case FetchRecoveryBlob(applicationId, sha256) =>
+      val message = PbFetchRecoveryBlob.newBuilder()
+        .setApplicationId(applicationId)
+        .setSha256(ByteString.copyFrom(sha256))
+        .build().toByteArray
+      new TransportMessage(MessageType.FETCH_RECOVERY_BLOB, message)
+
+    case FetchRecoveryBlobResponse(found, payload, success, reason) =>
+      val builder = PbFetchRecoveryBlobResponse.newBuilder()
+        .setFound(found)
+        .setSuccess(success)
+        .setReason(reason)
+      if (payload != null) {
+        builder.setPayload(ByteString.copyFrom(payload))
+      }
+      new TransportMessage(MessageType.FETCH_RECOVERY_BLOB_RESPONSE, builder.build().toByteArray)
+
     case pb: PbPartitionSplit =>
       new TransportMessage(MessageType.PARTITION_SPLIT, pb.toByteArray)
 
@@ -1656,6 +1701,29 @@ object ControlMessages extends Logging {
           fence.getOwnerId,
           fence.getExpiresAtMs,
           fence.getLeaseDurationMs)
+
+      case PUSH_RECOVERY_BLOB_VALUE =>
+        val push = PbPushRecoveryBlob.parseFrom(message.getPayload)
+        PushRecoveryBlob(
+          push.getApplicationId,
+          push.getSha256.toByteArray,
+          push.getPayload.toByteArray)
+
+      case PUSH_RECOVERY_BLOB_RESPONSE_VALUE =>
+        val push = PbPushRecoveryBlobResponse.parseFrom(message.getPayload)
+        PushRecoveryBlobResponse(push.getSuccess, push.getReason)
+
+      case FETCH_RECOVERY_BLOB_VALUE =>
+        val fetch = PbFetchRecoveryBlob.parseFrom(message.getPayload)
+        FetchRecoveryBlob(fetch.getApplicationId, fetch.getSha256.toByteArray)
+
+      case FETCH_RECOVERY_BLOB_RESPONSE_VALUE =>
+        val fetch = PbFetchRecoveryBlobResponse.parseFrom(message.getPayload)
+        FetchRecoveryBlobResponse(
+          fetch.getFound,
+          if (fetch.getFound) fetch.getPayload.toByteArray else null,
+          fetch.getSuccess,
+          fetch.getReason)
 
       case FENCE_APPLICATION_RESPONSE_VALUE =>
         val fence = PbFenceApplicationResponse.parseFrom(message.getPayload)

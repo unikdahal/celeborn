@@ -36,6 +36,33 @@ import org.apache.celeborn.common.rpc.RpcEnv;
 
 public class SingleMasterMetaManager extends AbstractMetaManager {
   @Override
+  public org.apache.celeborn.common.protocol.PbRecoveryBlobPointer handlePublishRecoveryBlobPointer(
+      String appId,
+      String recoveryId,
+      String writeId,
+      int partitionId,
+      byte[] sha256,
+      long length,
+      int formatVersion,
+      java.util.List<String> workerIds,
+      long createdAtMs,
+      long applicationLeaseEpoch,
+      String applicationLeaseOwnerId,
+      String requestId) {
+    requireApplicationLeaseOwnerMeta(appId, applicationLeaseEpoch, applicationLeaseOwnerId);
+    return updateRecoveryBlobPointerMeta(
+        appId,
+        recoveryId,
+        writeId,
+        partitionId,
+        sha256,
+        length,
+        formatVersion,
+        workerIds,
+        createdAtMs);
+  }
+
+  @Override
   public org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord
       handlePublishRecoveryTaskCommit(
           String appId,

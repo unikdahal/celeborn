@@ -46,6 +46,7 @@ enum Type {
   PublishCommittedShuffleCatalog = 32;
   ResolveSourceRecoveryAnchor = 33;
   PublishRecoveryTaskCommit = 34;
+  PublishRecoveryBlobPointer = 35;
 }
 
 enum WorkerEventType {
@@ -82,6 +83,7 @@ message ResourceRequest {
   optional PublishCommittedShuffleCatalogRequest publishCommittedShuffleCatalogRequest = 28;
   optional ResolveSourceRecoveryAnchorRequest resolveSourceRecoveryAnchorRequest = 29;
   optional PublishRecoveryTaskCommitRequest publishRecoveryTaskCommitRequest = 30;
+  optional PublishRecoveryBlobPointerRequest publishRecoveryBlobPointerRequest = 31;
   optional ReviseLostShufflesRequest reviseLostShufflesRequest = 102;
 }
 
@@ -107,6 +109,20 @@ message PublishRecoveryTaskCommitRequest {
   bytes sha256 = 6;
   int64 applicationLeaseEpoch = 7;
   string applicationLeaseOwnerId = 8;
+}
+
+message PublishRecoveryBlobPointerRequest {
+  string appId = 1;
+  string recoveryId = 2;
+  string writeId = 3;
+  int32 partitionId = 4;
+  bytes sha256 = 5;
+  int64 length = 6;
+  int32 formatVersion = 7;
+  repeated string workerIds = 8;
+  int64 createdAtMs = 9;
+  int64 applicationLeaseEpoch = 10;
+  string applicationLeaseOwnerId = 11;
 }
 
 message DiskInfo {

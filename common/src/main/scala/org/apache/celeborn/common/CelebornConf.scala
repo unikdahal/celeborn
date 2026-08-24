@@ -975,6 +975,7 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
   def recoveryBlobInlineThreshold: Long = get(RECOVERY_BLOB_INLINE_THRESHOLD)
   def recoveryBlobOrphanGrace: Long = get(RECOVERY_BLOB_ORPHAN_GRACE)
   def recoveryBlobRepairInterval: Long = get(RECOVERY_BLOB_REPAIR_INTERVAL)
+  def recoveryBlobMaxPayloadSize: Long = get(RECOVERY_BLOB_MAX_PAYLOAD_SIZE)
   def recoveryTaskCommitMaxBatchResponseSize: Long =
     get(RECOVERY_TASK_COMMIT_MAX_BATCH_RESPONSE_SIZE)
   def recoveryTaskCommitMaxInlineBytesPerRecovery: Long =
@@ -2631,6 +2632,16 @@ object CelebornConf extends Logging {
       .timeConf(TimeUnit.MILLISECONDS)
       .checkValue(_ > 0, "Recovery blob repair interval must be positive")
       .createWithDefaultString("5m")
+
+  val RECOVERY_BLOB_MAX_PAYLOAD_SIZE: ConfigEntry[Long] =
+    buildConf("celeborn.master.recovery.blob.maxPayloadSize")
+      .categories("master")
+      .version("1.0.0")
+      .doc("Largest recovery payload a worker will store as a blob. This bounds worker disk per " +
+        "record rather than master heap, so it is far larger than the inline payload limit.")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(_ > 0, "Recovery blob maximum payload must be positive")
+      .createWithDefaultString("64m")
 
   val RECOVERY_TASK_COMMIT_MAX_PAYLOAD_SIZE: ConfigEntry[Long] =
     buildConf("celeborn.master.recovery.taskCommit.maxPayloadSize")

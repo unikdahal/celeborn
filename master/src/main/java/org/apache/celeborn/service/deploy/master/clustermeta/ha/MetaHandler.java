@@ -131,6 +131,25 @@ public class MetaHandler {
               taskCommitRequest.getSha256().toByteArray());
           break;
 
+        case PublishRecoveryBlobPointer:
+          PbPublishRecoveryBlobPointerRequest blobPointerRequest =
+              request.getPublishRecoveryBlobPointerRequest();
+          metaSystem.requireApplicationLeaseOwnerMeta(
+              blobPointerRequest.getAppId(),
+              blobPointerRequest.getApplicationLeaseEpoch(),
+              blobPointerRequest.getApplicationLeaseOwnerId());
+          metaSystem.updateRecoveryBlobPointerMeta(
+              blobPointerRequest.getAppId(),
+              blobPointerRequest.getRecoveryId(),
+              blobPointerRequest.getWriteId(),
+              blobPointerRequest.getPartitionId(),
+              blobPointerRequest.getSha256().toByteArray(),
+              blobPointerRequest.getLength(),
+              blobPointerRequest.getFormatVersion(),
+              blobPointerRequest.getWorkerIdsList(),
+              blobPointerRequest.getCreatedAtMs());
+          break;
+
         case PublishCommittedShuffleCatalog:
           PbPublishCommittedShuffleCatalogRequest catalogRequest =
               request.getPublishCommittedShuffleCatalogRequest();

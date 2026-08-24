@@ -80,6 +80,49 @@ public class HAMasterMetaManager extends AbstractMetaManager {
   }
 
   @Override
+  public org.apache.celeborn.common.protocol.PbRecoveryBlobPointer handlePublishRecoveryBlobPointer(
+      String appId,
+      String recoveryId,
+      String writeId,
+      int partitionId,
+      byte[] sha256,
+      long length,
+      int formatVersion,
+      java.util.List<String> workerIds,
+      long createdAtMs,
+      long applicationLeaseEpoch,
+      String applicationLeaseOwnerId,
+      String requestId) {
+    ResourceProtos.ResourceResponse response =
+        ratisServer.submitRequest(
+            ResourceRequest.newBuilder()
+                .setCmdType(Type.PublishRecoveryBlobPointer)
+                .setRequestId(requestId)
+                .setPublishRecoveryBlobPointerRequest(
+                    ResourceProtos.PublishRecoveryBlobPointerRequest.newBuilder()
+                        .setAppId(appId)
+                        .setRecoveryId(recoveryId)
+                        .setWriteId(writeId)
+                        .setPartitionId(partitionId)
+                        .setSha256(com.google.protobuf.ByteString.copyFrom(sha256))
+                        .setLength(length)
+                        .setFormatVersion(formatVersion)
+                        .addAllWorkerIds(workerIds)
+                        .setCreatedAtMs(createdAtMs)
+                        .setApplicationLeaseEpoch(applicationLeaseEpoch)
+                        .setApplicationLeaseOwnerId(applicationLeaseOwnerId)
+                        .build())
+                .build());
+    if (!response.getSuccess()) {
+      throw new CelebornRuntimeException(
+          response.hasMessage() ? response.getMessage() : "Blob pointer publication failed");
+    }
+    // Read the applied value back rather than trusting the request: the winner may be an earlier
+    // pointer published by another attempt.
+    return getRecoveryBlobPointer(appId, recoveryId, writeId, partitionId);
+  }
+
+  @Override
   public void handlePublishCommittedShuffleCatalog(
       String appId, int shuffleId, byte[] catalog, String requestId) {
     ResourceProtos.ResourceResponse response =

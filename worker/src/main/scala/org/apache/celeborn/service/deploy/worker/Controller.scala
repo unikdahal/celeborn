@@ -50,6 +50,7 @@ private[deploy] class Controller(
 
   var storageManager: StorageManager = _
   var applicationLeaseStore: ApplicationLeaseStore = _
+  var recoveryBlobStore: RecoveryBlobStore = _
   var shuffleMapperAttempts: ConcurrentHashMap[String, AtomicIntegerArray] = _
   // shuffleKey -> (epoch -> CommitInfo)
   var shuffleCommitInfos: ConcurrentHashMap[String, ConcurrentHashMap[Long, CommitInfo]] = _
@@ -78,6 +79,7 @@ private[deploy] class Controller(
   def init(worker: Worker): Unit = {
     storageManager = worker.storageManager
     applicationLeaseStore = worker.applicationLeaseStore
+    recoveryBlobStore = worker.recoveryBlobStore
     shufflePartitionType = worker.shufflePartitionType
     shufflePushDataTimeout = worker.shufflePushDataTimeout
     shuffleMapperAttempts = worker.shuffleMapperAttempts
@@ -191,6 +193,41 @@ private[deploy] class Controller(
     case ValidateShuffleFiles(applicationId, shuffleId, files) =>
       checkAuth(context, applicationId)
       handleValidateShuffleFiles(context, applicationId, shuffleId, files)
+
+    case PushRecoveryBlob(applicationId, sha256, payload) =>
+      checkAuth(context, applicationId)
+      try {
+        // The store verifies the payload against its digest and fsyncs before returning, so a
+        // success here means the bytes are durable on this worker and not merely accepted.
+        recoveryBlobStore.put(sha256, payload)
+        context.reply(PushRecoveryBlobResponse(success = true))
+      } catch {
+        case e: Exception =>
+          logWarning(s"Failed to store a recovery blob for $applicationId", e)
+          context.reply(PushRecoveryBlobResponse(
+            success = false,
+            Option(e.getMessage).getOrElse(e.getClass.getName)))
+      }
+
+    case FetchRecoveryBlob(applicationId, sha256) =>
+      checkAuth(context, applicationId)
+      try {
+        val payload = recoveryBlobStore.get(sha256)
+        // "Not held here" and "held but unreadable" are different answers: the first lets a reader
+        // move on to the next replica quietly, the second is a corruption signal worth recording.
+        context.reply(FetchRecoveryBlobResponse(
+          found = payload != null,
+          payload = payload,
+          success = true))
+      } catch {
+        case e: Exception =>
+          logWarning(s"Failed to serve a recovery blob for $applicationId", e)
+          context.reply(FetchRecoveryBlobResponse(
+            found = false,
+            payload = null,
+            success = false,
+            Option(e.getMessage).getOrElse(e.getClass.getName)))
+      }
 
     case FenceApplication(applicationId, epoch, ownerId, expiresAtMs, leaseDurationMs) =>
       checkAuth(context, applicationId)

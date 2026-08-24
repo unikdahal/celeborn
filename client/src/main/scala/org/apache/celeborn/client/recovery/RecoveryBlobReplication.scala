@@ -138,8 +138,10 @@ private[celeborn] class RecoveryBlobReplication(
   }
 
   /** Workers that must receive a copy before this pointer meets its replication factor again. */
-  def replicasToRepair(current: Seq[String], live: Set[String], candidates: Seq[String])
-      : Seq[String] = {
+  def replicasToRepair(
+      current: Seq[String],
+      live: Set[String],
+      candidates: Seq[String]): Seq[String] = {
     val healthy = current.filter(live.contains)
     val missing = replicationFactor - healthy.size
     if (missing <= 0) {
@@ -167,7 +169,7 @@ private[celeborn] object RecoveryBlobReplication {
 
   def hex(digest: Array[Byte]): String = {
     val builder = new StringBuilder(digest.length * 2)
-    digest.foreach(value => builder.append(f"${value & 0xff}%02x"))
+    digest.foreach(value => builder.append(f"${value & 0xFF}%02x"))
     builder.toString
   }
 
