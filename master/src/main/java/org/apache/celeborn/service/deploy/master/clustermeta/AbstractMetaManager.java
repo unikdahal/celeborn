@@ -31,8 +31,8 @@ import java.util.stream.Collectors;
 import scala.Option;
 import scala.Tuple2;
 
-import com.google.protobuf.ByteString;
 import com.google.common.annotations.VisibleForTesting;
+import com.google.protobuf.ByteString;
 import org.apache.commons.lang3.tuple.ImmutablePair;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.hadoop.net.NetworkTopology;
@@ -304,21 +304,14 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
     return sourceRecoveryAnchors.get(sourceRecoveryAnchorKey(appId, recoveryId, sourceId));
   }
 
-  private static String sourceRecoveryAnchorKey(
-      String appId, String recoveryId, String sourceId) {
-    return appId.length()
-        + ":"
-        + appId
-        + recoveryId.length()
-        + ":"
-        + recoveryId
-        + sourceId;
+  private static String sourceRecoveryAnchorKey(String appId, String recoveryId, String sourceId) {
+    return appId.length() + ":" + appId + recoveryId.length() + ":" + recoveryId + sourceId;
   }
 
   /**
-   * Publishes an immutable commit for one logical output task and returns the canonical winner.
-   * An exact retry is idempotent; a speculative attempt with different bytes loses without
-   * replacing the first durable value.
+   * Publishes an immutable commit for one logical output task and returns the canonical winner. An
+   * exact retry is idempotent; a speculative attempt with different bytes loses without replacing
+   * the first durable value.
    */
   public synchronized org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord
       updateRecoveryTaskCommitMeta(
@@ -352,8 +345,7 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
   }
 
   public synchronized org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord
-      getRecoveryTaskCommit(
-      String appId, String recoveryId, String writeId, int partitionId) {
+      getRecoveryTaskCommit(String appId, String recoveryId, String writeId, int partitionId) {
     validateRecoveryTaskCommitIdentity(appId, recoveryId, writeId, partitionId);
     String key = recoveryTaskCommitKey(appId, recoveryId, writeId, partitionId);
     ByteString stored = recoveryTaskCommits.get(key);
@@ -367,9 +359,15 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
 
   private static String recoveryTaskCommitKey(
       String appId, String recoveryId, String writeId, int partitionId) {
-    return appId.length() + ":" + appId
-        + recoveryId.length() + ":" + recoveryId
-        + writeId.length() + ":" + writeId
+    return appId.length()
+        + ":"
+        + appId
+        + recoveryId.length()
+        + ":"
+        + recoveryId
+        + writeId.length()
+        + ":"
+        + writeId
         + partitionId;
   }
 
@@ -411,11 +409,9 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
     recoveryTaskCommitInlineBytes.addAndGet(-bytes);
     recoveryTaskCommitInlineRecords.decrementAndGet();
     recoveryTaskCommitBytesByRecovery.computeIfPresent(
-        recoveryKey,
-        (ignored, value) -> value.addAndGet(-bytes) == 0 ? null : value);
+        recoveryKey, (ignored, value) -> value.addAndGet(-bytes) == 0 ? null : value);
     recoveryTaskCommitRecordsByRecovery.computeIfPresent(
-        recoveryKey,
-        (ignored, value) -> value.decrementAndGet() == 0 ? null : value);
+        recoveryKey, (ignored, value) -> value.decrementAndGet() == 0 ? null : value);
   }
 
   @VisibleForTesting
@@ -471,12 +467,10 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
     for (Map.Entry<String, ByteString> entry : records.entrySet()) {
       org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord record =
           parseAndValidateRecoveryTaskCommit(entry.getValue(), entry.getKey());
-      String recoveryKey =
-          recoveryTaskCommitRecoveryKey(record.getAppId(), record.getRecoveryId());
+      String recoveryKey = recoveryTaskCommitRecoveryKey(record.getAppId(), record.getRecoveryId());
       long recoveryBytes =
           Math.addExact(bytesByRecovery.getOrDefault(recoveryKey, 0L), entry.getValue().size());
-      long recoveryRecords =
-          Math.addExact(recordsByRecovery.getOrDefault(recoveryKey, 0L), 1L);
+      long recoveryRecords = Math.addExact(recordsByRecovery.getOrDefault(recoveryKey, 0L), 1L);
       totalBytes = Math.addExact(totalBytes, entry.getValue().size());
       totalRecords = Math.addExact(totalRecords, 1L);
       if (recoveryBytes > conf.recoveryTaskCommitMaxInlineBytesPerRecovery()
@@ -587,30 +581,34 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
     applicationMetas.remove(appId);
     applicationInfos.remove(appId);
     applicationWorkers.remove(appId);
-    committedShuffleCatalogs.entrySet().removeIf(
-        entry -> {
-          try {
-            return appId.equals(
-                org.apache.celeborn.common.protocol.PbCommittedShuffleCatalog.parseFrom(
-                        entry.getValue())
-                    .getAppId());
-          } catch (com.google.protobuf.InvalidProtocolBufferException e) {
-            throw new IllegalStateException("Malformed committed catalog in master state", e);
-          }
-        });
+    committedShuffleCatalogs
+        .entrySet()
+        .removeIf(
+            entry -> {
+              try {
+                return appId.equals(
+                    org.apache.celeborn.common.protocol.PbCommittedShuffleCatalog.parseFrom(
+                            entry.getValue())
+                        .getAppId());
+              } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+                throw new IllegalStateException("Malformed committed catalog in master state", e);
+              }
+            });
     String recoveryIndexPrefix = appId.length() + ":" + appId;
     committedShuffleCatalogIndex.keySet().removeIf(key -> key.startsWith(recoveryIndexPrefix));
     sourceRecoveryAnchors.keySet().removeIf(key -> key.startsWith(recoveryIndexPrefix));
-    recoveryTaskCommits.entrySet().removeIf(
-        entry -> {
-          if (entry.getKey().startsWith(recoveryIndexPrefix)) {
-            releaseRecoveryTaskCommitCapacity(
-                parseAndValidateRecoveryTaskCommit(entry.getValue(), entry.getKey()),
-                entry.getValue().size());
-            return true;
-          }
-          return false;
-        });
+    recoveryTaskCommits
+        .entrySet()
+        .removeIf(
+            entry -> {
+              if (entry.getKey().startsWith(recoveryIndexPrefix)) {
+                releaseRecoveryTaskCommitCapacity(
+                    parseAndValidateRecoveryTaskCommit(entry.getValue(), entry.getKey()),
+                    entry.getValue().size());
+                return true;
+              }
+              return false;
+            });
   }
 
   @VisibleForTesting
@@ -915,20 +913,24 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
           (key, value) -> recoveryTaskCommitRecordsByRecovery.put(key, new AtomicLong(value)));
       recoveryTaskCommitInlineBytes.set(taskCommitState.totalBytes);
       recoveryTaskCommitInlineRecords.set(taskCommitState.totalRecords);
-      committedShuffleCatalogs.values().forEach(
-          bytes -> {
-            try {
-              org.apache.celeborn.common.protocol.PbCommittedShuffleCatalog catalog =
-                  org.apache.celeborn.common.protocol.PbCommittedShuffleCatalog.parseFrom(bytes);
-              if (!catalog.getRecoveryKey().isEmpty()) {
-                committedShuffleCatalogIndex.put(
-                    committedCatalogRecoveryKey(catalog.getAppId(), catalog.getRecoveryKey()),
-                    catalog.getShuffleId());
-              }
-            } catch (com.google.protobuf.InvalidProtocolBufferException e) {
-              throw new IllegalStateException("Snapshot contains a malformed committed catalog", e);
-            }
-          });
+      committedShuffleCatalogs
+          .values()
+          .forEach(
+              bytes -> {
+                try {
+                  org.apache.celeborn.common.protocol.PbCommittedShuffleCatalog catalog =
+                      org.apache.celeborn.common.protocol.PbCommittedShuffleCatalog.parseFrom(
+                          bytes);
+                  if (!catalog.getRecoveryKey().isEmpty()) {
+                    committedShuffleCatalogIndex.put(
+                        committedCatalogRecoveryKey(catalog.getAppId(), catalog.getRecoveryKey()),
+                        catalog.getShuffleId());
+                  }
+                } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+                  throw new IllegalStateException(
+                      "Snapshot contains a malformed committed catalog", e);
+                }
+              });
 
       registeredAppAndShuffles.forEach(
           (appId, shuffleId) -> {

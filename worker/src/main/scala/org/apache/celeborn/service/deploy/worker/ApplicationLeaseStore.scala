@@ -128,7 +128,8 @@ final private[worker] class ApplicationLeaseStore(root: File, durableIdentity: B
         Files.move(temporary.toPath, stateFile.toPath, StandardCopyOption.REPLACE_EXISTING)
     }
     val directory = FileChannel.open(root.toPath, StandardOpenOption.READ)
-    try directory.force(true) finally directory.close()
+    try directory.force(true)
+    finally directory.close()
   }
 
   override def close(): Unit = {}

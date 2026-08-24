@@ -24,8 +24,7 @@ import java.util.{Collections, HashMap}
 import org.scalatest.funsuite.AnyFunSuite
 
 import org.apache.celeborn.common.CelebornConf
-import org.apache.celeborn.common.protocol.{
-  PbCommittedShuffleCatalog, PbPartitionLocation, PbPartitionLocationSet, PbSnapshotMetaInfo}
+import org.apache.celeborn.common.protocol.{PbCommittedShuffleCatalog, PbPartitionLocation, PbPartitionLocationSet, PbSnapshotMetaInfo}
 import org.apache.celeborn.common.util.RecoveryTaskCommitUtils
 
 class ApplicationLeaseSuite extends AnyFunSuite {
@@ -45,9 +44,11 @@ class ApplicationLeaseSuite extends AnyFunSuite {
       .setNumMappers(1)
       .setNumPartitions(1)
       .addMapperAttempts(attempt)
-      .putFileGroups(0, PbPartitionLocationSet.newBuilder()
-        .addLocations(PbPartitionLocation.newBuilder().setId(0).build())
-        .build())
+      .putFileGroups(
+        0,
+        PbPartitionLocationSet.newBuilder()
+          .addLocations(PbPartitionLocation.newBuilder().setId(0).build())
+          .build())
       .build()
       .toByteArray
 
@@ -107,10 +108,17 @@ class ApplicationLeaseSuite extends AnyFunSuite {
     val committedCatalog = catalog()
     source.updateCommittedShuffleCatalogMeta("logical-app", 7, committedCatalog)
     source.updateSourceRecoveryAnchorMeta(
-      "logical-app", "query-1", "iceberg:catalog.db.table", "snapshot:41")
+      "logical-app",
+      "query-1",
+      "iceberg:catalog.db.table",
+      "snapshot:41")
     val taskPayload = "task-envelope".getBytes("UTF-8")
     source.updateRecoveryTaskCommitMeta(
-      "logical-app", "query-1", "write-1", 0, taskPayload,
+      "logical-app",
+      "query-1",
+      "write-1",
+      0,
+      taskPayload,
       MessageDigest.getInstance("SHA-256").digest(taskPayload))
     val snapshot = Files.createTempFile("celeborn-application-lease", ".snapshot")
     try {
@@ -124,11 +132,18 @@ class ApplicationLeaseSuite extends AnyFunSuite {
       assert(restored.committedShuffleCatalogs.get("logical-app-7").toByteArray.sameElements(
         committedCatalog))
       assert(restored.getCommittedShuffleCatalog(
-        "logical-app", 0, "query-1/stage-1").toByteArray.sameElements(committedCatalog))
+        "logical-app",
+        0,
+        "query-1/stage-1").toByteArray.sameElements(committedCatalog))
       assert(restored.getSourceRecoveryAnchor(
-        "logical-app", "query-1", "iceberg:catalog.db.table") == "snapshot:41")
+        "logical-app",
+        "query-1",
+        "iceberg:catalog.db.table") == "snapshot:41")
       assert(restored.getRecoveryTaskCommit(
-        "logical-app", "query-1", "write-1", 0).getPayload.toByteArray.sameElements(taskPayload))
+        "logical-app",
+        "query-1",
+        "write-1",
+        0).getPayload.toByteArray.sameElements(taskPayload))
       assert(restored.recoveryTaskCommitInlineRecords() == 1L)
       assert(restored.recoveryTaskCommitInlineBytes() > taskPayload.length)
     } finally {
@@ -143,39 +158,87 @@ class ApplicationLeaseSuite extends AnyFunSuite {
     def digest(bytes: Array[Byte]) = MessageDigest.getInstance("SHA-256").digest(bytes)
 
     val published = meta.updateRecoveryTaskCommitMeta(
-      "logical-app", "query-1", "write-1", 7, first, digest(first))
+      "logical-app",
+      "query-1",
+      "write-1",
+      7,
+      first,
+      digest(first))
     assert(published.getPayload.toByteArray.sameElements(first))
     assert(meta.updateRecoveryTaskCommitMeta(
-      "logical-app", "query-1", "write-1", 7, first, digest(first)) == published)
+      "logical-app",
+      "query-1",
+      "write-1",
+      7,
+      first,
+      digest(first)) == published)
     assert(meta.updateRecoveryTaskCommitMeta(
-      "logical-app", "query-1", "write-1", 7, second, digest(second)) == published)
+      "logical-app",
+      "query-1",
+      "write-1",
+      7,
+      second,
+      digest(second)) == published)
     assert(meta.getRecoveryTaskCommit(
-      "logical-app", "query-1", "write-1", 7) == published)
+      "logical-app",
+      "query-1",
+      "write-1",
+      7) == published)
 
     intercept[IllegalArgumentException] {
       meta.updateRecoveryTaskCommitMeta(
-        "logical-app", "query-1", "write-1", 8, first, new Array[Byte](32))
+        "logical-app",
+        "query-1",
+        "write-1",
+        8,
+        first,
+        new Array[Byte](32))
     }
     intercept[IllegalArgumentException] {
       val empty = Array.empty[Byte]
       meta.updateRecoveryTaskCommitMeta(
-        "logical-app", "query-1", "write-1", 8, empty, digest(empty))
+        "logical-app",
+        "query-1",
+        "write-1",
+        8,
+        empty,
+        digest(empty))
     }
     intercept[IllegalArgumentException] {
       meta.updateRecoveryTaskCommitMeta(
-        "logical-app", "query-1", "write-1", -2, first, digest(first))
+        "logical-app",
+        "query-1",
+        "write-1",
+        -2,
+        first,
+        digest(first))
     }
 
     val maxUtf8Identity = "é" * (RecoveryTaskCommitUtils.MAX_IDENTITY_UTF8_BYTES / 2)
     meta.updateRecoveryTaskCommitMeta(
-      "logical-app", maxUtf8Identity, "write-2", 0, first, digest(first))
+      "logical-app",
+      maxUtf8Identity,
+      "write-2",
+      0,
+      first,
+      digest(first))
     intercept[IllegalArgumentException] {
       meta.updateRecoveryTaskCommitMeta(
-        "logical-app", maxUtf8Identity + "é", "write-2", 0, first, digest(first))
+        "logical-app",
+        maxUtf8Identity + "é",
+        "write-2",
+        0,
+        first,
+        digest(first))
     }
     intercept[IllegalArgumentException] {
       meta.updateRecoveryTaskCommitMeta(
-        "logical-app", "invalid-\uD800", "write-2", 0, first, digest(first))
+        "logical-app",
+        "invalid-\uD800",
+        "write-2",
+        0,
+        first,
+        digest(first))
     }
   }
 
@@ -192,7 +255,9 @@ class ApplicationLeaseSuite extends AnyFunSuite {
       val record = org.apache.celeborn.common.protocol.PbRecoveryTaskCommitRecord
         .parseFrom(parsed.getRecoveryTaskCommitsMap.get(key))
         .toBuilder.clearSha256().build().toByteString
-      Files.write(snapshot, parsed.toBuilder.putRecoveryTaskCommits(key, record).build().toByteArray)
+      Files.write(
+        snapshot,
+        parsed.toBuilder.putRecoveryTaskCommits(key, record).build().toByteArray)
 
       val target = metadata
       target.updateSourceRecoveryAnchorMeta("live", "execution", "source", "anchor")
@@ -254,13 +319,25 @@ class ApplicationLeaseSuite extends AnyFunSuite {
   test("source recovery anchors are immutable per logical execution and source") {
     val meta = metadata
     assert(meta.updateSourceRecoveryAnchorMeta(
-      "logical-app", "query-1", "iceberg:catalog.db.table", "snapshot:41") == "snapshot:41")
+      "logical-app",
+      "query-1",
+      "iceberg:catalog.db.table",
+      "snapshot:41") == "snapshot:41")
     assert(meta.updateSourceRecoveryAnchorMeta(
-      "logical-app", "query-1", "iceberg:catalog.db.table", "snapshot:42") == "snapshot:41")
+      "logical-app",
+      "query-1",
+      "iceberg:catalog.db.table",
+      "snapshot:42") == "snapshot:41")
     assert(meta.updateSourceRecoveryAnchorMeta(
-      "logical-app", "query-1", "iceberg:catalog.db.other", "snapshot:9") == "snapshot:9")
+      "logical-app",
+      "query-1",
+      "iceberg:catalog.db.other",
+      "snapshot:9") == "snapshot:9")
     assert(meta.updateSourceRecoveryAnchorMeta(
-      "logical-app", "query-2", "iceberg:catalog.db.table", "snapshot:42") == "snapshot:42")
+      "logical-app",
+      "query-2",
+      "iceberg:catalog.db.table",
+      "snapshot:42") == "snapshot:42")
 
     intercept[IllegalArgumentException] {
       meta.updateSourceRecoveryAnchorMeta("logical-app", "", "source", "anchor")
@@ -284,7 +361,9 @@ class ApplicationLeaseSuite extends AnyFunSuite {
     }
     intercept[IllegalStateException] {
       meta.updateCommittedShuffleCatalogMeta(
-        "logical-app", 10, catalog(shuffleId = 10))
+        "logical-app",
+        10,
+        catalog(shuffleId = 10))
     }
 
     val missingReducer = PbCommittedShuffleCatalog.newBuilder()
@@ -305,9 +384,11 @@ class ApplicationLeaseSuite extends AnyFunSuite {
       .setNumMappers(1)
       .setNumPartitions(1)
       .addMapperAttempts(0)
-      .putFileGroups(0, PbPartitionLocationSet.newBuilder()
-        .addLocations(PbPartitionLocation.newBuilder().setId(1).build())
-        .build())
+      .putFileGroups(
+        0,
+        PbPartitionLocationSet.newBuilder()
+          .addLocations(PbPartitionLocation.newBuilder().setId(1).build())
+          .build())
       .build()
       .toByteArray
     intercept[IllegalArgumentException] {

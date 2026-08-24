@@ -116,8 +116,8 @@ public class MetaHandler {
       List<Integer> lostShuffles;
       switch (metaRequestType) {
         case PublishRecoveryTaskCommit:
-          org.apache.celeborn.service.deploy.master.clustermeta.ResourceProtos.PublishRecoveryTaskCommitRequest
-              taskCommitRequest = request.getPublishRecoveryTaskCommitRequest();
+          PbPublishRecoveryTaskCommitRequest taskCommitRequest =
+              request.getPublishRecoveryTaskCommitRequest();
           metaSystem.requireApplicationLeaseOwnerMeta(
               taskCommitRequest.getAppId(),
               taskCommitRequest.getApplicationLeaseEpoch(),

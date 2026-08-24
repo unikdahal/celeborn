@@ -2564,7 +2564,8 @@ object CelebornConf extends Logging {
         "The bound protects Raft logs, master heap, and snapshots; larger envelopes require " +
         "a durable blob-backed record codec.")
       .bytesConf(ByteUnit.BYTE)
-      .checkValue(value => value > 0 && value <= 16 * 1024 * 1024,
+      .checkValue(
+        value => value > 0 && value <= 16 * 1024 * 1024,
         "Recovery task commit maximum payload must be between 1 byte and 16 MiB")
       .createWithDefaultString("1m")
 
@@ -2575,7 +2576,8 @@ object CelebornConf extends Logging {
       .doc("Maximum serialized protobuf response bytes returned by one recovery task commit " +
         "batch lookup, including entry framing, digests, payloads, and authoritative misses.")
       .bytesConf(ByteUnit.BYTE)
-      .checkValue(value => value > 0 && value <= 64 * 1024 * 1024,
+      .checkValue(
+        value => value > 0 && value <= 64 * 1024 * 1024,
         "Recovery task commit batch response must be between 1 byte and 64 MiB")
       .createWithDefaultString("16m")
 

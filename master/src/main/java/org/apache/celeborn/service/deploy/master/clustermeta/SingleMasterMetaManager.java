@@ -48,8 +48,7 @@ public class SingleMasterMetaManager extends AbstractMetaManager {
           String applicationLeaseOwnerId,
           String requestId) {
     requireApplicationLeaseOwnerMeta(appId, applicationLeaseEpoch, applicationLeaseOwnerId);
-    return updateRecoveryTaskCommitMeta(
-        appId, recoveryId, writeId, partitionId, payload, sha256);
+    return updateRecoveryTaskCommitMeta(appId, recoveryId, writeId, partitionId, payload, sha256);
   }
 
   @Override
@@ -60,11 +59,7 @@ public class SingleMasterMetaManager extends AbstractMetaManager {
 
   @Override
   public String handleResolveSourceRecoveryAnchor(
-      String appId,
-      String recoveryId,
-      String sourceId,
-      String currentAnchor,
-      String requestId) {
+      String appId, String recoveryId, String sourceId, String currentAnchor, String requestId) {
     return updateSourceRecoveryAnchorMeta(appId, recoveryId, sourceId, currentAnchor);
   }
 

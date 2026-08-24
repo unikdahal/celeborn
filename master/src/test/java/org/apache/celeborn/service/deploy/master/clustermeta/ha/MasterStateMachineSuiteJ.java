@@ -142,8 +142,7 @@ public class MasterStateMachineSuiteJ extends RatisBaseSuiteJ {
     Assert.assertTrue(stateMachine.runCommand(advancedSource, -1).getSuccess());
     Assert.assertEquals(
         "snapshot:41",
-        statusSystem.getSourceRecoveryAnchor(
-            "logical-app", "query-1", "iceberg:catalog.db.table"));
+        metaSystem.getSourceRecoveryAnchor("logical-app", "query-1", "iceberg:catalog.db.table"));
 
     byte[] payload = "task-envelope".getBytes(java.nio.charset.StandardCharsets.UTF_8);
     byte[] digest;
@@ -174,7 +173,7 @@ public class MasterStateMachineSuiteJ extends RatisBaseSuiteJ {
     Assert.assertTrue(stateMachine.runCommand(taskCommit, -1).getSuccess());
     Assert.assertArrayEquals(
         payload,
-        statusSystem
+        metaSystem
             .getRecoveryTaskCommit("logical-app", "query-1", "write-1", 2)
             .getPayload()
             .toByteArray());
@@ -202,8 +201,7 @@ public class MasterStateMachineSuiteJ extends RatisBaseSuiteJ {
                     .setPartitionId(3))
             .build();
     Assert.assertFalse(stateMachine.runCommand(staleTaskCommit, -1).getSuccess());
-    Assert.assertNull(
-        statusSystem.getRecoveryTaskCommit("logical-app", "query-1", "write-1", 3));
+    Assert.assertNull(metaSystem.getRecoveryTaskCommit("logical-app", "query-1", "write-1", 3));
   }
 
   @Test

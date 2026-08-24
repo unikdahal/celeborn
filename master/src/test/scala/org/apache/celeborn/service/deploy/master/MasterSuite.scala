@@ -326,20 +326,22 @@ class MasterSuite extends AnyFunSuite
         val context = mock(classOf[RpcCallContext])
         val captor = ArgumentCaptor.forClass(classOf[Any])
         master.receiveAndReply(context).applyOrElse(
-          request, (_: Any) => fail(s"${request.getClass.getSimpleName} was not handled"))
+          request,
+          (_: Any) => fail(s"${request.getClass.getSimpleName} was not handled"))
         verify(context).reply(captor.capture())
         responseClass.cast(captor.getValue)
       }
       def publish(epoch: Long, owner: String, partitionId: Int, value: String) = {
         val bytes = value.getBytes("UTF-8")
-        rpc(PbPublishRecoveryTaskCommit.newBuilder()
-          .setAppId("logical-app").setRecoveryId("query-1").setWriteId("write-1")
-          .setPartitionId(partitionId)
-          .setPayload(com.google.protobuf.ByteString.copyFrom(bytes))
-          .setSha256(com.google.protobuf.ByteString.copyFrom(
-            MessageDigest.getInstance("SHA-256").digest(bytes)))
-          .setApplicationLeaseEpoch(epoch).setApplicationLeaseOwnerId(owner)
-          .setRequestId(MasterClient.genRequestId()).build(),
+        rpc(
+          PbPublishRecoveryTaskCommit.newBuilder()
+            .setAppId("logical-app").setRecoveryId("query-1").setWriteId("write-1")
+            .setPartitionId(partitionId)
+            .setPayload(com.google.protobuf.ByteString.copyFrom(bytes))
+            .setSha256(com.google.protobuf.ByteString.copyFrom(
+              MessageDigest.getInstance("SHA-256").digest(bytes)))
+            .setApplicationLeaseEpoch(epoch).setApplicationLeaseOwnerId(owner)
+            .setRequestId(MasterClient.genRequestId()).build(),
           classOf[PbPublishRecoveryTaskCommitResponse])
       }
 
@@ -353,17 +355,19 @@ class MasterSuite extends AnyFunSuite
       assert(!publish(0L, "driver-0", 1, "stale").getSuccess)
       assert(!publish(1L, "driver-1", 1, "payload-too-large").getSuccess)
 
-      val get = rpc(PbGetRecoveryTaskCommit.newBuilder()
-        .setAppId("logical-app").setRecoveryId("query-1").setWriteId("write-1")
-        .setPartitionId(0).setApplicationLeaseEpoch(1L)
-        .setApplicationLeaseOwnerId("driver-1").build(),
+      val get = rpc(
+        PbGetRecoveryTaskCommit.newBuilder()
+          .setAppId("logical-app").setRecoveryId("query-1").setWriteId("write-1")
+          .setPartitionId(0).setApplicationLeaseEpoch(1L)
+          .setApplicationLeaseOwnerId("driver-1").build(),
         classOf[PbGetRecoveryTaskCommitResponse])
       assert(get.getSuccess && get.getFound && get.getPayload.toStringUtf8 == "winner")
 
-      val batch = rpc(PbBatchGetRecoveryTaskCommits.newBuilder()
-        .setAppId("logical-app").setRecoveryId("query-1").setWriteId("write-1")
-        .addPartitionIds(1).addPartitionIds(0).setApplicationLeaseEpoch(1L)
-        .setApplicationLeaseOwnerId("driver-1").build(),
+      val batch = rpc(
+        PbBatchGetRecoveryTaskCommits.newBuilder()
+          .setAppId("logical-app").setRecoveryId("query-1").setWriteId("write-1")
+          .addPartitionIds(1).addPartitionIds(0).setApplicationLeaseEpoch(1L)
+          .setApplicationLeaseOwnerId("driver-1").build(),
         classOf[PbBatchGetRecoveryTaskCommitsResponse])
       assert(batch.getSuccess)
       assert(batch.getEntriesCount == 2)
@@ -371,10 +375,11 @@ class MasterSuite extends AnyFunSuite
       assert(batch.getEntries(1).getFound)
       assert(batch.getEntries(1).getPayload.toStringUtf8 == "winner")
 
-      val oversizedBatch = rpc(PbBatchGetRecoveryTaskCommits.newBuilder()
-        .setAppId("logical-app").setRecoveryId("query-1").setWriteId("write-1")
-        .addPartitionIds(0).addPartitionIds(0).setApplicationLeaseEpoch(1L)
-        .setApplicationLeaseOwnerId("driver-1").build(),
+      val oversizedBatch = rpc(
+        PbBatchGetRecoveryTaskCommits.newBuilder()
+          .setAppId("logical-app").setRecoveryId("query-1").setWriteId("write-1")
+          .addPartitionIds(0).addPartitionIds(0).setApplicationLeaseEpoch(1L)
+          .setApplicationLeaseOwnerId("driver-1").build(),
         classOf[PbBatchGetRecoveryTaskCommitsResponse])
       assert(!oversizedBatch.getSuccess)
       assert(oversizedBatch.getEntriesCount == 0)

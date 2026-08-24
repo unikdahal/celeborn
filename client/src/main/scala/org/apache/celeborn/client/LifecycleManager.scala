@@ -405,7 +405,9 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
       sha256: Array[Byte]): PbPublishRecoveryTaskCommitResponse = {
     RecoveryTaskCommitUtils.validateIdentity(appUniqueId, recoveryId, writeId, partitionId)
     RecoveryTaskCommitUtils.validatePayload(
-      payload, sha256, conf.recoveryTaskCommitMaxPayloadSize)
+      payload,
+      sha256,
+      conf.recoveryTaskCommitMaxPayloadSize)
     val lease = requireRecoveryLease("publish a recovery task commit")
     masterClient.askSync[PbPublishRecoveryTaskCommitResponse](
       PbPublishRecoveryTaskCommit.newBuilder()
@@ -445,13 +447,17 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
       recoveryId: String,
       writeId: String,
       partitionIds: java.util.List[Integer]): PbBatchGetRecoveryTaskCommitsResponse = {
-    require(partitionIds != null && !partitionIds.isEmpty && partitionIds.size() <= 1024,
+    require(
+      partitionIds != null && !partitionIds.isEmpty && partitionIds.size() <= 1024,
       "partitionIds size must be within [1, 1024]")
     RecoveryTaskCommitUtils.validateIdentity(appUniqueId, recoveryId, writeId, -1)
     partitionIds.asScala.foreach { partitionId =>
       require(partitionId != null, "partitionIds must not contain null")
       RecoveryTaskCommitUtils.validateIdentity(
-        appUniqueId, recoveryId, writeId, partitionId.intValue())
+        appUniqueId,
+        recoveryId,
+        writeId,
+        partitionId.intValue())
     }
     val lease = requireRecoveryLease("read recovery task commits")
     masterClient.askSync[PbBatchGetRecoveryTaskCommitsResponse](
@@ -847,7 +853,9 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
           new IllegalArgumentException("Recovery task commit application mismatch"))
       } else {
         context.reply(getRecoveryTaskCommit(
-          pb.getRecoveryId, pb.getWriteId, pb.getPartitionId))
+          pb.getRecoveryId,
+          pb.getWriteId,
+          pb.getPartitionId))
       }
 
     case pb: PbBatchGetRecoveryTaskCommits =>
@@ -856,7 +864,9 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
           new IllegalArgumentException("Recovery task commit application mismatch"))
       } else {
         context.reply(batchGetRecoveryTaskCommits(
-          pb.getRecoveryId, pb.getWriteId, pb.getPartitionIdsList))
+          pb.getRecoveryId,
+          pb.getWriteId,
+          pb.getPartitionIdsList))
       }
   }
 
@@ -2598,28 +2608,30 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
     val catalogBytes = response.getCatalog.toByteArray
     val actualDigest = MessageDigest.getInstance("SHA-256").digest(catalogBytes)
     if (response.getSha256.size() != 32 ||
-        !MessageDigest.isEqual(actualDigest, response.getSha256.toByteArray) ||
-        (expectedCatalogSha256.nonEmpty &&
-          !MessageDigest.isEqual(actualDigest, expectedCatalogSha256))) {
+      !MessageDigest.isEqual(actualDigest, response.getSha256.toByteArray) ||
+      (expectedCatalogSha256.nonEmpty &&
+        !MessageDigest.isEqual(actualDigest, expectedCatalogSha256))) {
       throw new IllegalStateException(
         s"Committed catalog digest mismatch for recovery key $recoveryKey")
     }
 
-    val catalog = try {
-      PbCommittedShuffleCatalog.parseFrom(catalogBytes)
-    } catch {
-      case e: com.google.protobuf.InvalidProtocolBufferException =>
-        throw new IllegalStateException(
-          s"Malformed committed catalog for recovery key $recoveryKey", e)
-    }
+    val catalog =
+      try {
+        PbCommittedShuffleCatalog.parseFrom(catalogBytes)
+      } catch {
+        case e: com.google.protobuf.InvalidProtocolBufferException =>
+          throw new IllegalStateException(
+            s"Malformed committed catalog for recovery key $recoveryKey",
+            e)
+      }
     val celebornShuffleId = catalog.getShuffleId
     if (catalog.getAppId != appUniqueId ||
-        catalog.getRecoveryKey != recoveryKey ||
-        catalog.getNumMappers != numMappers ||
-        catalog.getNumPartitions != numPartitions ||
-        catalog.getMapperAttemptsCount != numMappers ||
-        catalog.getMapperAttemptsList.asScala.exists(_.intValue() < 0) ||
-        catalog.getFileGroupsCount != numPartitions) {
+      catalog.getRecoveryKey != recoveryKey ||
+      catalog.getNumMappers != numMappers ||
+      catalog.getNumPartitions != numPartitions ||
+      catalog.getMapperAttemptsCount != numMappers ||
+      catalog.getMapperAttemptsList.asScala.exists(_.intValue() < 0) ||
+      catalog.getFileGroupsCount != numPartitions) {
       throw new IllegalStateException(
         s"Committed catalog identity or dimensions do not match recovery key $recoveryKey " +
           s"(original Spark shuffle ${catalog.getAppShuffleId}, current Spark shuffle " +
@@ -2630,14 +2642,14 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
     val bytesByPartitionId = Array.fill[Long](numPartitions)(0L)
     catalog.getFileGroupsMap.asScala.foreach { case (partitionId, locationSet) =>
       if (partitionId < 0 || partitionId >= numPartitions ||
-          locationSet.getLocationsCount == 0) {
+        locationSet.getLocationsCount == 0) {
         throw new IllegalStateException(
           s"Committed catalog contains an invalid reducer $partitionId for $recoveryKey")
       }
       val locations = new util.HashSet[PartitionLocation](locationSet.getLocationsCount)
       locationSet.getLocationsList.asScala.foreach { pbLocation =>
         if (pbLocation.getId != partitionId || !pbLocation.hasStorageInfo ||
-            pbLocation.getStorageInfo.getFileSize < 0) {
+          pbLocation.getStorageInfo.getFileSize < 0) {
           throw new IllegalStateException(
             s"Committed catalog contains an invalid location for reducer $partitionId " +
               s"for $recoveryKey")

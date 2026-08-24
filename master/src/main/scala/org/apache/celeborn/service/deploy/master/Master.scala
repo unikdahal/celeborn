@@ -262,6 +262,18 @@ private[celeborn] class Master(
     statusSystem.appHeartbeatTime.size
   }
   masterSource.addGauge(MasterSource.PARTITION_SIZE) { () => statusSystem.estimatedPartitionSize }
+  masterSource.addGauge(MasterSource.RECOVERY_TASK_COMMIT_INLINE_BYTES) { () =>
+    statusSystem.recoveryTaskCommitInlineBytes()
+  }
+  masterSource.addGauge(MasterSource.RECOVERY_TASK_COMMIT_INLINE_RECORDS) { () =>
+    statusSystem.recoveryTaskCommitInlineRecords()
+  }
+  masterSource.addGauge(MasterSource.RECOVERY_COMMITTED_CATALOG_COUNT) { () =>
+    statusSystem.committedShuffleCatalogs.size
+  }
+  masterSource.addGauge(MasterSource.APPLICATION_LEASE_ACTIVE_COUNT) { () =>
+    statusSystem.applicationLeases.size
+  }
   masterSource.addGauge(MasterSource.ACTIVE_SHUFFLE_SIZE) { () =>
     statusSystem.workersMap.values().parallelStream()
       .mapToLong(new ToLongFunction[WorkerInfo]() {
@@ -1311,7 +1323,7 @@ private[celeborn] class Master(
           s"Application ${request.getAppId} is still leased to ${currentLease.ownerId()}")
       }
       if (!request.getRenewal && request.getExpectedEpoch == -1L && currentLease != null &&
-          currentLease.ownerId() == request.getOwnerId && nowMs < currentLease.expiresAtMs()) {
+        currentLease.ownerId() == request.getOwnerId && nowMs < currentLease.expiresAtMs()) {
         fenceApplicationWorkers(request.getAppId, currentLease)
         response
           .setSuccess(true)
@@ -1357,8 +1369,15 @@ private[celeborn] class Master(
         .setEpoch(lease.epoch())
         .setOwnerId(lease.ownerId())
         .setExpiresAtMs(lease.expiresAtMs())
+      // A renewal keeps the epoch; a takeover advances it. Counting them apart is what makes an
+      // unexpected ownership change visible without reading logs.
+      masterSource.incRecovery(
+        MasterSource.APPLICATION_LEASE_COUNT,
+        if (request.getRenewal) MasterSource.RECOVERY_OUTCOME_DUPLICATE
+        else MasterSource.RECOVERY_OUTCOME_ACCEPTED)
     } catch {
       case NonFatal(e) =>
+        masterSource.incRecovery(MasterSource.APPLICATION_LEASE_COUNT, recoveryFailureOutcome(e))
         response.setSuccess(false).setMessage(Option(e.getMessage).getOrElse(e.getClass.getName))
     }
     context.reply(response.build())
@@ -1381,8 +1400,14 @@ private[celeborn] class Master(
         request.getRequestId)
       response.setSuccess(true).setSha256(
         com.google.protobuf.ByteString.copyFrom(MessageDigest.getInstance("SHA-256").digest(bytes)))
+      masterSource.incRecovery(
+        MasterSource.RECOVERY_CATALOG_PUBLISH_COUNT,
+        MasterSource.RECOVERY_OUTCOME_ACCEPTED)
     } catch {
       case NonFatal(e) =>
+        masterSource.incRecovery(
+          MasterSource.RECOVERY_CATALOG_PUBLISH_COUNT,
+          recoveryFailureOutcome(e))
         response.setSuccess(false).setMessage(Option(e.getMessage).getOrElse(e.getClass.getName))
     }
     context.reply(response.build())
@@ -1407,8 +1432,16 @@ private[celeborn] class Master(
         throw new IllegalStateException("Replicated source recovery anchor is empty")
       }
       response.setSuccess(true).setAnchor(anchor)
+      // The returned anchor equals the proposal only when this caller's value became canonical.
+      masterSource.incRecovery(
+        MasterSource.RECOVERY_ANCHOR_RESOLVE_COUNT,
+        if (anchor == request.getCurrentAnchor) MasterSource.RECOVERY_OUTCOME_ACCEPTED
+        else MasterSource.RECOVERY_OUTCOME_DUPLICATE)
     } catch {
       case NonFatal(e) =>
+        masterSource.incRecovery(
+          MasterSource.RECOVERY_ANCHOR_RESOLVE_COUNT,
+          recoveryFailureOutcome(e))
         response.setSuccess(false).setMessage(Option(e.getMessage).getOrElse(e.getClass.getName))
     }
     context.reply(response.build())
@@ -1420,7 +1453,10 @@ private[celeborn] class Master(
     val response = PbPublishRecoveryTaskCommitResponse.newBuilder()
     try {
       RecoveryTaskCommitUtils.validateIdentity(
-        request.getAppId, request.getRecoveryId, request.getWriteId, request.getPartitionId)
+        request.getAppId,
+        request.getRecoveryId,
+        request.getWriteId,
+        request.getPartitionId)
       RecoveryTaskCommitUtils.validatePayload(
         request.getPayload.toByteArray,
         request.getSha256.toByteArray,
@@ -1439,17 +1475,33 @@ private[celeborn] class Master(
         request.getApplicationLeaseEpoch,
         request.getApplicationLeaseOwnerId,
         request.getRequestId)
+      val canonicalDiffers =
+        !MessageDigest.isEqual(
+          request.getPayload.toByteArray,
+          canonical.getPayload.toByteArray) ||
+          !MessageDigest.isEqual(request.getSha256.toByteArray, canonical.getSha256.toByteArray)
       response
         .setSuccess(true)
         .setPayload(canonical.getPayload)
         .setSha256(canonical.getSha256)
-        .setCanonicalDiffers(
-          !MessageDigest.isEqual(
-            request.getPayload.toByteArray,
-            canonical.getPayload.toByteArray) ||
-            !MessageDigest.isEqual(request.getSha256.toByteArray, canonical.getSha256.toByteArray))
+        .setCanonicalDiffers(canonicalDiffers)
+      if (canonicalDiffers) {
+        masterSource.incRecovery(
+          MasterSource.RECOVERY_TASK_COMMIT_PUBLISH_COUNT,
+          MasterSource.RECOVERY_OUTCOME_DUPLICATE)
+      } else {
+        masterSource.incRecovery(
+          MasterSource.RECOVERY_TASK_COMMIT_PUBLISH_COUNT,
+          MasterSource.RECOVERY_OUTCOME_ACCEPTED)
+        masterSource.incCounter(
+          MasterSource.RECOVERY_TASK_COMMIT_BYTES,
+          request.getPayload.size().toLong)
+      }
     } catch {
       case NonFatal(e) =>
+        masterSource.incRecovery(
+          MasterSource.RECOVERY_TASK_COMMIT_PUBLISH_COUNT,
+          recoveryFailureOutcome(e))
         response.setSuccess(false).setMessage(Option(e.getMessage).getOrElse(e.getClass.getName))
     }
     context.reply(response.build())
@@ -1461,19 +1513,33 @@ private[celeborn] class Master(
     val response = PbGetRecoveryTaskCommitResponse.newBuilder()
     try {
       RecoveryTaskCommitUtils.validateIdentity(
-        request.getAppId, request.getRecoveryId, request.getWriteId, request.getPartitionId)
+        request.getAppId,
+        request.getRecoveryId,
+        request.getWriteId,
+        request.getPartitionId)
       requireValidApplicationLease(
         request.getAppId,
         request.getApplicationLeaseEpoch,
         request.getApplicationLeaseOwnerId)
       val record = statusSystem.getRecoveryTaskCommit(
-        request.getAppId, request.getRecoveryId, request.getWriteId, request.getPartitionId)
+        request.getAppId,
+        request.getRecoveryId,
+        request.getWriteId,
+        request.getPartitionId)
       response.setSuccess(true)
       if (record != null) {
         response.setFound(true).setPayload(record.getPayload).setSha256(record.getSha256)
+        masterSource.incRecovery(
+          MasterSource.RECOVERY_LOOKUP_COUNT,
+          MasterSource.RECOVERY_OUTCOME_HIT)
+      } else {
+        masterSource.incRecovery(
+          MasterSource.RECOVERY_LOOKUP_COUNT,
+          MasterSource.RECOVERY_OUTCOME_MISS)
       }
     } catch {
       case NonFatal(e) =>
+        masterSource.incRecovery(MasterSource.RECOVERY_LOOKUP_COUNT, recoveryFailureOutcome(e))
         response.setSuccess(false).setMessage(Option(e.getMessage).getOrElse(e.getClass.getName))
     }
     context.reply(response.build())
@@ -1485,28 +1551,46 @@ private[celeborn] class Master(
     val response = PbBatchGetRecoveryTaskCommitsResponse.newBuilder()
     try {
       RecoveryTaskCommitUtils.validateIdentity(
-        request.getAppId, request.getRecoveryId, request.getWriteId, -1)
+        request.getAppId,
+        request.getRecoveryId,
+        request.getWriteId,
+        -1)
       requireValidApplicationLease(
         request.getAppId,
         request.getApplicationLeaseEpoch,
         request.getApplicationLeaseOwnerId)
-      require(request.getPartitionIdsCount > 0 && request.getPartitionIdsCount <= 1024,
+      require(
+        request.getPartitionIdsCount > 0 && request.getPartitionIdsCount <= 1024,
         s"Recovery task commit batch size ${request.getPartitionIdsCount} is outside [1, 1024]")
       var responseBytes = 2L // serialized `success = true`
       request.getPartitionIdsList.asScala.foreach { partitionId =>
         RecoveryTaskCommitUtils.validateIdentity(
-          request.getAppId, request.getRecoveryId, request.getWriteId, partitionId)
+          request.getAppId,
+          request.getRecoveryId,
+          request.getWriteId,
+          partitionId)
         val entry = PbRecoveryTaskCommitEntry.newBuilder().setPartitionId(partitionId)
         val record = statusSystem.getRecoveryTaskCommit(
-          request.getAppId, request.getRecoveryId, request.getWriteId, partitionId)
+          request.getAppId,
+          request.getRecoveryId,
+          request.getWriteId,
+          partitionId)
         if (record != null) {
           entry.setFound(true).setPayload(record.getPayload).setSha256(record.getSha256)
+          masterSource.incRecovery(
+            MasterSource.RECOVERY_LOOKUP_COUNT,
+            MasterSource.RECOVERY_OUTCOME_HIT)
+        } else {
+          masterSource.incRecovery(
+            MasterSource.RECOVERY_LOOKUP_COUNT,
+            MasterSource.RECOVERY_OUTCOME_MISS)
         }
         val builtEntry = entry.build()
         responseBytes = Math.addExact(
           responseBytes,
           com.google.protobuf.CodedOutputStream.computeMessageSize(2, builtEntry).toLong)
-        require(responseBytes <= recoveryTaskCommitMaxBatchResponseSize,
+        require(
+          responseBytes <= recoveryTaskCommitMaxBatchResponseSize,
           s"Recovery task commit batch response exceeds configured maximum " +
             s"$recoveryTaskCommitMaxBatchResponseSize")
         response.addEntries(builtEntry)
@@ -1514,6 +1598,7 @@ private[celeborn] class Master(
       response.setSuccess(true)
     } catch {
       case NonFatal(e) =>
+        masterSource.incRecovery(MasterSource.RECOVERY_LOOKUP_COUNT, recoveryFailureOutcome(e))
         response.clearEntries().setSuccess(false)
           .setMessage(Option(e.getMessage).getOrElse(e.getClass.getName))
     }
@@ -1553,9 +1638,19 @@ private[celeborn] class Master(
   private def requireValidApplicationLease(appId: String, epoch: Long, ownerId: String): Unit = {
     val lease = statusSystem.applicationLeases.get(appId)
     if (lease == null || !lease.isValid(epoch, ownerId, System.currentTimeMillis())) {
-      throw new IllegalStateException(
+      throw new ApplicationLeaseFencedException(
         s"A current application lease is required for $appId at epoch $epoch and owner $ownerId")
     }
+  }
+
+  /**
+   * Classifies a recovery failure for metrics. Fencing is reported separately from rejection
+   * because the two mean different things to an operator: fencing is a healthy takeover in
+   * progress, rejection is malformed or over-quota input.
+   */
+  private def recoveryFailureOutcome(e: Throwable): String = e match {
+    case _: ApplicationLeaseFencedException => MasterSource.RECOVERY_OUTCOME_FENCED
+    case _ => MasterSource.RECOVERY_OUTCOME_REJECTED
   }
 
   private def fenceApplicationWorkers(

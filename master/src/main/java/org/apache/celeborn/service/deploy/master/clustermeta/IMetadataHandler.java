@@ -44,11 +44,7 @@ public interface IMetadataHandler {
       String appId, int shuffleId, byte[] catalog, String requestId);
 
   String handleResolveSourceRecoveryAnchor(
-      String appId,
-      String recoveryId,
-      String sourceId,
-      String currentAnchor,
-      String requestId);
+      String appId, String recoveryId, String sourceId, String currentAnchor, String requestId);
 
   ApplicationLease handleApplicationLease(
       String appId,

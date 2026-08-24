@@ -28,11 +28,29 @@ class MasterSource(conf: CelebornConf) extends AbstractSource(conf, Role.MASTER)
   RequestSlotsFailureStatuses.foreach { status =>
     addCounter(REQUEST_SLOTS_FAILED_COUNT, Map(STATUS_CODE_LABEL -> status.name()))
   }
+  RecoveryPublishOutcomes.foreach { outcome =>
+    addCounter(RECOVERY_TASK_COMMIT_PUBLISH_COUNT, Map(RECOVERY_OUTCOME_LABEL -> outcome))
+    addCounter(RECOVERY_CATALOG_PUBLISH_COUNT, Map(RECOVERY_OUTCOME_LABEL -> outcome))
+    addCounter(RECOVERY_ANCHOR_RESOLVE_COUNT, Map(RECOVERY_OUTCOME_LABEL -> outcome))
+    addCounter(APPLICATION_LEASE_COUNT, Map(RECOVERY_OUTCOME_LABEL -> outcome))
+  }
+  RecoveryLookupOutcomes.foreach { outcome =>
+    addCounter(RECOVERY_LOOKUP_COUNT, Map(RECOVERY_OUTCOME_LABEL -> outcome))
+  }
+  addCounter(RECOVERY_TASK_COMMIT_BYTES)
   // add timers
   addTimer(OFFER_SLOTS_TIME)
   addTimer(UPDATE_RESOURCE_CONSUMPTION_TIME)
   // start cleaner
   startCleaner()
+
+  /**
+   * Records the outcome of one recovery operation. Outcomes are a closed set so that a
+   *  dashboard can sum them without discovering new label values at runtime.
+   */
+  def incRecovery(name: String, outcome: String, count: Long = 1L): Unit = {
+    incCounter(name, count, Map(RECOVERY_OUTCOME_LABEL -> outcome))
+  }
 
   def incRequestSlotsFailed(status: StatusCode): Unit = {
     if (RequestSlotsFailureStatuses.contains(status)) {
@@ -43,6 +61,47 @@ class MasterSource(conf: CelebornConf) extends AbstractSource(conf, Role.MASTER)
 
 object MasterSource {
   val STATUS_CODE_LABEL = "statusCode"
+
+  val RECOVERY_OUTCOME_LABEL = "outcome"
+
+  // Publication outcomes. "accepted" means this attempt's value became canonical; "duplicate"
+  // means an earlier value was already canonical and was returned unchanged; "fenced" means the
+  // caller no longer holds the application lease; "rejected" covers validation and capacity.
+  val RECOVERY_OUTCOME_ACCEPTED = "accepted"
+  val RECOVERY_OUTCOME_DUPLICATE = "duplicate"
+  val RECOVERY_OUTCOME_FENCED = "fenced"
+  val RECOVERY_OUTCOME_REJECTED = "rejected"
+
+  // Lookup outcomes. "miss" is an authoritative absence, "corrupt" is a digest or parse failure,
+  // and the two must never be conflated: a miss permits recomputation, a corrupt read does not.
+  val RECOVERY_OUTCOME_HIT = "hit"
+  val RECOVERY_OUTCOME_MISS = "miss"
+  val RECOVERY_OUTCOME_CORRUPT = "corrupt"
+
+  val RecoveryPublishOutcomes: Seq[String] = Seq(
+    RECOVERY_OUTCOME_ACCEPTED,
+    RECOVERY_OUTCOME_DUPLICATE,
+    RECOVERY_OUTCOME_FENCED,
+    RECOVERY_OUTCOME_REJECTED)
+
+  val RecoveryLookupOutcomes: Seq[String] = Seq(
+    RECOVERY_OUTCOME_HIT,
+    RECOVERY_OUTCOME_MISS,
+    RECOVERY_OUTCOME_CORRUPT,
+    RECOVERY_OUTCOME_FENCED,
+    RECOVERY_OUTCOME_REJECTED)
+
+  val RECOVERY_TASK_COMMIT_PUBLISH_COUNT = "RecoveryTaskCommitPublishCount"
+  val RECOVERY_TASK_COMMIT_BYTES = "RecoveryTaskCommitBytes"
+  val RECOVERY_CATALOG_PUBLISH_COUNT = "RecoveryCatalogPublishCount"
+  val RECOVERY_ANCHOR_RESOLVE_COUNT = "RecoveryAnchorResolveCount"
+  val RECOVERY_LOOKUP_COUNT = "RecoveryLookupCount"
+  val APPLICATION_LEASE_COUNT = "ApplicationLeaseCount"
+
+  val RECOVERY_TASK_COMMIT_INLINE_BYTES = "RecoveryTaskCommitInlineBytes"
+  val RECOVERY_TASK_COMMIT_INLINE_RECORDS = "RecoveryTaskCommitInlineRecords"
+  val RECOVERY_COMMITTED_CATALOG_COUNT = "RecoveryCommittedCatalogCount"
+  val APPLICATION_LEASE_ACTIVE_COUNT = "ApplicationLeaseActiveCount"
 
   val WORKER_COUNT = "WorkerCount"
 

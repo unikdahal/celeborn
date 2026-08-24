@@ -102,11 +102,7 @@ public class HAMasterMetaManager extends AbstractMetaManager {
 
   @Override
   public String handleResolveSourceRecoveryAnchor(
-      String appId,
-      String recoveryId,
-      String sourceId,
-      String currentAnchor,
-      String requestId) {
+      String appId, String recoveryId, String sourceId, String currentAnchor, String requestId) {
     ResourceProtos.ResourceResponse response =
         ratisServer.submitRequest(
             ResourceRequest.newBuilder()

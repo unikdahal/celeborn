@@ -20,6 +20,7 @@ package org.apache.celeborn.common.protocol
 import java.util.Collections
 
 import com.google.protobuf.ByteString
+
 import org.apache.celeborn.CelebornFunSuite
 import org.apache.celeborn.common.network.protocol.TransportMessage
 import org.apache.celeborn.common.protocol.message.ControlMessages

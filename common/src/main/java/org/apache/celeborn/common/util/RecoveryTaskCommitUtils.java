@@ -46,9 +46,7 @@ public final class RecoveryTaskCommitUtils {
   public static void validatePayload(byte[] payload, byte[] sha256, long maxPayloadBytes) {
     if (payload == null || payload.length == 0 || payload.length > maxPayloadBytes) {
       throw new IllegalArgumentException(
-          "Recovery task commit payload must contain between 1 and "
-              + maxPayloadBytes
-              + " bytes");
+          "Recovery task commit payload must contain between 1 and " + maxPayloadBytes + " bytes");
     }
     if (sha256 == null || sha256.length != 32) {
       throw new IllegalArgumentException("Recovery task commit requires a 32-byte SHA-256 digest");
@@ -82,11 +80,7 @@ public final class RecoveryTaskCommitUtils {
     }
     if (encoded.remaining() > MAX_IDENTITY_UTF8_BYTES) {
       throw new IllegalArgumentException(
-          "Recovery task commit "
-              + name
-              + " exceeds "
-              + MAX_IDENTITY_UTF8_BYTES
-              + " UTF-8 bytes");
+          "Recovery task commit " + name + " exceeds " + MAX_IDENTITY_UTF8_BYTES + " UTF-8 bytes");
     }
   }
 }

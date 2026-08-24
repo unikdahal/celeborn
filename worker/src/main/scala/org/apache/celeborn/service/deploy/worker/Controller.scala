@@ -195,11 +195,12 @@ private[deploy] class Controller(
     case FenceApplication(applicationId, epoch, ownerId, expiresAtMs, leaseDurationMs) =>
       checkAuth(context, applicationId)
       try {
-        val workerExpiresAtMs = if (leaseDurationMs > 0L) {
-          Math.addExact(System.currentTimeMillis(), leaseDurationMs)
-        } else {
-          expiresAtMs
-        }
+        val workerExpiresAtMs =
+          if (leaseDurationMs > 0L) {
+            Math.addExact(System.currentTimeMillis(), leaseDurationMs)
+          } else {
+            expiresAtMs
+          }
         applicationLeaseStore.install(
           applicationId,
           new org.apache.celeborn.common.meta.ApplicationLease(epoch, ownerId, workerExpiresAtMs))
