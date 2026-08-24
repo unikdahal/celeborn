@@ -95,6 +95,11 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
       JavaUtils.newConcurrentHashMap();
   public final ConcurrentHashMap<String, ByteString> recoveryBlobPointers =
       JavaUtils.newConcurrentHashMap();
+  // How many pointers reference each (application, payload digest). Collection on a worker must
+  // never delete a blob that any surviving pointer still names, and scanning every pointer at
+  // collection time would be linear in the width of every live write.
+  private final ConcurrentHashMap<String, AtomicLong> recoveryBlobDigestRefs =
+      JavaUtils.newConcurrentHashMap();
   private final AtomicLong recoveryTaskCommitInlineBytes = new AtomicLong();
   private final AtomicLong recoveryTaskCommitInlineRecords = new AtomicLong();
   private final ConcurrentHashMap<String, AtomicLong> recoveryTaskCommitBytesByRecovery =
@@ -485,6 +490,7 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
     // more than a flood of inline records could.
     reserveRecoveryTaskCommitCapacity(appId, recoveryId, serialized.size(), 1L);
     recoveryBlobPointers.put(key, serialized);
+    retainRecoveryBlobDigest(appId, sha256);
     return candidate;
   }
 
@@ -547,6 +553,52 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
     String key = recoveryTaskCommitKey(appId, recoveryId, writeId, partitionId);
     ByteString stored = recoveryBlobPointers.get(key);
     return stored == null ? null : parseAndValidateRecoveryBlobPointer(stored, key);
+  }
+
+  private static String recoveryBlobDigestKey(String appId, byte[] sha256) {
+    StringBuilder key = new StringBuilder(appId.length() + 1 + sha256.length * 2);
+    key.append(appId.length()).append(':').append(appId);
+    for (byte value : sha256) {
+      key.append(Character.forDigit((value >> 4) & 0xf, 16));
+      key.append(Character.forDigit(value & 0xf, 16));
+    }
+    return key.toString();
+  }
+
+  private void retainRecoveryBlobDigest(String appId, byte[] sha256) {
+    recoveryBlobDigestRefs
+        .computeIfAbsent(recoveryBlobDigestKey(appId, sha256), ignored -> new AtomicLong())
+        .incrementAndGet();
+  }
+
+  private void releaseRecoveryBlobDigest(String appId, byte[] sha256) {
+    recoveryBlobDigestRefs.computeIfPresent(
+        recoveryBlobDigestKey(appId, sha256),
+        (ignored, value) -> value.decrementAndGet() <= 0 ? null : value);
+  }
+
+  /**
+   * Whether any live pointer still names this payload.
+   *
+   * <p>A worker asks this before collecting a blob it uploaded. An unreferenced answer is only safe
+   * to act on after the orphan grace period, because a blob is uploaded before its pointer is
+   * published and would otherwise be collected in that window.
+   */
+  public boolean isRecoveryBlobReferenced(String appId, byte[] sha256) {
+    validateBlobDigest(sha256);
+    AtomicLong references = recoveryBlobDigestRefs.get(recoveryBlobDigestKey(appId, sha256));
+    return references != null && references.get() > 0L;
+  }
+
+  @VisibleForTesting
+  public int recoveryBlobDigestCount() {
+    return recoveryBlobDigestRefs.size();
+  }
+
+  private static void validateBlobDigest(byte[] sha256) {
+    if (sha256 == null || sha256.length != 32) {
+      throw new IllegalArgumentException("A recovery blob digest must be 32 bytes");
+    }
   }
 
   private org.apache.celeborn.common.protocol.PbRecoveryBlobPointer
@@ -820,6 +872,7 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
                     parseAndValidateRecoveryBlobPointer(entry.getValue(), entry.getKey());
                 releaseRecoveryTaskCommitCapacity(
                     pointer.getAppId(), pointer.getRecoveryId(), entry.getValue().size());
+                releaseRecoveryBlobDigest(pointer.getAppId(), pointer.getSha256().toByteArray());
                 return true;
               }
               return false;
@@ -1126,6 +1179,16 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
       sourceRecoveryAnchors.putAll(snapshotMetaInfo.getSourceRecoveryAnchorsMap());
       recoveryTaskCommits.putAll(snapshotMetaInfo.getRecoveryTaskCommitsMap());
       recoveryBlobPointers.putAll(snapshotMetaInfo.getRecoveryBlobPointersMap());
+      // The index is derived state, so it is rebuilt from the pointers rather than replicated.
+      recoveryBlobDigestRefs.clear();
+      snapshotMetaInfo
+          .getRecoveryBlobPointersMap()
+          .forEach(
+              (key, value) -> {
+                org.apache.celeborn.common.protocol.PbRecoveryBlobPointer pointer =
+                    parseAndValidateRecoveryBlobPointer(value, key);
+                retainRecoveryBlobDigest(pointer.getAppId(), pointer.getSha256().toByteArray());
+              });
       taskCommitState.bytesByRecovery.forEach(
           (key, value) -> recoveryTaskCommitBytesByRecovery.put(key, new AtomicLong(value)));
       taskCommitState.recordsByRecovery.forEach(
@@ -1255,6 +1318,7 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
     sourceRecoveryAnchors.clear();
     recoveryTaskCommits.clear();
     recoveryBlobPointers.clear();
+    recoveryBlobDigestRefs.clear();
     recoveryTaskCommitInlineBytes.set(0L);
     recoveryTaskCommitInlineRecords.set(0L);
     recoveryTaskCommitBytesByRecovery.clear();

@@ -230,6 +230,80 @@ class RecoveryBlobPointerSuite extends AnyFunSuite {
     assert(meta.recoveryBlobPointers.isEmpty)
   }
 
+  test("a payload stays referenced until the last pointer naming it is gone") {
+    val meta = metadata
+    val shared = digestOf("payload-shared")
+
+    assert(!meta.isRecoveryBlobReferenced("logical-app", shared))
+
+    // Two partitions can legitimately produce byte-identical payloads, and content addressing
+    // stores them once. Collection must not act on the first pointer's removal alone.
+    meta.updateRecoveryBlobPointerMeta(
+      "logical-app",
+      "query-1",
+      "write-1",
+      0,
+      shared,
+      4096L,
+      1,
+      replicas,
+      100L)
+    meta.updateRecoveryBlobPointerMeta(
+      "logical-app",
+      "query-1",
+      "write-1",
+      1,
+      shared,
+      4096L,
+      1,
+      replicas,
+      100L)
+    assert(meta.isRecoveryBlobReferenced("logical-app", shared))
+    assert(meta.recoveryBlobDigestCount() == 1, "one digest, however many pointers name it")
+
+    // The same bytes under a different application are a different blob for collection purposes.
+    assert(!meta.isRecoveryBlobReferenced("other-app", shared))
+
+    meta.updateAppLostMeta("logical-app")
+    assert(!meta.isRecoveryBlobReferenced("logical-app", shared))
+    assert(meta.recoveryBlobDigestCount() == 0)
+  }
+
+  test("the reference index is rebuilt from a restored snapshot") {
+    val source = metadata
+    val digest = digestOf("payload-a")
+    source.updateRecoveryBlobPointerMeta(
+      "logical-app",
+      "query-1",
+      "write-1",
+      0,
+      digest,
+      4096L,
+      1,
+      replicas,
+      100L)
+
+    val snapshot = Files.createTempFile("celeborn-blob-digest-snapshot", ".bin")
+    try {
+      source.writeMetaInfoToFile(snapshot.toFile)
+      val restored = metadata
+      restored.restoreMetaFromFile(snapshot.toFile)
+
+      // The index is derived state and is not replicated, so a restored master has to rebuild it
+      // or it would collect blobs that its own pointers still name.
+      assert(restored.isRecoveryBlobReferenced("logical-app", digest))
+      assert(restored.recoveryBlobDigestCount() == 1)
+    } finally {
+      Files.deleteIfExists(snapshot)
+    }
+  }
+
+  test("a malformed digest is refused by the reference query") {
+    intercept[IllegalArgumentException] {
+      metadata.isRecoveryBlobReferenced("logical-app", Array.emptyByteArray)
+    }
+  }
+
   test("pointers survive a master snapshot and are dropped with their application") {
     val source = metadata
     val digest = digestOf("payload-a")

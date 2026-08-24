@@ -50,10 +50,20 @@ private[worker] class RecoveryBlobStore(root: File, maxBlobBytes: Long) extends 
   Files.createDirectories(blobRoot)
 
   /**
+   * Blobs are laid out per application so that an application's payloads can be enumerated and
+   * dropped without touching another's, and so that a worker can answer "whose blob is this?" - the
+   * digest alone does not say, and the master's reference index is scoped per application.
+   */
+  private def appRoot(appId: String): Path = {
+    require(appId != null && appId.nonEmpty, "A recovery blob requires an application id")
+    blobRoot.resolve(appId.replaceAll("[^A-Za-z0-9_.-]", "_"))
+  }
+
+  /**
    * Stores `payload` under `digest`, returning true when this call created the blob and false when
    * an identical blob was already present.
    */
-  def put(digest: Array[Byte], payload: Array[Byte]): Boolean = {
+  def put(appId: String, digest: Array[Byte], payload: Array[Byte]): Boolean = {
     validateDigest(digest)
     require(payload != null, "Recovery blob payload must not be null")
     require(
@@ -64,7 +74,7 @@ private[worker] class RecoveryBlobStore(root: File, maxBlobBytes: Long) extends 
       MessageDigest.isEqual(actual, digest),
       "Recovery blob payload does not match its digest")
 
-    val target = blobPath(digest)
+    val target = blobPath(appId, digest)
     if (Files.exists(target)) {
       return false
     }
@@ -98,9 +108,9 @@ private[worker] class RecoveryBlobStore(root: File, maxBlobBytes: Long) extends 
   }
 
   /** Returns the payload for `digest`, or null when this worker does not hold it. */
-  def get(digest: Array[Byte]): Array[Byte] = {
+  def get(appId: String, digest: Array[Byte]): Array[Byte] = {
     validateDigest(digest)
-    val target = blobPath(digest)
+    val target = blobPath(appId, digest)
     if (!Files.exists(target)) {
       return null
     }
@@ -114,9 +124,16 @@ private[worker] class RecoveryBlobStore(root: File, maxBlobBytes: Long) extends 
     payload
   }
 
-  def contains(digest: Array[Byte]): Boolean = {
+  def contains(appId: String, digest: Array[Byte]): Boolean = {
     validateDigest(digest)
-    Files.exists(blobPath(digest))
+    Files.exists(blobPath(appId, digest))
+  }
+
+  /** When this blob was last written, used to keep collection off blobs that may still be in flight. */
+  def modifiedAtMs(appId: String, digest: Array[Byte]): Long = {
+    validateDigest(digest)
+    val target = blobPath(appId, digest)
+    if (Files.exists(target)) Files.getLastModifiedTime(target).toMillis else -1L
   }
 
   /**
@@ -124,9 +141,9 @@ private[worker] class RecoveryBlobStore(root: File, maxBlobBytes: Long) extends 
    * references a blob before deleting it, so that no reader can observe a pointer whose payload is
    * already gone.
    */
-  def delete(digest: Array[Byte]): Boolean = {
+  def delete(appId: String, digest: Array[Byte]): Boolean = {
     validateDigest(digest)
-    val target = blobPath(digest)
+    val target = blobPath(appId, digest)
     val deleted = Files.deleteIfExists(target)
     if (deleted) {
       syncDirectory(target.getParent)
@@ -135,16 +152,39 @@ private[worker] class RecoveryBlobStore(root: File, maxBlobBytes: Long) extends 
     deleted
   }
 
-  /** Every digest this worker holds, for repair and garbage collection. */
-  def digests(): Seq[String] = {
+  /** Every digest this worker holds for one application, for repair and garbage collection. */
+  def digests(appId: String): Seq[String] = {
     val collected = Seq.newBuilder[String]
-    forEachBlob(path => collected += path.getFileName.toString.stripSuffix(BlobSuffix))
+    forEachBlob(
+      appRoot(appId),
+      path => collected += path.getFileName.toString.stripSuffix(BlobSuffix))
     collected.result()
+  }
+
+  /** Every application this worker holds blobs for. */
+  def applications(): Seq[String] = {
+    if (!Files.isDirectory(blobRoot)) {
+      return Seq.empty
+    }
+    val stream = Files.list(blobRoot)
+    try {
+      val names = Seq.newBuilder[String]
+      val paths = stream.iterator()
+      while (paths.hasNext) {
+        val path = paths.next()
+        if (Files.isDirectory(path)) {
+          names += path.getFileName.toString
+        }
+      }
+      names.result()
+    } finally {
+      stream.close()
+    }
   }
 
   def totalBytes: Long = {
     var total = 0L
-    forEachBlob(path => total += Files.size(path))
+    forEachBlob(blobRoot, path => total += Files.size(path))
     total
   }
 
@@ -152,8 +192,11 @@ private[worker] class RecoveryBlobStore(root: File, maxBlobBytes: Long) extends 
    * Walks the blob directory without Scala collection converters, which differ between the Scala
    * versions Celeborn builds against.
    */
-  private def forEachBlob(action: Path => Unit): Unit = {
-    val stream = Files.walk(blobRoot)
+  private def forEachBlob(from: Path, action: Path => Unit): Unit = {
+    if (!Files.isDirectory(from)) {
+      return
+    }
+    val stream = Files.walk(from)
     try {
       val paths = stream.iterator()
       while (paths.hasNext) {
@@ -167,10 +210,10 @@ private[worker] class RecoveryBlobStore(root: File, maxBlobBytes: Long) extends 
     }
   }
 
-  private def blobPath(digest: Array[Byte]): Path = {
+  private def blobPath(appId: String, digest: Array[Byte]): Path = {
     val name = hex(digest)
     // Two-character fan-out keeps directory sizes manageable for a large recovery.
-    blobRoot.resolve(name.substring(0, 2)).resolve(s"$name$BlobSuffix")
+    appRoot(appId).resolve(name.substring(0, 2)).resolve(s"$name$BlobSuffix")
   }
 
   private def syncDirectory(directory: Path): Unit = {

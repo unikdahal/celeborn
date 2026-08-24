@@ -25,6 +25,8 @@ import org.scalatest.funsuite.AnyFunSuite
 
 class RecoveryBlobStoreSuite extends AnyFunSuite {
 
+  private val appId = "logical-app"
+
   private def withStore(body: (RecoveryBlobStore, File) => Unit): Unit = {
     val root = Files.createTempDirectory("celeborn-recovery-blobs").toFile
     try {
@@ -48,9 +50,9 @@ class RecoveryBlobStoreSuite extends AnyFunSuite {
       val payload = payloadOf("task-envelope-1")
       val digest = RecoveryBlobStore.sha256(payload)
 
-      assert(store.put(digest, payload))
-      assert(store.contains(digest))
-      assert(store.get(digest).sameElements(payload))
+      assert(store.put(appId, digest, payload))
+      assert(store.contains(appId, digest))
+      assert(store.get(appId, digest).sameElements(payload))
       assert(store.totalBytes === payload.length.toLong)
     }
   }
@@ -60,11 +62,11 @@ class RecoveryBlobStoreSuite extends AnyFunSuite {
       val payload = payloadOf("task-envelope-2")
       val digest = RecoveryBlobStore.sha256(payload)
 
-      assert(store.put(digest, payload))
+      assert(store.put(appId, digest, payload))
       // A second attempt, whether a retry or another worker's repair copy, must succeed and report
       // that nothing new was written.
-      assert(!store.put(digest, payload))
-      assert(store.get(digest).sameElements(payload))
+      assert(!store.put(appId, digest, payload))
+      assert(store.get(appId, digest).sameElements(payload))
     }
   }
 
@@ -73,10 +75,10 @@ class RecoveryBlobStoreSuite extends AnyFunSuite {
       val digest = RecoveryBlobStore.sha256(payloadOf("intended"))
 
       val error = intercept[IllegalArgumentException] {
-        store.put(digest, payloadOf("something else"))
+        store.put(appId, digest, payloadOf("something else"))
       }
       assert(error.getMessage.contains("does not match its digest"))
-      assert(!store.contains(digest))
+      assert(!store.contains(appId, digest))
     }
   }
 
@@ -84,27 +86,28 @@ class RecoveryBlobStoreSuite extends AnyFunSuite {
     withStore { (store, root) =>
       val payload = payloadOf("task-envelope-3")
       val digest = RecoveryBlobStore.sha256(payload)
-      store.put(digest, payload)
+      store.put(appId, digest, payload)
 
       val name = RecoveryBlobStore.hex(digest)
       val stored = Paths.get(
         root.getAbsolutePath,
         RecoveryBlobStore.BlobDirectory,
+        appId,
         name.substring(0, 2),
         s"$name${RecoveryBlobStore.BlobSuffix}")
       val bytes = Files.readAllBytes(stored)
       bytes(0) = (bytes(0) ^ 0x01).toByte
       Files.write(stored, bytes)
 
-      val error = intercept[IOException](store.get(digest))
+      val error = intercept[IOException](store.get(appId, digest))
       assert(error.getMessage.contains("failed digest verification on read"))
     }
   }
 
   test("an absent blob reads as absent rather than as a failure") {
     withStore { (store, _) =>
-      assert(store.get(RecoveryBlobStore.sha256(payloadOf("never stored"))) === null)
-      assert(!store.contains(RecoveryBlobStore.sha256(payloadOf("never stored"))))
+      assert(store.get(appId, RecoveryBlobStore.sha256(payloadOf("never stored"))) === null)
+      assert(!store.contains(appId, RecoveryBlobStore.sha256(payloadOf("never stored"))))
     }
   }
 
@@ -114,14 +117,14 @@ class RecoveryBlobStoreSuite extends AnyFunSuite {
       val second = payloadOf("task-envelope-5")
       val firstDigest = RecoveryBlobStore.sha256(first)
       val secondDigest = RecoveryBlobStore.sha256(second)
-      store.put(firstDigest, first)
-      store.put(secondDigest, second)
+      store.put(appId, firstDigest, first)
+      store.put(appId, secondDigest, second)
 
-      assert(store.digests().toSet ===
+      assert(store.digests(appId).toSet ===
         Set(RecoveryBlobStore.hex(firstDigest), RecoveryBlobStore.hex(secondDigest)))
-      assert(store.delete(firstDigest))
-      assert(!store.delete(firstDigest))
-      assert(store.digests() === Seq(RecoveryBlobStore.hex(secondDigest)))
+      assert(store.delete(appId, firstDigest))
+      assert(!store.delete(appId, firstDigest))
+      assert(store.digests(appId) === Seq(RecoveryBlobStore.hex(secondDigest)))
     }
   }
 
@@ -129,10 +132,10 @@ class RecoveryBlobStoreSuite extends AnyFunSuite {
     withStore { (store, _) =>
       val payload = payloadOf("task-envelope-6")
       intercept[IllegalArgumentException] {
-        store.put(Array.emptyByteArray, payload)
+        store.put(appId, Array.emptyByteArray, payload)
       }
       intercept[IllegalArgumentException] {
-        store.put(RecoveryBlobStore.sha256(Array.emptyByteArray), Array.emptyByteArray)
+        store.put(appId, RecoveryBlobStore.sha256(Array.emptyByteArray), Array.emptyByteArray)
       }
     }
   }
@@ -142,12 +145,12 @@ class RecoveryBlobStoreSuite extends AnyFunSuite {
     try {
       val payload = payloadOf("task-envelope-7")
       val digest = RecoveryBlobStore.sha256(payload)
-      new RecoveryBlobStore(root, 1024L).put(digest, payload)
+      new RecoveryBlobStore(root, 1024L).put(appId, digest, payload)
 
       // A worker restart must find the blobs it acknowledged before the restart.
       val reopened = new RecoveryBlobStore(root, 1024L)
-      assert(reopened.contains(digest))
-      assert(reopened.get(digest).sameElements(payload))
+      assert(reopened.contains(appId, digest))
+      assert(reopened.get(appId, digest).sameElements(payload))
     } finally {
       deleteRecursively(root)
     }

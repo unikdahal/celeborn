@@ -199,7 +199,7 @@ private[deploy] class Controller(
       try {
         // The store verifies the payload against its digest and fsyncs before returning, so a
         // success here means the bytes are durable on this worker and not merely accepted.
-        recoveryBlobStore.put(sha256, payload)
+        recoveryBlobStore.put(applicationId, sha256, payload)
         context.reply(PushRecoveryBlobResponse(success = true))
       } catch {
         case e: Exception =>
@@ -212,7 +212,7 @@ private[deploy] class Controller(
     case FetchRecoveryBlob(applicationId, sha256) =>
       checkAuth(context, applicationId)
       try {
-        val payload = recoveryBlobStore.get(sha256)
+        val payload = recoveryBlobStore.get(applicationId, sha256)
         // "Not held here" and "held but unreadable" are different answers: the first lets a reader
         // move on to the next replica quietly, the second is a corruption signal worth recording.
         context.reply(FetchRecoveryBlobResponse(
