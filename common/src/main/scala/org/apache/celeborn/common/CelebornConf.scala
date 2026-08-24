@@ -961,6 +961,20 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
   def appHeartbeatTimeoutMs: Long = get(APPLICATION_HEARTBEAT_TIMEOUT)
   def applicationLeaseMaxDurationMs: Long = get(APPLICATION_LEASE_MAX_DURATION)
   def recoveryTaskCommitMaxPayloadSize: Long = get(RECOVERY_TASK_COMMIT_MAX_PAYLOAD_SIZE)
+  def recoveryBlobEnabled: Boolean = get(RECOVERY_BLOB_ENABLED)
+  def recoveryBlobReplicationFactor: Int = get(RECOVERY_BLOB_REPLICATION_FACTOR)
+  def recoveryBlobQuorum: Int = {
+    val quorum = get(RECOVERY_BLOB_QUORUM)
+    val replicas = recoveryBlobReplicationFactor
+    require(
+      quorum <= replicas,
+      s"${RECOVERY_BLOB_QUORUM.key} ($quorum) cannot exceed " +
+        s"${RECOVERY_BLOB_REPLICATION_FACTOR.key} ($replicas)")
+    quorum
+  }
+  def recoveryBlobInlineThreshold: Long = get(RECOVERY_BLOB_INLINE_THRESHOLD)
+  def recoveryBlobOrphanGrace: Long = get(RECOVERY_BLOB_ORPHAN_GRACE)
+  def recoveryBlobRepairInterval: Long = get(RECOVERY_BLOB_REPAIR_INTERVAL)
   def recoveryTaskCommitMaxBatchResponseSize: Long =
     get(RECOVERY_TASK_COMMIT_MAX_BATCH_RESPONSE_SIZE)
   def recoveryTaskCommitMaxInlineBytesPerRecovery: Long =
@@ -2555,6 +2569,68 @@ object CelebornConf extends Logging {
       .timeConf(TimeUnit.MILLISECONDS)
       .checkValue(_ > 0, "Application lease maximum duration must be positive")
       .createWithDefaultString("24h")
+
+  val RECOVERY_BLOB_ENABLED: ConfigEntry[Boolean] =
+    buildConf("celeborn.master.recovery.blob.enabled")
+      .categories("master")
+      .version("1.0.0")
+      .doc("Whether recovery task payloads are stored on workers under their own content digest " +
+        "instead of inline in replicated master state. Inline storage is bounded and safe, but " +
+        "every byte rides in the Raft log, in master heap, and in every snapshot, which limits " +
+        "how wide a recoverable write can be.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val RECOVERY_BLOB_REPLICATION_FACTOR: ConfigEntry[Int] =
+    buildConf("celeborn.master.recovery.blob.replicationFactor")
+      .categories("master")
+      .version("1.0.0")
+      .doc("Number of workers a recovery payload is uploaded to.")
+      .intConf
+      .checkValue(_ > 0, "Recovery blob replication factor must be positive")
+      .createWithDefault(3)
+
+  val RECOVERY_BLOB_QUORUM: ConfigEntry[Int] =
+    buildConf("celeborn.master.recovery.blob.quorum")
+      .categories("master")
+      .version("1.0.0")
+      .doc("Durable acknowledgements required before a recovery blob pointer may be published. " +
+        "Publication below quorum is a failure, never a partial success, because a published " +
+        "pointer promises a readable payload.")
+      .intConf
+      .checkValue(_ > 0, "Recovery blob quorum must be positive")
+      .createWithDefault(2)
+
+  val RECOVERY_BLOB_INLINE_THRESHOLD: ConfigEntry[Long] =
+    buildConf("celeborn.master.recovery.blob.inlineThreshold")
+      .categories("master")
+      .version("1.0.0")
+      .doc("Payloads at or below this size stay inline in replicated state. A small commit " +
+        "message should not pay a replicated upload and an extra read.")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(_ >= 0, "Recovery blob inline threshold must not be negative")
+      .createWithDefaultString("4k")
+
+  val RECOVERY_BLOB_ORPHAN_GRACE: ConfigEntry[Long] =
+    buildConf("celeborn.master.recovery.blob.orphanGrace")
+      .categories("master")
+      .version("1.0.0")
+      .doc("How long an uploaded blob that no pointer references is kept before collection. " +
+        "This must exceed the longest gap between an upload and its pointer publication, or " +
+        "collection can delete a blob that is about to become canonical.")
+      .timeConf(TimeUnit.MILLISECONDS)
+      .checkValue(_ > 0, "Recovery blob orphan grace must be positive")
+      .createWithDefaultString("1h")
+
+  val RECOVERY_BLOB_REPAIR_INTERVAL: ConfigEntry[Long] =
+    buildConf("celeborn.master.recovery.blob.repairInterval")
+      .categories("master")
+      .version("1.0.0")
+      .doc("How often the leader looks for recovery blob pointers whose replica set no longer " +
+        "meets quorum.")
+      .timeConf(TimeUnit.MILLISECONDS)
+      .checkValue(_ > 0, "Recovery blob repair interval must be positive")
+      .createWithDefaultString("5m")
 
   val RECOVERY_TASK_COMMIT_MAX_PAYLOAD_SIZE: ConfigEntry[Long] =
     buildConf("celeborn.master.recovery.taskCommit.maxPayloadSize")

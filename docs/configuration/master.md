@@ -37,6 +37,7 @@ license: |
 | celeborn.internal.port.enabled | false | false | Whether to create a internal port on Masters/Workers for inter-Masters/Workers communication. This is beneficial when SASL authentication is enforced for all interactions between clients and Celeborn Services, but the services can exchange messages without being subject to SASL authentication. | 0.5.0 |  | 
 | celeborn.logConf.enabled | false | false | When `true`, log the CelebornConf for debugging purposes. | 0.5.0 |  | 
 | celeborn.master.allowWorkerHostPattern | &lt;undefined&gt; | false | Pattern of worker host that allowed to register with the master. If not set, all workers are allowed to register. | 0.6.0 |  | 
+| celeborn.master.applicationLease.maxDuration | 24h | false | Maximum duration accepted for a driver-recovery application lease. | 1.0.0 |  | 
 | celeborn.master.denyWorkerHostPattern | &lt;undefined&gt; | false | Pattern of worker host that denied to register with the master. If not set, no workers are denied to register. | 0.6.0 |  | 
 | celeborn.master.dfs.expireDirs.timeout | 1h | false | The timeout for an expired dirs to be deleted on dfs like HDFS, S3, OSS. | 0.6.0 |  | 
 | celeborn.master.estimatedPartitionSize.initialSize | 64mb | false | Initial partition size for estimation, it will change according to runtime stats. | 0.3.0 | celeborn.shuffle.initialEstimatedPartitionSize | 
@@ -73,6 +74,18 @@ license: |
 | celeborn.master.persist.workerNetworkLocation | false | false |  | 0.6.0 |  | 
 | celeborn.master.port | 9097 | false | Port for master to bind. | 0.2.0 |  | 
 | celeborn.master.rackResolver.refresh.interval | 30s | false | Interval for refreshing the node rack information periodically. | 0.5.0 |  | 
+| celeborn.master.recovery.blob.enabled | false | false | Whether recovery task payloads are stored on workers under their own content digest instead of inline in replicated master state. Inline storage is bounded and safe, but every byte rides in the Raft log, in master heap, and in every snapshot, which limits how wide a recoverable write can be. | 1.0.0 |  | 
+| celeborn.master.recovery.blob.inlineThreshold | 4k | false | Payloads at or below this size stay inline in replicated state. A small commit message should not pay a replicated upload and an extra read. | 1.0.0 |  | 
+| celeborn.master.recovery.blob.orphanGrace | 1h | false | How long an uploaded blob that no pointer references is kept before collection. This must exceed the longest gap between an upload and its pointer publication, or collection can delete a blob that is about to become canonical. | 1.0.0 |  | 
+| celeborn.master.recovery.blob.quorum | 2 | false | Durable acknowledgements required before a recovery blob pointer may be published. Publication below quorum is a failure, never a partial success, because a published pointer promises a readable payload. | 1.0.0 |  | 
+| celeborn.master.recovery.blob.repairInterval | 5m | false | How often the leader looks for recovery blob pointers whose replica set no longer meets quorum. | 1.0.0 |  | 
+| celeborn.master.recovery.blob.replicationFactor | 3 | false | Number of workers a recovery payload is uploaded to. | 1.0.0 |  | 
+| celeborn.master.recovery.taskCommit.maxBatchResponseSize | 16m | false | Maximum serialized protobuf response bytes returned by one recovery task commit batch lookup, including entry framing, digests, payloads, and authoritative misses. | 1.0.0 |  | 
+| celeborn.master.recovery.taskCommit.maxInlineBytesGlobal | 512m | false | Maximum serialized inline task-commit bytes retained by a master cluster. | 1.0.0 |  | 
+| celeborn.master.recovery.taskCommit.maxInlineBytesPerRecovery | 256m | false | Maximum serialized inline task-commit bytes retained for one recovery execution. | 1.0.0 |  | 
+| celeborn.master.recovery.taskCommit.maxInlineRecordsGlobal | 1000000 | false | Maximum number of inline task-commit records retained by a master cluster. | 1.0.0 |  | 
+| celeborn.master.recovery.taskCommit.maxInlineRecordsPerRecovery | 200000 | false | Maximum number of inline task-commit records retained for one recovery execution. | 1.0.0 |  | 
+| celeborn.master.recovery.taskCommit.maxPayloadSize | 1m | false | Maximum inline payload accepted for one immutable recovery task commit. The bound protects Raft logs, master heap, and snapshots; larger envelopes require a durable blob-backed record codec. | 1.0.0 |  | 
 | celeborn.master.send.applicationMeta.threads | 8 | false | Number of threads used by the Master to send ApplicationMeta to Workers. | 0.5.0 |  | 
 | celeborn.master.slot.assign.extraSlots | 2 | false | Extra slots number when master assign slots. Provided enough workers are available. | 0.3.0 | celeborn.slots.assign.extraSlots | 
 | celeborn.master.slot.assign.interruptionAware | false | false | If this is set to true, Celeborn master will prioritize partition placement on workers that are not in scope for maintenance soon. | 0.7.0 |  | 
