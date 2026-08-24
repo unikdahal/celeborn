@@ -95,6 +95,13 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
       JavaUtils.newConcurrentHashMap();
   public final ConcurrentHashMap<String, ByteString> recoveryBlobPointers =
       JavaUtils.newConcurrentHashMap();
+  // Derived per-application shares of the inline budget: the sum of the per-recovery counters
+  // over every live recovery of one application. Rebuilt on snapshot restore like the other
+  // derived indexes and maintained incrementally by reserve/release, so the quota check is exact.
+  private final ConcurrentHashMap<String, AtomicLong> recoveryTaskCommitBytesByApp =
+      JavaUtils.newConcurrentHashMap();
+  private final ConcurrentHashMap<String, AtomicLong> recoveryTaskCommitRecordsByApp =
+      JavaUtils.newConcurrentHashMap();
   // How many pointers reference each (application, payload digest). Collection on a worker must
   // never delete a blob that any surviving pointer still names, and scanning every pointer at
   // collection time would be linear in the width of every live write.
@@ -391,14 +398,42 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
     long recoveryRecords = currentRecoveryRecords == null ? 0L : currentRecoveryRecords.get();
     long newRecoveryBytes = Math.addExact(recoveryBytes, bytes);
     long newRecoveryRecords = Math.addExact(recoveryRecords, records);
+    // Per-application usage is the sum over that application's live recoveries. A wide or
+    // repeatedly retried write from one application must not be able to consume the cluster-wide
+    // budget and starve every other resumable write, so the share is checked before anything is
+    // recorded. Rejections name which bound fired: per-recovery, per-application, or global.
+    AtomicLong currentAppBytes = recoveryTaskCommitBytesByApp.get(appId);
+    AtomicLong currentAppRecords = recoveryTaskCommitRecordsByApp.get(appId);
+    long appBytes = currentAppBytes == null ? 0L : currentAppBytes.get();
+    long appRecords = currentAppRecords == null ? 0L : currentAppRecords.get();
+    long newAppBytes = Math.addExact(appBytes, bytes);
+    long newAppRecords = Math.addExact(appRecords, records);
     long newGlobalBytes = Math.addExact(recoveryTaskCommitInlineBytes.get(), bytes);
     long newGlobalRecords = Math.addExact(recoveryTaskCommitInlineRecords.get(), records);
     if (newRecoveryBytes > conf.recoveryTaskCommitMaxInlineBytesPerRecovery()
-        || newRecoveryRecords > conf.recoveryTaskCommitMaxInlineRecordsPerRecovery()
-        || newGlobalBytes > conf.recoveryTaskCommitMaxInlineBytesGlobal()
+        || newRecoveryRecords > conf.recoveryTaskCommitMaxInlineRecordsPerRecovery()) {
+      throw new IllegalStateException(
+          "Per-recovery inline metadata capacity exceeded for "
+              + recoveryKey
+              + "; use blob-backed storage or raise the maxInline*PerRecovery bounds");
+    }
+    if (newAppBytes > conf.recoveryTaskCommitMaxInlineBytesPerApp()
+        || newAppRecords > conf.recoveryTaskCommitMaxInlineRecordsPerApp()) {
+      throw new IllegalStateException(
+          "Application "
+              + appId
+              + " exceeded its recovery inline metadata quota ("
+              + conf.recoveryTaskCommitMaxInlineBytesPerApp()
+              + " bytes / "
+              + conf.recoveryTaskCommitMaxInlineRecordsPerApp()
+              + " records); raise celeborn.master.recovery.taskCommit.maxInlineBytesPerApp or "
+              + "reduce this application's concurrent resumable writes");
+    }
+    if (newGlobalBytes > conf.recoveryTaskCommitMaxInlineBytesGlobal()
         || newGlobalRecords > conf.recoveryTaskCommitMaxInlineRecordsGlobal()) {
       throw new IllegalStateException(
-          "Recovery task commit inline metadata capacity exceeded; use blob-backed storage");
+          "Cluster-wide recovery inline metadata capacity exceeded; raise the maxInline*Global "
+              + "bounds or add master capacity");
     }
     recoveryTaskCommitBytesByRecovery
         .computeIfAbsent(recoveryKey, ignored -> new AtomicLong())
@@ -406,6 +441,12 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
     recoveryTaskCommitRecordsByRecovery
         .computeIfAbsent(recoveryKey, ignored -> new AtomicLong())
         .set(newRecoveryRecords);
+    recoveryTaskCommitBytesByApp
+        .computeIfAbsent(appId, ignored -> new AtomicLong())
+        .set(newAppBytes);
+    recoveryTaskCommitRecordsByApp
+        .computeIfAbsent(appId, ignored -> new AtomicLong())
+        .set(newAppRecords);
     recoveryTaskCommitInlineBytes.set(newGlobalBytes);
     recoveryTaskCommitInlineRecords.set(newGlobalRecords);
   }
@@ -416,13 +457,31 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
   }
 
   private void releaseRecoveryTaskCommitCapacity(String appId, String recoveryId, int bytes) {
+    releaseRecoveryTaskCommitCapacity(appId, recoveryId, (long) bytes, 1L);
+  }
+
+  /**
+   * Returns previously reserved inline budget. Bytes and records are adjusted independently so
+   * paths that never touched the record count (a repair replacing replica lists) can release their
+   * share without corrupting the record accounting.
+   */
+  private void releaseRecoveryTaskCommitCapacity(
+      String appId, String recoveryId, long bytes, long records) {
     String recoveryKey = recoveryTaskCommitRecoveryKey(appId, recoveryId);
-    recoveryTaskCommitInlineBytes.addAndGet(-bytes);
-    recoveryTaskCommitInlineRecords.decrementAndGet();
-    recoveryTaskCommitBytesByRecovery.computeIfPresent(
-        recoveryKey, (ignored, value) -> value.addAndGet(-bytes) == 0 ? null : value);
-    recoveryTaskCommitRecordsByRecovery.computeIfPresent(
-        recoveryKey, (ignored, value) -> value.decrementAndGet() == 0 ? null : value);
+    if (bytes != 0) {
+      recoveryTaskCommitInlineBytes.addAndGet(-bytes);
+      recoveryTaskCommitBytesByRecovery.computeIfPresent(
+          recoveryKey, (ignored, value) -> value.addAndGet(-bytes) == 0 ? null : value);
+      recoveryTaskCommitBytesByApp.computeIfPresent(
+          appId, (ignored, value) -> value.addAndGet(-bytes) == 0 ? null : value);
+    }
+    if (records != 0) {
+      recoveryTaskCommitInlineRecords.addAndGet(-records);
+      recoveryTaskCommitRecordsByRecovery.computeIfPresent(
+          recoveryKey, (ignored, value) -> value.addAndGet(-records) == 0 ? null : value);
+      recoveryTaskCommitRecordsByApp.computeIfPresent(
+          appId, (ignored, value) -> value.addAndGet(-records) == 0 ? null : value);
+    }
   }
 
   @VisibleForTesting
@@ -542,6 +601,10 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
     long delta = serialized.size() - stored.size();
     if (delta > 0) {
       reserveRecoveryTaskCommitCapacity(appId, recoveryId, delta, 0L);
+    } else if (delta < 0) {
+      // A repair can shrink the pointer (shorter replica IDs): without returning the difference,
+      // the per-recovery and global budgets only ever grow across repairs.
+      releaseRecoveryTaskCommitCapacity(appId, recoveryId, -delta, 0L);
     }
     recoveryBlobPointers.put(key, serialized);
     return repaired;
@@ -553,6 +616,22 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
     String key = recoveryTaskCommitKey(appId, recoveryId, writeId, partitionId);
     ByteString stored = recoveryBlobPointers.get(key);
     return stored == null ? null : parseAndValidateRecoveryBlobPointer(stored, key);
+  }
+
+  /**
+   * Every live pointer, parsed and validated.
+   *
+   * <p>Repair needs the whole set to find the ones that have fallen below their replication factor.
+   * Parsing here rather than exposing the raw map keeps malformed replicated state from reaching a
+   * caller that would treat it as a healthy pointer.
+   */
+  public synchronized java.util.List<org.apache.celeborn.common.protocol.PbRecoveryBlobPointer>
+      allRecoveryBlobPointers() {
+    java.util.List<org.apache.celeborn.common.protocol.PbRecoveryBlobPointer> pointers =
+        new java.util.ArrayList<>(recoveryBlobPointers.size());
+    recoveryBlobPointers.forEach(
+        (key, value) -> pointers.add(parseAndValidateRecoveryBlobPointer(value, key)));
+    return pointers;
   }
 
   private static String recoveryBlobDigestKey(String appId, byte[] sha256) {
@@ -686,6 +765,8 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
       Map<String, ByteString> pointers, RecoveryTaskCommitSnapshotState base) {
     Map<String, Long> bytesByRecovery = new HashMap<>(base.bytesByRecovery);
     Map<String, Long> recordsByRecovery = new HashMap<>(base.recordsByRecovery);
+    Map<String, Long> bytesByApp = new HashMap<>(base.bytesByApp);
+    Map<String, Long> recordsByApp = new HashMap<>(base.recordsByApp);
     long totalBytes = base.totalBytes;
     long totalRecords = base.totalRecords;
     for (Map.Entry<String, ByteString> entry : pointers.entrySet()) {
@@ -696,10 +777,15 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
       long recoveryBytes =
           Math.addExact(bytesByRecovery.getOrDefault(recoveryKey, 0L), entry.getValue().size());
       long recoveryRecords = Math.addExact(recordsByRecovery.getOrDefault(recoveryKey, 0L), 1L);
+      long appBytes =
+          Math.addExact(bytesByApp.getOrDefault(pointer.getAppId(), 0L), entry.getValue().size());
+      long appRecords = Math.addExact(recordsByApp.getOrDefault(pointer.getAppId(), 0L), 1L);
       totalBytes = Math.addExact(totalBytes, entry.getValue().size());
       totalRecords = Math.addExact(totalRecords, 1L);
       if (recoveryBytes > conf.recoveryTaskCommitMaxInlineBytesPerRecovery()
           || recoveryRecords > conf.recoveryTaskCommitMaxInlineRecordsPerRecovery()
+          || appBytes > conf.recoveryTaskCommitMaxInlineBytesPerApp()
+          || appRecords > conf.recoveryTaskCommitMaxInlineRecordsPerApp()
           || totalBytes > conf.recoveryTaskCommitMaxInlineBytesGlobal()
           || totalRecords > conf.recoveryTaskCommitMaxInlineRecordsGlobal()) {
         throw new IllegalStateException(
@@ -707,15 +793,19 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
       }
       bytesByRecovery.put(recoveryKey, recoveryBytes);
       recordsByRecovery.put(recoveryKey, recoveryRecords);
+      bytesByApp.put(pointer.getAppId(), appBytes);
+      recordsByApp.put(pointer.getAppId(), appRecords);
     }
     return new RecoveryTaskCommitSnapshotState(
-        bytesByRecovery, recordsByRecovery, totalBytes, totalRecords);
+        bytesByRecovery, recordsByRecovery, bytesByApp, recordsByApp, totalBytes, totalRecords);
   }
 
   private RecoveryTaskCommitSnapshotState validateRecoveryTaskCommitSnapshot(
       Map<String, ByteString> records) {
     Map<String, Long> bytesByRecovery = new HashMap<>();
     Map<String, Long> recordsByRecovery = new HashMap<>();
+    Map<String, Long> bytesByApp = new HashMap<>();
+    Map<String, Long> recordsByApp = new HashMap<>();
     long totalBytes = 0L;
     long totalRecords = 0L;
     for (Map.Entry<String, ByteString> entry : records.entrySet()) {
@@ -725,10 +815,15 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
       long recoveryBytes =
           Math.addExact(bytesByRecovery.getOrDefault(recoveryKey, 0L), entry.getValue().size());
       long recoveryRecords = Math.addExact(recordsByRecovery.getOrDefault(recoveryKey, 0L), 1L);
+      long appBytes =
+          Math.addExact(bytesByApp.getOrDefault(record.getAppId(), 0L), entry.getValue().size());
+      long appRecords = Math.addExact(recordsByApp.getOrDefault(record.getAppId(), 0L), 1L);
       totalBytes = Math.addExact(totalBytes, entry.getValue().size());
       totalRecords = Math.addExact(totalRecords, 1L);
       if (recoveryBytes > conf.recoveryTaskCommitMaxInlineBytesPerRecovery()
           || recoveryRecords > conf.recoveryTaskCommitMaxInlineRecordsPerRecovery()
+          || appBytes > conf.recoveryTaskCommitMaxInlineBytesPerApp()
+          || appRecords > conf.recoveryTaskCommitMaxInlineRecordsPerApp()
           || totalBytes > conf.recoveryTaskCommitMaxInlineBytesGlobal()
           || totalRecords > conf.recoveryTaskCommitMaxInlineRecordsGlobal()) {
         throw new IllegalStateException(
@@ -736,24 +831,32 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
       }
       bytesByRecovery.put(recoveryKey, recoveryBytes);
       recordsByRecovery.put(recoveryKey, recoveryRecords);
+      bytesByApp.put(record.getAppId(), appBytes);
+      recordsByApp.put(record.getAppId(), appRecords);
     }
     return new RecoveryTaskCommitSnapshotState(
-        bytesByRecovery, recordsByRecovery, totalBytes, totalRecords);
+        bytesByRecovery, recordsByRecovery, bytesByApp, recordsByApp, totalBytes, totalRecords);
   }
 
   private static final class RecoveryTaskCommitSnapshotState {
     private final Map<String, Long> bytesByRecovery;
     private final Map<String, Long> recordsByRecovery;
+    private final Map<String, Long> bytesByApp;
+    private final Map<String, Long> recordsByApp;
     private final long totalBytes;
     private final long totalRecords;
 
     private RecoveryTaskCommitSnapshotState(
         Map<String, Long> bytesByRecovery,
         Map<String, Long> recordsByRecovery,
+        Map<String, Long> bytesByApp,
+        Map<String, Long> recordsByApp,
         long totalBytes,
         long totalRecords) {
       this.bytesByRecovery = bytesByRecovery;
       this.recordsByRecovery = recordsByRecovery;
+      this.bytesByApp = bytesByApp;
+      this.recordsByApp = recordsByApp;
       this.totalBytes = totalBytes;
       this.totalRecords = totalRecords;
     }
@@ -1193,6 +1296,10 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
           (key, value) -> recoveryTaskCommitBytesByRecovery.put(key, new AtomicLong(value)));
       taskCommitState.recordsByRecovery.forEach(
           (key, value) -> recoveryTaskCommitRecordsByRecovery.put(key, new AtomicLong(value)));
+      taskCommitState.bytesByApp.forEach(
+          (key, value) -> recoveryTaskCommitBytesByApp.put(key, new AtomicLong(value)));
+      taskCommitState.recordsByApp.forEach(
+          (key, value) -> recoveryTaskCommitRecordsByApp.put(key, new AtomicLong(value)));
       recoveryTaskCommitInlineBytes.set(taskCommitState.totalBytes);
       recoveryTaskCommitInlineRecords.set(taskCommitState.totalRecords);
       committedShuffleCatalogs
@@ -1323,6 +1430,8 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
     recoveryTaskCommitInlineRecords.set(0L);
     recoveryTaskCommitBytesByRecovery.clear();
     recoveryTaskCommitRecordsByRecovery.clear();
+    recoveryTaskCommitBytesByApp.clear();
+    recoveryTaskCommitRecordsByApp.clear();
     excludedWorkers.clear();
     shutdownWorkers.clear();
     decommissionWorkers.clear();

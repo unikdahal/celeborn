@@ -161,6 +161,42 @@ class RecoveryBlobPointerSuite extends AnyFunSuite {
     assert(stale.getMessage.contains("does not advance"))
   }
 
+  test("a shrinking repair returns its byte budget instead of leaking it") {
+    val meta = metadata
+    // A long first replica list reserves a large byte footprint; replacing it with short IDs must
+    // give the difference back, or every repair with shorter replica IDs permanently consumes
+    // per-recovery and global inline budget until publications are refused for capacity.
+    val longReplicas = Arrays.asList(
+      "worker-with-a-deliberately-long-identifier-aaaaaaaaaaaaaaaaaaaa",
+      "worker-with-a-deliberately-long-identifier-bbbbbbbbbbbbbbbbbbbb",
+      "worker-with-a-deliberately-long-identifier-cccccccccccccccccccc")
+    val digest = digestOf("payload-shrink")
+    meta.updateRecoveryBlobPointerMeta(
+      "logical-app",
+      "query-1",
+      "write-1",
+      0,
+      digest,
+      4096L,
+      1,
+      longReplicas,
+      100L)
+    val afterPublish = meta.recoveryTaskCommitInlineBytes()
+    assert(afterPublish > 0)
+
+    meta.repairRecoveryBlobPointerMeta(
+      "logical-app",
+      "query-1",
+      "write-1",
+      0,
+      1L,
+      Collections.singletonList("w"))
+
+    assert(
+      meta.recoveryTaskCommitInlineBytes() < afterPublish,
+      "a repair whose pointer shrank must release the freed bytes")
+  }
+
   test("repairing a pointer that does not exist fails rather than creating one") {
     val meta = metadata
     val missing = intercept[IllegalStateException] {

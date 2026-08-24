@@ -80,6 +80,37 @@ public class HAMasterMetaManager extends AbstractMetaManager {
   }
 
   @Override
+  public org.apache.celeborn.common.protocol.PbRecoveryBlobPointer handleRepairRecoveryBlobPointer(
+      String appId,
+      String recoveryId,
+      String writeId,
+      int partitionId,
+      long generation,
+      java.util.List<String> workerIds,
+      String requestId) {
+    ResourceProtos.ResourceResponse response =
+        ratisServer.submitRequest(
+            ResourceRequest.newBuilder()
+                .setCmdType(Type.RepairRecoveryBlobPointer)
+                .setRequestId(requestId)
+                .setRepairRecoveryBlobPointerRequest(
+                    ResourceProtos.RepairRecoveryBlobPointerRequest.newBuilder()
+                        .setAppId(appId)
+                        .setRecoveryId(recoveryId)
+                        .setWriteId(writeId)
+                        .setPartitionId(partitionId)
+                        .setGeneration(generation)
+                        .addAllWorkerIds(workerIds)
+                        .build())
+                .build());
+    if (!response.getSuccess()) {
+      throw new CelebornRuntimeException(
+          response.hasMessage() ? response.getMessage() : "Blob pointer repair failed");
+    }
+    return getRecoveryBlobPointer(appId, recoveryId, writeId, partitionId);
+  }
+
+  @Override
   public org.apache.celeborn.common.protocol.PbRecoveryBlobPointer handlePublishRecoveryBlobPointer(
       String appId,
       String recoveryId,

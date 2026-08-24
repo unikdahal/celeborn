@@ -141,6 +141,8 @@ enum MessageType {
   PUBLISH_RECOVERY_BLOB_POINTER_RESPONSE = 118;
   GET_RECOVERY_BLOB_POINTER = 119;
   GET_RECOVERY_BLOB_POINTER_RESPONSE = 120;
+  REPLICATE_RECOVERY_BLOB = 121;
+  REPLICATE_RECOVERY_BLOB_RESPONSE = 122;
 }
 
 enum StreamType {
@@ -1135,6 +1137,21 @@ message PbPushRecoveryBlobResponse {
   string reason = 2;
 }
 
+// Instructs a worker that holds a payload to copy it to other workers. Repair is driven from the
+// master, but the bytes move worker to worker so they never pass through master memory.
+message PbReplicateRecoveryBlob {
+  string applicationId = 1;
+  bytes sha256 = 2;
+  repeated string targetWorkerIds = 3;
+}
+
+message PbReplicateRecoveryBlobResponse {
+  // Only the targets that durably accepted the copy. A pointer may record no more than these.
+  repeated string acceptedWorkerIds = 1;
+  bool success = 2;
+  string reason = 3;
+}
+
 message PbFetchRecoveryBlob {
   string applicationId = 1;
   bytes sha256 = 2;
@@ -1177,6 +1194,15 @@ message PbPublishRecoveryBlobPointerRequest {
   int64 createdAtMs = 9;
   int64 applicationLeaseEpoch = 10;
   string applicationLeaseOwnerId = 11;
+}
+
+message PbRepairRecoveryBlobPointerRequest {
+  string appId = 1;
+  string recoveryId = 2;
+  string writeId = 3;
+  int32 partitionId = 4;
+  int64 generation = 5;
+  repeated string workerIds = 6;
 }
 
 message PbPublishRecoveryTaskCommit {
@@ -1340,6 +1366,7 @@ enum PbMetaRequestType {
   ResolveSourceRecoveryAnchor = 33;
   PublishRecoveryTaskCommit = 34;
   PublishRecoveryBlobPointer = 35;
+  RepairRecoveryBlobPointer = 36;
 }
 
 message PbMetaRequest {
@@ -1366,6 +1393,7 @@ message PbMetaRequest {
   PbResolveSourceRecoveryAnchorRequest resolveSourceRecoveryAnchorRequest = 29;
   PbPublishRecoveryTaskCommitRequest publishRecoveryTaskCommitRequest = 30;
   PbPublishRecoveryBlobPointerRequest publishRecoveryBlobPointerRequest = 31;
+  PbRepairRecoveryBlobPointerRequest repairRecoveryBlobPointerRequest = 32;
   PbReviseLostShuffles reviseLostShufflesRequest = 102;
 }
 

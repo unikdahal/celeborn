@@ -986,6 +986,10 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
     get(RECOVERY_TASK_COMMIT_MAX_INLINE_BYTES_GLOBAL)
   def recoveryTaskCommitMaxInlineRecordsGlobal: Long =
     get(RECOVERY_TASK_COMMIT_MAX_INLINE_RECORDS_GLOBAL)
+  def recoveryTaskCommitMaxInlineBytesPerApp: Long =
+    get(RECOVERY_TASK_COMMIT_MAX_INLINE_BYTES_PER_APP)
+  def recoveryTaskCommitMaxInlineRecordsPerApp: Long =
+    get(RECOVERY_TASK_COMMIT_MAX_INLINE_RECORDS_PER_APP)
   def dfsExpireDirsTimeoutMS: Long = get(DFS_EXPIRE_DIRS_TIMEOUT)
   def appHeartbeatIntervalMs: Long = get(APPLICATION_HEARTBEAT_INTERVAL)
   def applicationUnregisterEnabled: Boolean = get(APPLICATION_UNREGISTER_ENABLED)
@@ -2703,6 +2707,28 @@ object CelebornConf extends Logging {
       .longConf
       .checkValue(_ > 0, "Global inline record bound must be positive")
       .createWithDefault(1000000L)
+
+  val RECOVERY_TASK_COMMIT_MAX_INLINE_BYTES_PER_APP: ConfigEntry[Long] =
+    buildConf("celeborn.master.recovery.taskCommit.maxInlineBytesPerApp")
+      .categories("master")
+      .version("1.0.0")
+      .doc("Maximum serialized inline task-commit bytes retained across all recoveries of one " +
+        "application. Without this share, one application's recoveries can consume the global " +
+        "budget and starve every other resumable write. Rejections name this key so they are " +
+        "distinguishable from cluster-wide capacity rejections.")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(_ > 0, "Per-application inline byte bound must be positive")
+      .createWithDefaultString("256m")
+
+  val RECOVERY_TASK_COMMIT_MAX_INLINE_RECORDS_PER_APP: ConfigEntry[Long] =
+    buildConf("celeborn.master.recovery.taskCommit.maxInlineRecordsPerApp")
+      .categories("master")
+      .version("1.0.0")
+      .doc("Maximum number of inline task-commit records retained across all recoveries of one " +
+        "application.")
+      .longConf
+      .checkValue(_ > 0, "Per-application inline record bound must be positive")
+      .createWithDefault(200000L)
 
   val DFS_EXPIRE_DIRS_TIMEOUT: ConfigEntry[Long] =
     buildConf("celeborn.master.dfs.expireDirs.timeout")

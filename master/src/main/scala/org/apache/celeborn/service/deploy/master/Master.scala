@@ -184,6 +184,7 @@ private[celeborn] class Master(
     ThreadUtils.newDaemonSingleThreadScheduledExecutor("master-message-forwarder")
   private var checkForWorkerTimeoutTask: ScheduledFuture[_] = _
   private var checkForApplicationTimeOutTask: ScheduledFuture[_] = _
+  private var checkForRecoveryBlobRepairTask: ScheduledFuture[_] = _
   private var checkForUnavailableWorkerTimeOutTask: ScheduledFuture[_] = _
   private var checkForDFSRemnantDirsTimeOutTask: ScheduledFuture[_] = _
   private val nonEagerHandler = ThreadUtils.newDaemonCachedThreadPool("master-noneager-handler", 64)
@@ -194,6 +195,20 @@ private[celeborn] class Master(
   private val applicationLeaseMaxDurationMs = conf.applicationLeaseMaxDurationMs
   private val recoveryTaskCommitMaxPayloadSize = conf.recoveryTaskCommitMaxPayloadSize
   private val recoveryBlobQuorum = conf.recoveryBlobQuorum
+  private lazy val recoveryBlobRepairCycle = new RecoveryBlobRepairCycle(
+    new RecoveryBlobRepairPlanner(
+      conf.recoveryBlobReplicationFactor,
+      Master.RecoveryBlobRepairTasksPerCycle),
+    new RpcRecoveryBlobRepairExecutor(rpcEnv),
+    (pointer, generation, workerIds) =>
+      statusSystem.handleRepairRecoveryBlobPointer(
+        pointer.getAppId,
+        pointer.getRecoveryId,
+        pointer.getWriteId,
+        pointer.getPartitionId,
+        generation,
+        workerIds.asJava,
+        MasterClient.genRequestId()))
   private val recoveryTaskCommitMaxBatchResponseSize = conf.recoveryTaskCommitMaxBatchResponseSize
   private val workerUnavailableInfoExpireTimeoutMs = conf.workerUnavailableInfoExpireTimeout
   private val allowWorkerHostPattern = conf.allowWorkerHostPattern
@@ -366,6 +381,11 @@ private[celeborn] class Master(
     checkForApplicationTimeOutTask =
       scheduleCheckTask(appHeartbeatTimeoutMs / 2, CheckForApplicationTimeOut)
 
+    if (conf.recoveryBlobEnabled) {
+      checkForRecoveryBlobRepairTask =
+        scheduleCheckTask(conf.recoveryBlobRepairInterval, CheckForRecoveryBlobRepair)
+    }
+
     if (workerUnavailableInfoExpireTimeoutMs > 0) {
       checkForUnavailableWorkerTimeOutTask = scheduleCheckTask(
         workerUnavailableInfoExpireTimeoutMs / 2,
@@ -462,6 +482,8 @@ private[celeborn] class Master(
       executeWithLeaderChecker(null, timeoutWorkerUnavailableInfos())
     case CheckForApplicationTimeOut =>
       executeWithLeaderChecker(null, timeoutDeadApplications())
+    case CheckForRecoveryBlobRepair =>
+      executeWithLeaderChecker(null, repairUnderReplicatedRecoveryBlobs())
     case CheckForDFSExpiredDirsTimeout =>
       executeWithLeaderChecker(null, checkAndCleanExpiredAppDirsOnDFS())
     case pb: PbWorkerLost =>
@@ -790,6 +812,27 @@ private[celeborn] class Master(
     if (!unavailableInfoTimeoutWorkers.isEmpty) {
       val handleResponse = removeWorkersUnavailableInfo(unavailableInfoTimeoutWorkers)
       logDebug(s"Remove unavailable info for workers response: $handleResponse")
+    }
+  }
+
+  /**
+   * Restores recovery payloads that have fallen below their replication factor.
+   *
+   * Runs on the leader only, because repair mutates replicated state and two masters planning
+   * against different views of the live worker set would fight over the same pointers.
+   */
+  private def repairUnderReplicatedRecoveryBlobs(): Unit = {
+    val pointers = statusSystem.allRecoveryBlobPointers()
+    if (pointers.isEmpty) {
+      return
+    }
+
+    val liveWorkers = statusSystem.availableWorkers.asScala
+      .map(worker => s"${worker.host}:${worker.rpcPort}")
+      .toSet
+    val repaired = recoveryBlobRepairCycle.run(pointers.asScala.toSeq, liveWorkers)
+    if (repaired > 0) {
+      logInfo(s"Repaired $repaired under-replicated recovery blob(s)")
     }
   }
 
@@ -2209,6 +2252,13 @@ private[celeborn] class Master(
 }
 
 private[deploy] object Master extends Logging {
+
+  /**
+   * How many payloads one repair cycle may copy. Repair shares the cluster with the write path, so
+   * a burst of worker loss must not turn into an unbounded copy storm.
+   */
+  private val RecoveryBlobRepairTasksPerCycle = 64
+
   def main(args: Array[String]): Unit = {
     SignalUtils.registerLogger(log)
     val conf = new CelebornConf()

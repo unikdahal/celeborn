@@ -83,8 +83,10 @@ license: |
 | celeborn.master.recovery.blob.replicationFactor | 3 | false | Number of workers a recovery payload is uploaded to. | 1.0.0 |  | 
 | celeborn.master.recovery.taskCommit.maxBatchResponseSize | 16m | false | Maximum serialized protobuf response bytes returned by one recovery task commit batch lookup, including entry framing, digests, payloads, and authoritative misses. | 1.0.0 |  | 
 | celeborn.master.recovery.taskCommit.maxInlineBytesGlobal | 512m | false | Maximum serialized inline task-commit bytes retained by a master cluster. | 1.0.0 |  | 
+| celeborn.master.recovery.taskCommit.maxInlineBytesPerApp | 256m | false | Maximum serialized inline task-commit bytes retained across all recoveries of one application. Without this share, one application's recoveries can consume the global budget and starve every other resumable write. Rejections name this key so they are distinguishable from cluster-wide capacity rejections. | 1.0.0 |  | 
 | celeborn.master.recovery.taskCommit.maxInlineBytesPerRecovery | 256m | false | Maximum serialized inline task-commit bytes retained for one recovery execution. | 1.0.0 |  | 
 | celeborn.master.recovery.taskCommit.maxInlineRecordsGlobal | 1000000 | false | Maximum number of inline task-commit records retained by a master cluster. | 1.0.0 |  | 
+| celeborn.master.recovery.taskCommit.maxInlineRecordsPerApp | 200000 | false | Maximum number of inline task-commit records retained across all recoveries of one application. | 1.0.0 |  | 
 | celeborn.master.recovery.taskCommit.maxInlineRecordsPerRecovery | 200000 | false | Maximum number of inline task-commit records retained for one recovery execution. | 1.0.0 |  | 
 | celeborn.master.recovery.taskCommit.maxPayloadSize | 1m | false | Maximum inline payload accepted for one immutable recovery task commit. The bound protects Raft logs, master heap, and snapshots; larger envelopes require a durable blob-backed record codec. | 1.0.0 |  | 
 | celeborn.master.send.applicationMeta.threads | 8 | false | Number of threads used by the Master to send ApplicationMeta to Workers. | 0.5.0 |  | 

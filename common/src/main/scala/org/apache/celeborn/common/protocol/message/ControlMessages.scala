@@ -69,6 +69,8 @@ object ControlMessages extends Logging {
 
   case object CheckForApplicationTimeOut extends Message
 
+  case object CheckForRecoveryBlobRepair extends Message
+
   case object CheckForWorkerUnavailableInfoTimeout extends Message
 
   case object CheckForDFSExpiredDirsTimeout extends Message
@@ -560,6 +562,16 @@ object ControlMessages extends Logging {
   case class PushRecoveryBlobResponse(success: Boolean, reason: String = "")
 
   case class FetchRecoveryBlob(applicationId: String, sha256: Array[Byte]) extends WorkerMessage
+
+  case class ReplicateRecoveryBlob(
+      applicationId: String,
+      sha256: Array[Byte],
+      targetWorkerIds: java.util.List[String]) extends WorkerMessage
+
+  case class ReplicateRecoveryBlobResponse(
+      acceptedWorkerIds: java.util.List[String],
+      success: Boolean,
+      reason: String = "")
 
   case class FetchRecoveryBlobResponse(
       found: Boolean,
@@ -1179,6 +1191,22 @@ object ControlMessages extends Logging {
       }
       new TransportMessage(MessageType.FETCH_RECOVERY_BLOB_RESPONSE, builder.build().toByteArray)
 
+    case ReplicateRecoveryBlob(applicationId, sha256, targetWorkerIds) =>
+      val message = PbReplicateRecoveryBlob.newBuilder()
+        .setApplicationId(applicationId)
+        .setSha256(ByteString.copyFrom(sha256))
+        .addAllTargetWorkerIds(targetWorkerIds)
+        .build().toByteArray
+      new TransportMessage(MessageType.REPLICATE_RECOVERY_BLOB, message)
+
+    case ReplicateRecoveryBlobResponse(acceptedWorkerIds, success, reason) =>
+      val message = PbReplicateRecoveryBlobResponse.newBuilder()
+        .addAllAcceptedWorkerIds(acceptedWorkerIds)
+        .setSuccess(success)
+        .setReason(reason)
+        .build().toByteArray
+      new TransportMessage(MessageType.REPLICATE_RECOVERY_BLOB_RESPONSE, message)
+
     case pb: PbPartitionSplit =>
       new TransportMessage(MessageType.PARTITION_SPLIT, pb.toByteArray)
 
@@ -1724,6 +1752,20 @@ object ControlMessages extends Logging {
           if (fetch.getFound) fetch.getPayload.toByteArray else null,
           fetch.getSuccess,
           fetch.getReason)
+
+      case REPLICATE_RECOVERY_BLOB_VALUE =>
+        val replicate = PbReplicateRecoveryBlob.parseFrom(message.getPayload)
+        ReplicateRecoveryBlob(
+          replicate.getApplicationId,
+          replicate.getSha256.toByteArray,
+          replicate.getTargetWorkerIdsList)
+
+      case REPLICATE_RECOVERY_BLOB_RESPONSE_VALUE =>
+        val replicate = PbReplicateRecoveryBlobResponse.parseFrom(message.getPayload)
+        ReplicateRecoveryBlobResponse(
+          replicate.getAcceptedWorkerIdsList,
+          replicate.getSuccess,
+          replicate.getReason)
 
       case FENCE_APPLICATION_RESPONSE_VALUE =>
         val fence = PbFenceApplicationResponse.parseFrom(message.getPayload)

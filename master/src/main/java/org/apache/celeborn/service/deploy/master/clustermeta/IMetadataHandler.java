@@ -29,6 +29,15 @@ import org.apache.celeborn.common.meta.WorkerStatus;
 import org.apache.celeborn.common.quota.ResourceConsumption;
 
 public interface IMetadataHandler {
+  org.apache.celeborn.common.protocol.PbRecoveryBlobPointer handleRepairRecoveryBlobPointer(
+      String appId,
+      String recoveryId,
+      String writeId,
+      int partitionId,
+      long generation,
+      java.util.List<String> workerIds,
+      String requestId);
+
   org.apache.celeborn.common.protocol.PbRecoveryBlobPointer handlePublishRecoveryBlobPointer(
       String appId,
       String recoveryId,

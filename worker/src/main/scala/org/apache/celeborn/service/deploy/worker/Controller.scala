@@ -51,6 +51,29 @@ private[deploy] class Controller(
   var storageManager: StorageManager = _
   var applicationLeaseStore: ApplicationLeaseStore = _
   var recoveryBlobStore: RecoveryBlobStore = _
+  private val recoveryBlobPeers =
+    new java.util.concurrent.ConcurrentHashMap[
+      String,
+      org.apache.celeborn.common.rpc.RpcEndpointRef]()
+
+  /**
+   * Resolves another worker by the host:rpcPort identity a pointer records, so repair uses the same
+   * addressing a reader would.
+   */
+  private def recoveryBlobPeer(workerId: String): org.apache.celeborn.common.rpc.RpcEndpointRef = {
+    recoveryBlobPeers.computeIfAbsent(
+      workerId,
+      (id: String) => {
+        val separator = id.lastIndexOf(':')
+        require(separator > 0, s"Malformed recovery blob worker id: $id")
+        rpcEnv.setupEndpointRefByAddr(
+          org.apache.celeborn.common.rpc.RpcEndpointAddress(
+            org.apache.celeborn.common.rpc.RpcAddress(
+              id.substring(0, separator),
+              id.substring(separator + 1).toInt),
+            org.apache.celeborn.common.protocol.RpcNameConstants.WORKER_EP))
+      })
+  }
   var shuffleMapperAttempts: ConcurrentHashMap[String, AtomicIntegerArray] = _
   // shuffleKey -> (epoch -> CommitInfo)
   var shuffleCommitInfos: ConcurrentHashMap[String, ConcurrentHashMap[Long, CommitInfo]] = _
@@ -225,6 +248,46 @@ private[deploy] class Controller(
           context.reply(FetchRecoveryBlobResponse(
             found = false,
             payload = null,
+            success = false,
+            Option(e.getMessage).getOrElse(e.getClass.getName)))
+      }
+
+    case ReplicateRecoveryBlob(applicationId, sha256, targetWorkerIds) =>
+      checkAuth(context, applicationId)
+      val accepted = new java.util.ArrayList[String]()
+      try {
+        val payload = recoveryBlobStore.get(applicationId, sha256)
+        if (payload == null) {
+          // This worker was named as a source but no longer holds the payload. Reporting failure
+          // lets the master pick a different source instead of recording replicas that do not
+          // exist.
+          context.reply(ReplicateRecoveryBlobResponse(
+            accepted,
+            success = false,
+            s"Worker does not hold recovery blob for $applicationId"))
+        } else {
+          targetWorkerIds.forEach { targetWorkerId =>
+            try {
+              val response = recoveryBlobPeer(targetWorkerId).askSync[PushRecoveryBlobResponse](
+                PushRecoveryBlob(applicationId, sha256, payload))
+              if (response.success) {
+                accepted.add(targetWorkerId)
+              } else {
+                logWarning(
+                  s"Worker $targetWorkerId refused a repaired recovery blob: ${response.reason}")
+              }
+            } catch {
+              case e: Exception =>
+                logWarning(s"Failed to copy a recovery blob to $targetWorkerId", e)
+            }
+          }
+          context.reply(ReplicateRecoveryBlobResponse(accepted, success = true))
+        }
+      } catch {
+        case e: Exception =>
+          logWarning(s"Failed to replicate a recovery blob for $applicationId", e)
+          context.reply(ReplicateRecoveryBlobResponse(
+            accepted,
             success = false,
             Option(e.getMessage).getOrElse(e.getClass.getName)))
       }
