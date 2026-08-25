@@ -266,6 +266,12 @@ public class SparkShuffleManager implements ShuffleManager {
     return true;
   }
 
+  // Not an @Override: the Spark 5 manager interface dropped this member, while stock 4.x still
+  // requires it. Keeping the concrete implementation satisfies both from one source tree.
+  public ShuffleBlockResolver shuffleBlockResolver() {
+    return sortShuffleManager().shuffleBlockResolver();
+  }
+
   @Override
   public void stop() {
     sortShuffleIds.clear();
