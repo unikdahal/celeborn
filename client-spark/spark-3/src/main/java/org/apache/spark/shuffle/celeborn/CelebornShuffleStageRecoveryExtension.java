@@ -107,6 +107,8 @@ public final class CelebornShuffleStageRecoveryExtension
     private final long leaseDurationMs;
     private final int probeTimeoutMs;
     private final Map<Integer, Integer> adoptedShuffles = new ConcurrentHashMap<>();
+    private final java.util.Set<String> registeredRecoveryKeys =
+        java.util.Collections.newSetFromMap(new ConcurrentHashMap<>());
     private final AtomicReference<RuntimeException> renewalFailure = new AtomicReference<>();
 
     private volatile LifecycleManager lifecycleManager;
@@ -180,6 +182,7 @@ public final class CelebornShuffleStageRecoveryExtension
       String recoveryKey = recoveryKey(info, numMappers, numPartitions);
 
       manager.registerShuffleRecoveryIntent(appShuffleId, recoveryKey);
+      registeredRecoveryKeys.add(recoveryKey);
       Option<LifecycleManager.AdoptedShuffleCatalog> adopted =
           manager.adoptShuffleFromCatalog(
               appShuffleId,

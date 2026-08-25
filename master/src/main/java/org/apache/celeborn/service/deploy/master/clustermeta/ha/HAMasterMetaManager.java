@@ -80,6 +80,27 @@ public class HAMasterMetaManager extends AbstractMetaManager {
   }
 
   @Override
+  public long[] handleReleaseRecoveryExecution(
+      String appId, String recoveryId, java.util.List<String> recoveryKeys, String requestId) {
+    ResourceProtos.ResourceResponse response =
+        ratisServer.submitRequest(
+            ResourceRequest.newBuilder()
+                .setCmdType(Type.ReleaseRecoveryExecution)
+                .setRequestId(requestId)
+                .setReleaseRecoveryExecutionRequest(
+                    ResourceProtos.ReleaseRecoveryExecutionRequest.newBuilder()
+                        .setAppId(appId)
+                        .setRecoveryId(recoveryId)
+                        .addAllRecoveryKeys(recoveryKeys)
+                        .build())
+                .build());
+    if (!response.getSuccess()) {
+      throw new CelebornRuntimeException(
+          response.hasMessage() ? response.getMessage() : "Recovery execution release failed");
+    }
+    return new long[] {0L, 0L, 0L};
+  }
+
   public org.apache.celeborn.common.protocol.PbRecoveryBlobPointer handleRepairRecoveryBlobPointer(
       String appId,
       String recoveryId,

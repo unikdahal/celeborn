@@ -29,6 +29,12 @@ import org.apache.celeborn.common.meta.WorkerStatus;
 import org.apache.celeborn.common.quota.ResourceConsumption;
 
 public interface IMetadataHandler {
+  long[] releaseRecoveryExecutionMeta(
+      String appId, String recoveryId, java.util.List<String> recoveryKeys);
+
+  long[] handleReleaseRecoveryExecution(
+      String appId, String recoveryId, java.util.List<String> recoveryKeys, String requestId);
+
   org.apache.celeborn.common.protocol.PbRecoveryBlobPointer handleRepairRecoveryBlobPointer(
       String appId,
       String recoveryId,

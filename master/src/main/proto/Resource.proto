@@ -48,6 +48,7 @@ enum Type {
   PublishRecoveryTaskCommit = 34;
   PublishRecoveryBlobPointer = 35;
   RepairRecoveryBlobPointer = 36;
+  ReleaseRecoveryExecution = 37;
 }
 
 enum WorkerEventType {
@@ -86,6 +87,7 @@ message ResourceRequest {
   optional PublishRecoveryTaskCommitRequest publishRecoveryTaskCommitRequest = 30;
   optional PublishRecoveryBlobPointerRequest publishRecoveryBlobPointerRequest = 31;
   optional RepairRecoveryBlobPointerRequest repairRecoveryBlobPointerRequest = 32;
+  optional ReleaseRecoveryExecutionRequest releaseRecoveryExecutionRequest = 33;
   optional ReviseLostShufflesRequest reviseLostShufflesRequest = 102;
 }
 
@@ -125,6 +127,14 @@ message PublishRecoveryBlobPointerRequest {
   int64 createdAtMs = 9;
   int64 applicationLeaseEpoch = 10;
   string applicationLeaseOwnerId = 11;
+}
+
+message ReleaseRecoveryExecutionRequest {
+  string appId = 1;
+  string recoveryId = 2;
+  int64 applicationLeaseEpoch = 3;
+  string applicationLeaseOwnerId = 4;
+  repeated string recoveryKeys = 5;
 }
 
 message RepairRecoveryBlobPointerRequest {

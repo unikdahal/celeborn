@@ -143,6 +143,8 @@ enum MessageType {
   GET_RECOVERY_BLOB_POINTER_RESPONSE = 120;
   REPLICATE_RECOVERY_BLOB = 121;
   REPLICATE_RECOVERY_BLOB_RESPONSE = 122;
+  RELEASE_RECOVERY_EXECUTION = 123;
+  RELEASE_RECOVERY_EXECUTION_RESPONSE = 124;
 }
 
 enum StreamType {
@@ -1145,6 +1147,24 @@ message PbReplicateRecoveryBlob {
   repeated string targetWorkerIds = 3;
 }
 
+message PbReleaseRecoveryExecutionRequest {
+  string applicationId = 1;
+  string recoveryId = 2;
+  int64 applicationLeaseEpoch = 3;
+  string applicationLeaseOwnerId = 4;
+  // The semantic shuffle keys this execution registered; catalogs are matched by these.
+  repeated string recoveryKeys = 5;
+}
+
+message PbReleaseRecoveryExecutionResponse {
+  // Counts of what this release actually removed; zero on an idempotent replay.
+  int64 releasedRecords = 1;
+  int64 releasedBytes = 2;
+  int64 releasedPointers = 3;
+  bool success = 4;
+  string reason = 5;
+}
+
 message PbReplicateRecoveryBlobResponse {
   // Only the targets that durably accepted the copy. A pointer may record no more than these.
   repeated string acceptedWorkerIds = 1;
@@ -1367,6 +1387,7 @@ enum PbMetaRequestType {
   PublishRecoveryTaskCommit = 34;
   PublishRecoveryBlobPointer = 35;
   RepairRecoveryBlobPointer = 36;
+  ReleaseRecoveryExecution = 37;
 }
 
 message PbMetaRequest {
@@ -1394,6 +1415,7 @@ message PbMetaRequest {
   PbPublishRecoveryTaskCommitRequest publishRecoveryTaskCommitRequest = 30;
   PbPublishRecoveryBlobPointerRequest publishRecoveryBlobPointerRequest = 31;
   PbRepairRecoveryBlobPointerRequest repairRecoveryBlobPointerRequest = 32;
+  PbReleaseRecoveryExecutionRequest releaseRecoveryExecutionRequest = 33;
   PbReviseLostShuffles reviseLostShufflesRequest = 102;
 }
 

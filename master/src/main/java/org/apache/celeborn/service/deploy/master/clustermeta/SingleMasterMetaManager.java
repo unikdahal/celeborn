@@ -36,6 +36,11 @@ import org.apache.celeborn.common.rpc.RpcEnv;
 
 public class SingleMasterMetaManager extends AbstractMetaManager {
   @Override
+  public long[] handleReleaseRecoveryExecution(
+      String appId, String recoveryId, java.util.List<String> recoveryKeys, String requestId) {
+    return releaseRecoveryExecutionMeta(appId, recoveryId, recoveryKeys);
+  }
+
   public org.apache.celeborn.common.protocol.PbRecoveryBlobPointer handleRepairRecoveryBlobPointer(
       String appId,
       String recoveryId,

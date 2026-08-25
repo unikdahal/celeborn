@@ -293,6 +293,29 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
   }
 
   /** Atomically acquire the next lease epoch using the master's clock. */
+  /**
+   * Releases every durable record of one logical execution after it completes successfully.
+   * Fenced or unreachable masters leave state to age out under the lease timeout, which stays the
+   * backstop; a second release is a harmless no-op.
+   */
+  def releaseRecoveryExecution(
+      recoveryId: String,
+      recoveryKeys: Seq[String],
+      leaseEpoch: Long,
+      leaseOwnerId: String): PbReleaseRecoveryExecutionResponse = {
+    require(recoveryId != null && recoveryId.nonEmpty, "recoveryId must be non-empty")
+    val request = PbReleaseRecoveryExecutionRequest.newBuilder()
+      .setApplicationId(appUniqueId)
+      .setRecoveryId(recoveryId)
+      .setApplicationLeaseEpoch(leaseEpoch)
+      .setApplicationLeaseOwnerId(leaseOwnerId)
+      .addAllRecoveryKeys(recoveryKeys.asJava)
+      .build()
+    masterClient.askSync[PbReleaseRecoveryExecutionResponse](
+      request,
+      classOf[PbReleaseRecoveryExecutionResponse])
+  }
+
   def takeOverApplicationLease(
       ownerId: String,
       leaseDurationMs: Long): PbApplicationLeaseControlResponse = {

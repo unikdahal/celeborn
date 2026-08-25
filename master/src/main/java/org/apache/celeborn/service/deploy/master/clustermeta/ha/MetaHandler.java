@@ -131,6 +131,15 @@ public class MetaHandler {
               taskCommitRequest.getSha256().toByteArray());
           break;
 
+        case ReleaseRecoveryExecution:
+          PbReleaseRecoveryExecutionRequest releaseRequest =
+              request.getReleaseRecoveryExecutionRequest();
+          metaSystem.releaseRecoveryExecutionMeta(
+              releaseRequest.getApplicationId(),
+              releaseRequest.getRecoveryId(),
+              releaseRequest.getRecoveryKeysList());
+          break;
+
         case RepairRecoveryBlobPointer:
           PbRepairRecoveryBlobPointerRequest blobRepairRequest =
               request.getRepairRecoveryBlobPointerRequest();

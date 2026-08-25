@@ -559,6 +559,105 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
    * <p>The digest and length may never change, so a repair cannot alter what a recovery reads; the
    * generation must advance so that a stale repair cannot overwrite a newer replica set.
    */
+  /**
+   * Drops every durable record of one logical execution - task commits, blob pointers, and the
+   * committed shuffle catalogs it published - returning the freed budget. Releasing an execution
+   * that has nothing left is a no-op, so a client retry or a second successful driver is harmless.
+   *
+   * <p>Source anchors are deliberately retained: their identity is shared across executions that
+   * read the same source, so removing them here could strand a concurrent sibling.
+   */
+  public synchronized long[] releaseRecoveryExecutionMeta(
+      String appId, String recoveryId, java.util.List<String> recoveryKeys) {
+    if (appId == null || appId.isEmpty() || recoveryId == null || recoveryId.isEmpty()) {
+      throw new IllegalArgumentException(
+          "Releasing a recovery execution requires an application and recovery identity");
+    }
+    String prefix = recoveryExecutionPrefix(appId, recoveryId);
+
+    // Catalogs first: their index entries are derived from the records themselves.
+    java.util.List<String> catalogKeys = new java.util.ArrayList<>();
+    java.util.Map.Entry<String, ByteString> catalogHit = null;
+    for (java.util.Map.Entry<String, ByteString> entry : committedShuffleCatalogs.entrySet()) {
+      org.apache.celeborn.common.protocol.PbCommittedShuffleCatalog catalog;
+      try {
+        catalog =
+            org.apache.celeborn.common.protocol.PbCommittedShuffleCatalog.parseFrom(
+                entry.getValue());
+      } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+        throw new IllegalStateException("Malformed committed catalog in master state", e);
+      }
+      if (appId.equals(catalog.getAppId()) && recoveryKeys.contains(catalog.getRecoveryKey())) {
+        catalogKeys.add(entry.getKey());
+        catalogHit = entry;
+      }
+    }
+    long releasedRecords = catalogKeys.size();
+    long releasedPointers = 0;
+    long releasedBytes = 0;
+    for (String key : catalogKeys) {
+      ByteString value = committedShuffleCatalogs.remove(key);
+      if (value != null) {
+        releaseRecoveryTaskCommitCapacity(appId, recoveryId, value.size(), 1L);
+        releasedBytes += value.size();
+      }
+    }
+    if (catalogHit != null) {
+      try {
+        org.apache.celeborn.common.protocol.PbCommittedShuffleCatalog catalog =
+            org.apache.celeborn.common.protocol.PbCommittedShuffleCatalog.parseFrom(
+                catalogHit.getValue());
+        committedShuffleCatalogIndex
+            .keySet()
+            .removeIf(
+                key -> key.equals(committedCatalogRecoveryKey(appId, catalog.getRecoveryKey())));
+      } catch (com.google.protobuf.InvalidProtocolBufferException ignored) {
+        // already handled above
+      }
+    }
+
+    java.util.List<String> commitKeys = new java.util.ArrayList<>();
+    for (String key : recoveryTaskCommits.keySet()) {
+      if (key.startsWith(prefix)) {
+        commitKeys.add(key);
+      }
+    }
+    for (String key : commitKeys) {
+      ByteString value = recoveryTaskCommits.remove(key);
+      if (value != null) {
+        parseAndValidateRecoveryTaskCommit(value, key);
+        releaseRecoveryTaskCommitCapacity(
+            parseAndValidateRecoveryTaskCommit(value, key), value.size());
+        releasedRecords++;
+        releasedBytes += value.size();
+      }
+    }
+
+    java.util.List<String> pointerKeys = new java.util.ArrayList<>();
+    for (String key : recoveryBlobPointers.keySet()) {
+      if (key.startsWith(prefix)) {
+        pointerKeys.add(key);
+      }
+    }
+    for (String key : pointerKeys) {
+      ByteString value = recoveryBlobPointers.remove(key);
+      if (value != null) {
+        org.apache.celeborn.common.protocol.PbRecoveryBlobPointer pointer =
+            parseAndValidateRecoveryBlobPointer(value, key);
+        releaseRecoveryTaskCommitCapacity(
+            pointer.getAppId(), pointer.getRecoveryId(), value.size());
+        releaseRecoveryBlobDigest(pointer.getAppId(), pointer.getSha256().toByteArray());
+        releasedPointers++;
+        releasedBytes += value.size();
+      }
+    }
+    return new long[] {releasedRecords, releasedBytes, releasedPointers};
+  }
+
+  private static String recoveryExecutionPrefix(String appId, String recoveryId) {
+    return appId.length() + ":" + appId + recoveryId.length() + ":" + recoveryId;
+  }
+
   public synchronized org.apache.celeborn.common.protocol.PbRecoveryBlobPointer
       repairRecoveryBlobPointerMeta(
           String appId,

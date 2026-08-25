@@ -751,6 +751,10 @@ private[celeborn] class Master(
       checkAuth(context, request.getAppId)
       executeWithLeaderChecker(context, handlePublishRecoveryBlobPointer(context, request))
 
+    case request: PbReleaseRecoveryExecutionRequest =>
+      checkAuth(context, request.getApplicationId)
+      executeWithLeaderChecker(context, handleReleaseRecoveryExecution(context, request))
+
     case request: PbGetRecoveryBlobPointer =>
       checkAuth(context, request.getAppId)
       executeWithLeaderChecker(context, handleGetRecoveryBlobPointer(context, request))
@@ -1557,6 +1561,35 @@ private[celeborn] class Master(
         response.setSuccess(false).setMessage(Option(e.getMessage).getOrElse(e.getClass.getName))
     }
     context.reply(response.build())
+  }
+
+  private def handleReleaseRecoveryExecution(
+      context: RpcCallContext,
+      request: PbReleaseRecoveryExecutionRequest): Unit = {
+    try {
+      requireValidApplicationLease(
+        request.getApplicationId,
+        request.getApplicationLeaseEpoch,
+        request.getApplicationLeaseOwnerId)
+      val released =
+        statusSystem.handleReleaseRecoveryExecution(
+          request.getApplicationId,
+          request.getRecoveryId,
+          request.getRecoveryKeysList,
+          MasterClient.genRequestId())
+      val response = PbReleaseRecoveryExecutionResponse.newBuilder()
+        .setSuccess(true)
+        .setReleasedRecords(released(0))
+        .setReleasedBytes(released(1))
+        .setReleasedPointers(released(2))
+      context.reply(response.build())
+    } catch {
+      case NonFatal(e) =>
+        context.reply(
+          PbReleaseRecoveryExecutionResponse.newBuilder()
+            .setSuccess(false)
+            .setReason(Option(e.getMessage).getOrElse(e.getClass.getName)))
+    }
   }
 
   private def handlePublishRecoveryBlobPointer(
