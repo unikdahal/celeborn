@@ -383,13 +383,12 @@ private[deploy] class Controller(
   }
 
   private def validChunkOffsets(offsets: jList[java.lang.Long], fileSize: Long): Boolean = {
-    offsets.asScala.forall(_ != null) &&
-    (offsets.isEmpty || offsets.get(0) == 0L) &&
-    offsets.asScala.sliding(2).forall {
-      case Seq(previous, next) => previous < next
-      case _ => true
-    } &&
-    (offsets.isEmpty || offsets.get(offsets.size() - 1) <= fileSize)
+    // A null offset is corrupt metadata; unboxing throws and fails the check loudly.
+    val primitives = offsets.asScala.map(_.longValue())
+    primitives.nonEmpty &&
+    primitives.head == 0L &&
+    primitives.sliding(2).forall(pair => pair.head < pair.last) &&
+    primitives.last <= fileSize
   }
 
   private def handleReserveSlots(
