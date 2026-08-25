@@ -267,11 +267,6 @@ public class SparkShuffleManager implements ShuffleManager {
   }
 
   @Override
-  public ShuffleBlockResolver shuffleBlockResolver() {
-    return sortShuffleManager().shuffleBlockResolver();
-  }
-
-  @Override
   public void stop() {
     sortShuffleIds.clear();
     if (shuffleClient != null) {
