@@ -577,7 +577,7 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
 
     // Catalogs first: their index entries are derived from the records themselves.
     java.util.List<String> catalogKeys = new java.util.ArrayList<>();
-    java.util.Map.Entry<String, ByteString> catalogHit = null;
+    java.util.Set<String> catalogIndexKeys = new java.util.HashSet<>();
     for (java.util.Map.Entry<String, ByteString> entry : committedShuffleCatalogs.entrySet()) {
       org.apache.celeborn.common.protocol.PbCommittedShuffleCatalog catalog;
       try {
@@ -589,7 +589,7 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
       }
       if (appId.equals(catalog.getAppId()) && recoveryKeys.contains(catalog.getRecoveryKey())) {
         catalogKeys.add(entry.getKey());
-        catalogHit = entry;
+        catalogIndexKeys.add(committedCatalogRecoveryKey(appId, catalog.getRecoveryKey()));
       }
     }
     long releasedRecords = catalogKeys.size();
@@ -602,18 +602,10 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
         releasedBytes += value.size();
       }
     }
-    if (catalogHit != null) {
-      try {
-        org.apache.celeborn.common.protocol.PbCommittedShuffleCatalog catalog =
-            org.apache.celeborn.common.protocol.PbCommittedShuffleCatalog.parseFrom(
-                catalogHit.getValue());
-        committedShuffleCatalogIndex
-            .keySet()
-            .removeIf(
-                key -> key.equals(committedCatalogRecoveryKey(appId, catalog.getRecoveryKey())));
-      } catch (com.google.protobuf.InvalidProtocolBufferException ignored) {
-        // already handled above
-      }
+    // Every matched catalog's index entry goes with it: an execution can publish several
+    // shuffles, and keeping any entry would leave a stale semantic key over dropped records.
+    for (String indexKey : catalogIndexKeys) {
+      committedShuffleCatalogIndex.remove(indexKey);
     }
 
     java.util.List<String> commitKeys = new java.util.ArrayList<>();
