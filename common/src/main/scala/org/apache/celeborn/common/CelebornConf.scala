@@ -745,7 +745,8 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
     val nodeConfPrefix = extractPrefix(HA_MASTER_NODE_HOST.key, "<id>")
     val nodeIds = getAllWithPrefix(nodeConfPrefix)
       .map(_._1)
-      .filterNot(_.equals("id"))
+      // "id" is the local-node override and "ids" the explicit list; neither names a node.
+      .filterNot(key => key.equals("id") || key.equals("ids"))
       .map(k => extractPrefix(k, "."))
       .distinct
 
