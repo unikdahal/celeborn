@@ -17,28 +17,25 @@
 
 package org.apache.celeborn.client
 
-import java.nio.file.{Files, Path, Paths, StandardOpenOption}
+import java.nio.file.{Files, Path, StandardOpenOption}
 import java.util.{Properties, UUID}
 import java.util.concurrent.atomic.AtomicBoolean
 
-import org.apache.celeborn.common.CelebornConf
-import org.apache.celeborn.common.util.Utils
-
 /**
- * Provider-owned lifecycle process. It holds Celeborn registration, commit metadata, heartbeats,
- * and retention leases independently of Spark drivers. A fresh service always receives a fresh
- * application identity; restarting it cannot silently attach an old descriptor to new output.
- * This initial service is not highly available and does not restore commit state after restart.
+ * Retention and seal controls attached to Celeborn's existing standalone lifecycle daemon.
+ * The daemon owns registration, heartbeats and shutdown. This attachment neither creates nor
+ * stops its lifecycle manager. Each attachment gets a fresh incarnation so a service restart
+ * cannot make old read descriptors current, even when the configured application ID is reused.
  */
-private[celeborn] final class RetainedShuffleService(conf: CelebornConf) extends AutoCloseable {
-  require(conf != null)
+private[celeborn] final class RetainedShuffleService(
+    private[celeborn] val lifecycleManager: LifecycleManager) extends AutoCloseable {
+  require(lifecycleManager != null)
 
   val incarnation: String = UUID.randomUUID().toString
-  val appUniqueId: String = s"retained-$incarnation"
+  val appUniqueId: String = lifecycleManager.appUniqueId
   private val closed = new AtomicBoolean(false)
-  private[celeborn] val lifecycleManager = new LifecycleManager(appUniqueId, conf)
-  lifecycleManager.rpcEnv.setupEndpoint(RetainedShuffleControl.EndpointName,
-    new RetainedShuffleControlEndpoint(this))
+  private val controlEndpoint = lifecycleManager.rpcEnv.setupEndpoint(
+    RetainedShuffleControl.EndpointName, new RetainedShuffleControlEndpoint(this))
 
   def isLive: Boolean = !closed.get()
 
@@ -80,31 +77,7 @@ private[celeborn] final class RetainedShuffleService(conf: CelebornConf) extends
     finally output.close()
   }
 
-  def awaitTermination(): Unit = lifecycleManager.rpcEnv.awaitTermination()
-
   override def close(): Unit = {
-    if (closed.compareAndSet(false, true)) lifecycleManager.stop()
-  }
-}
-
-/** Run separately from measured Spark attempts; terminate explicitly when retained work expires. */
-object RetainedShuffleService {
-  def main(args: Array[String]): Unit = {
-    require(args.length == 2, "expected Celeborn properties file and new endpoint output path")
-    val conf = new CelebornConf()
-    Utils.loadDefaultCelebornProperties(conf, args(0))
-    val service = new RetainedShuffleService(conf)
-    val shutdown = new Thread("celeborn-retained-shuffle-service-shutdown") {
-      override def run(): Unit = service.close()
-    }
-    Runtime.getRuntime.addShutdownHook(shutdown)
-    try {
-      service.writeEndpoint(Paths.get(args(1)))
-      service.awaitTermination()
-    } finally {
-      service.close()
-      try Runtime.getRuntime.removeShutdownHook(shutdown)
-      catch { case _: IllegalStateException => () }
-    }
+    if (closed.compareAndSet(false, true)) lifecycleManager.rpcEnv.stop(controlEndpoint)
   }
 }

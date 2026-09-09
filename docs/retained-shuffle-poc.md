@@ -38,19 +38,24 @@ Compilation, race tests, expiry tests, and end-to-end Spark integration are defe
 until the requested combined validation phase. Do not interpret this branch as a
 validated provider integration yet.
 
-## Provider-owned lifecycle process
+## Existing standalone lifecycle daemon
 
-`org.apache.celeborn.client.RetainedShuffleService` is a standalone entry point accepting
-a Celeborn properties file and an unused endpoint output path. It starts the normal
-Celeborn lifecycle manager and its master heartbeats outside Spark. The output properties
-record application ID, service incarnation, host and port. Service restarts create a new
-application identity. Shutdown closes leases and the lifecycle manager. The endpoint file
-is only discovery metadata; clients must verify liveness and exact incarnation before use.
+The PoC extends the existing `LifecycleManagerDaemon` and uses its normal
+`sbin/start-lifecycle-manager.sh` entry point. Add
+`celeborn.retainedShuffle.endpointFile=/absolute/path/to/new-endpoint.properties`
+to its properties file to attach retention and seal controls. With that setting absent,
+the daemon remains unchanged. Its existing authentication restriction, command-line
+configuration, master heartbeats, shutdown hook, and watchdog remain authoritative.
+No second standalone process implementation is maintained.
 
-The process currently exposes the existing native lifecycle endpoint. The next changes
-must connect producer/replacement clients to this owner, add the retention control RPCs,
-and export a sealed commit descriptor. Merely launching the process is not yet an
-end-to-end retention or recovery result. No provider restart/HA guarantee is claimed.
+The output properties record the daemon's application ID, a fresh retention-control
+incarnation, host and port. Use a unique application ID for each new provider lifetime.
+Even if an operator reuses the application ID, old descriptors must be rejected because
+the control incarnation changes. This attachment does not restore metadata after restart.
+The endpoint file is only discovery metadata, not evidence of liveness or a lease.
+
+Producer/replacement integration and native reads remain outstanding. Adding this
+attachment to the existing standalone daemon does not by itself prove end-to-end recovery.
 
 The service also registers `RetainedShuffleControlV1` in its native RPC environment.
 Its internal JVM messages support probe, acquire, renew, and release; requests and

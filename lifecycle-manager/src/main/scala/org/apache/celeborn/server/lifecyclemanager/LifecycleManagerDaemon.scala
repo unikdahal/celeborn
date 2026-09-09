@@ -17,10 +17,11 @@
 
 package org.apache.celeborn.server.lifecyclemanager
 
+import java.nio.file.Paths
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicReference
 
-import org.apache.celeborn.client.LifecycleManager
+import org.apache.celeborn.client.{LifecycleManager, RetainedShuffleService}
 import org.apache.celeborn.common.CelebornConf
 import org.apache.celeborn.common.internal.Logging
 import org.apache.celeborn.common.util.{SignalUtils, Utils}
@@ -31,6 +32,8 @@ object LifecycleManagerDaemon extends Logging {
 
   private[lifecyclemanager] val currentInstance: AtomicReference[LifecycleManager] =
     new AtomicReference[LifecycleManager]()
+
+  private val retainedInstance = new AtomicReference[RetainedShuffleService]()
 
   private[lifecyclemanager] var exitFn: Int => Unit =
     (code: Int) => System.exit(code)
@@ -82,6 +85,14 @@ object LifecycleManagerDaemon extends Logging {
 
       installShutdownHook(conf)
 
+      // Experimental opt-in: extend the normal daemon rather than starting a second owner.
+      conf.getOption("celeborn.retainedShuffle.endpointFile").foreach { endpointFile =>
+        require(endpointFile.nonEmpty, "retained shuffle endpoint file must not be empty")
+        val retained = new RetainedShuffleService(lm)
+        retainedInstance.set(retained)
+        retained.writeEndpoint(Paths.get(endpointFile))
+      }
+
       // scalastyle:off println
       println(s"LifecycleManager bound at ${lm.getHost}:${lm.getPort}")
       // scalastyle:on println
@@ -131,6 +142,11 @@ object LifecycleManagerDaemon extends Logging {
     Runtime.getRuntime.addShutdownHook(new Thread("celeborn-lm-shutdown") {
       override def run(): Unit = {
         watchdog.start()
+        val retained = retainedInstance.getAndSet(null)
+        if (retained != null) {
+          try retained.close()
+          catch { case t: Throwable => logError("retained controls stop failed", t) }
+        }
         val lm = currentInstance.get()
         if (lm != null) {
           try {
