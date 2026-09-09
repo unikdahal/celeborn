@@ -82,6 +82,11 @@ private[celeborn] final class RetainedShuffleLeases(
     }
   }
 
+  def isCurrent(lease: RetainedShuffleLease): Boolean = synchronized {
+    expire(nanoTime())
+    !closed && lease != null && leases.get(lease.token).exists(_.lease == lease)
+  }
+
   def release(lease: RetainedShuffleLease): Unit = synchronized {
     if (lease != null && leases.get(lease.token).exists(_.lease == lease)) {
       leases.remove(lease.token)

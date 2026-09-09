@@ -542,6 +542,40 @@ class ReducePartitionCommitHandler(
     }
   }
 
+  /** Immutable native read metadata for retained output; callers must hold a cleanup lease. */
+  private[celeborn] def retainedReadSnapshot(
+      shuffleId: Int,
+      expectedAttempts: Vector[Int],
+      reducerCount: Int): Option[Vector[Byte]] = {
+    if (expectedAttempts == null || expectedAttempts.isEmpty || expectedAttempts.size > 65536 ||
+        expectedAttempts.exists(_ < 0) || reducerCount <= 0 || reducerCount > 65536 ||
+        !isStageEnd(shuffleId) || isStageDataLost(shuffleId)) return None
+    val attempts = getMapperAttempts(shuffleId)
+    if (attempts == null || attempts.toVector != expectedAttempts) return None
+    val groups = reducerFileGroupsMap.get(shuffleId)
+    val failed = shufflePushFailedBatches.get(shuffleId)
+    // Failed-batch repair adds read semantics not yet represented by the retained descriptor.
+    if (groups == null || groups.size() > reducerCount || (failed != null && !failed.isEmpty)) {
+      return None
+    }
+    var locations = 0L
+    val entries = groups.entrySet().iterator()
+    while (entries.hasNext) {
+      val entry = entries.next()
+      if (entry.getKey == null || entry.getKey < 0 || entry.getKey >= reducerCount ||
+          entry.getValue == null) return None
+      locations += entry.getValue.size()
+      if (locations > 4096L) return None
+    }
+    val response = GetReducerFileGroupResponse(
+      StatusCode.SUCCESS, groups, attempts.clone(), serdeVersion = SerdeVersion.V1)
+    val payload = org.apache.celeborn.common.protocol.message.ControlMessages
+      .toTransportMessage(response).getPayload
+    if (payload.length > 4 * 1024 * 1024 || isStageDataLost(shuffleId) ||
+        !Option(getMapperAttempts(shuffleId)).exists(_.toVector == expectedAttempts)) None
+    else Some(payload.toVector)
+  }
+
   override def handleGetReducerFileGroup(
       context: RpcCallContext,
       shuffleId: Int,

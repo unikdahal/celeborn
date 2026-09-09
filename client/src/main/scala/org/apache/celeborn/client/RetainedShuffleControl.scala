@@ -30,11 +30,17 @@ private[celeborn] object RetainedShuffleControl {
   case class Renew(incarnation: String, lease: RetainedShuffleLease, ttlMillis: Long) extends Request
   case class Release(incarnation: String, lease: RetainedShuffleLease) extends Request
   case class Probe(incarnation: String) extends Request
+  case class Seal(
+      incarnation: String,
+      lease: RetainedShuffleLease,
+      expectedAttempts: Vector[Int],
+      reducerCount: Int) extends Request
   case class Response(
       incarnation: String,
       accepted: Boolean,
       lease: Option[RetainedShuffleLease],
-      reason: String) extends Serializable
+      reason: String,
+      seal: Option[RetainedShuffleSeal] = None) extends Serializable
 }
 
 private[celeborn] final class RetainedShuffleControlEndpoint(
@@ -61,6 +67,10 @@ private[celeborn] final class RetainedShuffleControlEndpoint(
             service.release(lease)
             Response(service.incarnation, true, None, "released")
           case Probe(_) => Response(service.incarnation, true, None, "live")
+          case Seal(_, lease, attempts, reducerCount) =>
+            val seal = service.seal(lease, attempts, reducerCount)
+            Response(service.incarnation, seal.nonEmpty, None,
+              if (seal.nonEmpty) "sealed" else "lease or committed winner metadata unavailable", seal)
         }
         context.reply(response)
       } catch {
@@ -102,6 +112,23 @@ private[celeborn] final class RetainedShuffleControlClient(
     if (response.accepted) require(response.lease.contains(lease), "renewal changed the lease")
     response.accepted
   }
+  def seal(
+      lease: RetainedShuffleLease,
+      expectedAttempts: Vector[Int],
+      reducerCount: Int): Option[RetainedShuffleSeal] = {
+    require(lease != null)
+    val response = request(Seal(incarnation, lease, expectedAttempts, reducerCount))
+    if (!response.accepted) None
+    else {
+      require(response.seal.exists { value =>
+        value.incarnation == incarnation && value.shuffleId == lease.shuffleId &&
+          value.reducerCount == reducerCount && value.mapperAttempts == expectedAttempts &&
+          RetainedShuffleSeal.valid(value)
+      }, "seal response does not match the requested committed shuffle")
+      response.seal
+    }
+  }
+
   def release(lease: RetainedShuffleLease): Unit = {
     require(request(Release(incarnation, lease)).accepted, "retention release was rejected")
   }

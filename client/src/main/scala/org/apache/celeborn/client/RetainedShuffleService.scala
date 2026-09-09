@@ -50,6 +50,17 @@ private[celeborn] final class RetainedShuffleService(conf: CelebornConf) extends
     !closed.get() && lifecycleManager.renewRetainedShuffle(lease, ttlMillis)
   }
 
+  def seal(
+      lease: RetainedShuffleLease,
+      expectedAttempts: Vector[Int],
+      reducerCount: Int): Option[RetainedShuffleSeal] = {
+    if (closed.get()) None
+    else lifecycleManager.retainedReadSnapshot(lease, expectedAttempts, reducerCount).map { payload =>
+      RetainedShuffleSeal.create(incarnation, lease.shuffleId, reducerCount,
+        expectedAttempts, payload)
+    }
+  }
+
   def release(lease: RetainedShuffleLease): Unit = {
     lifecycleManager.releaseRetainedShuffle(lease)
   }

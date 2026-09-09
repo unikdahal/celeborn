@@ -60,3 +60,22 @@ JVM serialization fallback and are not a released language-neutral protocol. Ide
 fencing is not a replacement for transport authorization. This control endpoint does not
 seal output or establish worker availability. A client must measure any local lease
 validity conservatively from the request start, not from the response arrival time.
+
+## Sealed native read snapshot
+
+The seal RPC requires a live retention lease, the exact registered mapper/reducer shape,
+and an accepted mapper-attempt vector supplied by Spark. Only reduce-partition shuffles
+are admitted. The commit handler requires stage completion without known data loss and
+an exact winner-vector match. It refuses failed-batch repair metadata in this initial
+slice. Stage completion alone is insufficient: Celeborn can mark a lost commit as ended.
+
+The response owns an immutable copy of Celeborn's native reducer-file-group protobuf
+payload. Its digest covers service incarnation, native shuffle ID, reducer count, mapper
+winners, and payload. The client validates the response against its request and recomputes
+the digest. Bounds currently limit mapper/reducer counts to 65536, partition locations
+to 4096, and the serialized payload to 4 MiB. These are PoC limits, not production sizing.
+
+A seal describes committed output at observation time. It is not an availability promise
+beyond the lease, does not survive provider restart, and does not replace authorization.
+Spark still needs to send its actual scheduler-accepted attempts and connect native reads
+to the prepared adoption path. All new behavior awaits the combined validation phase.

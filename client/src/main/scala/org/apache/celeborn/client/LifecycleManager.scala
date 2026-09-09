@@ -91,6 +91,7 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
   private val rangeReadFilter = conf.shuffleRangeReadFilterEnabled
   private val unregisterShuffleTime = JavaUtils.newConcurrentHashMap[Int, Long]()
   private val retainedShuffleLeases = new RetainedShuffleLeases()
+  private val retainedShuffleShapes = JavaUtils.newConcurrentHashMap[Int, (Int, Int)]()
 
   val registeredShuffle = ConcurrentHashMap.newKeySet[Int]()
   val shuffleCount = new LongAdder()
@@ -861,6 +862,7 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
         allocatedWorkers.put(workerInfo.toUniqueId, partitionLocationInfo)
       }
       shuffleAllocatedWorkers.put(shuffleId, allocatedWorkers)
+      retainedShuffleShapes.put(shuffleId, (numMappers, numPartitions))
       registeredShuffle.add(shuffleId)
       commitManager.registerShuffle(
         shuffleId,
@@ -1276,6 +1278,22 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
   private[celeborn] def renewRetainedShuffle(
       lease: RetainedShuffleLease,
       ttlMillis: Long): Boolean = retainedShuffleLeases.renew(lease, ttlMillis)
+
+  private[celeborn] def retainedReadSnapshot(
+      lease: RetainedShuffleLease,
+      expectedAttempts: Vector[Int],
+      reducerCount: Int): Option[Vector[Byte]] = {
+    if (!retainedShuffleLeases.isCurrent(lease) || expectedAttempts == null ||
+        retainedShuffleShapes.get(lease.shuffleId) != ((expectedAttempts.size, reducerCount))) {
+      return None
+    }
+    val snapshot = commitManager.getCommitHandler(lease.shuffleId) match {
+      case handler: org.apache.celeborn.client.commit.ReducePartitionCommitHandler =>
+        handler.retainedReadSnapshot(lease.shuffleId, expectedAttempts, reducerCount)
+      case _ => None
+    }
+    if (retainedShuffleLeases.isCurrent(lease)) snapshot else None
+  }
 
   private[celeborn] def releaseRetainedShuffle(lease: RetainedShuffleLease): Unit = {
     retainedShuffleLeases.release(lease)
@@ -1832,6 +1850,7 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
           }) {
         shuffleIdsToRemove += shuffleId
         // The registered-shuffle set was cleared atomically with the retention check above.
+        retainedShuffleShapes.remove(shuffleId)
         registeringShuffleRequest.remove(shuffleId)
         shuffleAllocatedWorkers.remove(shuffleId)
         latestPartitionLocation.remove(shuffleId)
