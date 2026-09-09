@@ -53,7 +53,7 @@ private[celeborn] final class RetainedShuffleService(
       reducerCount: Int): Option[RetainedShuffleSeal] = {
     if (closed.get()) None
     else lifecycleManager.retainedReadSnapshot(lease, expectedAttempts, reducerCount).map { payload =>
-      RetainedShuffleSeal.create(incarnation, lease.shuffleId, reducerCount,
+      RetainedShuffleSeal.create(appUniqueId, incarnation, lease.shuffleId, reducerCount,
         expectedAttempts, payload)
     }
   }
@@ -72,7 +72,8 @@ private[celeborn] final class RetainedShuffleService(
     properties.setProperty("incarnation", incarnation)
     properties.setProperty("host", lifecycleManager.getHost)
     properties.setProperty("port", lifecycleManager.getPort.toString)
-    val output = Files.newOutputStream(path, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
+    val output = Files.newOutputStream(
+      path, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
     try properties.store(output, "Celeborn retained shuffle lifecycle endpoint")
     finally output.close()
   }

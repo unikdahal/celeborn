@@ -23,6 +23,7 @@ import java.security.MessageDigest
 
 /** Native read snapshot after commit and Spark's accepted mapper-attempt vector agree. */
 private[celeborn] final case class RetainedShuffleSeal(
+    applicationId: String,
     incarnation: String,
     shuffleId: Int,
     reducerCount: Int,
@@ -34,11 +35,13 @@ private[celeborn] object RetainedShuffleSeal {
   val FormatVersion = 1
 
   def create(
+      applicationId: String,
       incarnation: String,
       shuffleId: Int,
       reducerCount: Int,
       mapperAttempts: Vector[Int],
       nativeReadMetadata: Vector[Byte]): RetainedShuffleSeal = {
+    require(applicationId != null && applicationId.nonEmpty && applicationId.length <= 1024)
     require(incarnation != null && incarnation.nonEmpty && incarnation.length <= 128)
     require(shuffleId >= 0 && reducerCount > 0 && reducerCount <= 65536)
     require(mapperAttempts != null && mapperAttempts.nonEmpty && mapperAttempts.size <= 65536)
@@ -46,16 +49,19 @@ private[celeborn] object RetainedShuffleSeal {
     require(nativeReadMetadata != null && nativeReadMetadata.nonEmpty &&
       nativeReadMetadata.size <= 4 * 1024 * 1024)
     val digest = MessageDigest.getInstance("SHA-256")
+    val application = applicationId.getBytes(StandardCharsets.UTF_8)
     val owner = incarnation.getBytes(StandardCharsets.UTF_8)
     digest.update(ByteBuffer.allocate(20).putInt(FormatVersion).putInt(owner.length)
       .putInt(shuffleId).putInt(reducerCount).putInt(mapperAttempts.size).array())
     digest.update(owner)
+    digest.update(ByteBuffer.allocate(4).putInt(application.length).array())
+    digest.update(application)
     mapperAttempts.foreach { attempt =>
       digest.update(ByteBuffer.allocate(4).putInt(attempt).array())
     }
     digest.update(ByteBuffer.allocate(4).putInt(nativeReadMetadata.size).array())
     digest.update(nativeReadMetadata.toArray)
-    RetainedShuffleSeal(incarnation, shuffleId, reducerCount, mapperAttempts,
+    RetainedShuffleSeal(applicationId, incarnation, shuffleId, reducerCount, mapperAttempts,
       nativeReadMetadata, digest.digest().toVector)
   }
 
@@ -63,7 +69,7 @@ private[celeborn] object RetainedShuffleSeal {
     if (seal == null) false
     else {
       try {
-        create(seal.incarnation, seal.shuffleId, seal.reducerCount,
+        create(seal.applicationId, seal.incarnation, seal.shuffleId, seal.reducerCount,
           seal.mapperAttempts, seal.nativeReadMetadata).digest == seal.digest
       } catch {
         case _: IllegalArgumentException => false
