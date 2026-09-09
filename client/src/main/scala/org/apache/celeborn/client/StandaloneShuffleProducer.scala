@@ -71,6 +71,37 @@ final class StandaloneShuffleProducer(endpointFile: String, conf: CelebornConf)
     StandaloneShuffleRegistration(value.shuffleId, value.user)
   }
 
+  /**
+   * Export committed native metadata after Spark has frozen its accepted encoded attempts.
+   * On success the bounded server lease is intentionally left alive for handoff, even if this
+   * producer exits. It expires without renewal; a replacement must obtain its own read lease.
+   */
+  def publish(
+      appShuffleId: Int,
+      acceptedEncodedAttempts: Array[Int],
+      handoffTtlMillis: Long): Array[Byte] = synchronized {
+    require(!closed && acceptedEncodedAttempts != null)
+    val reservation = registrations.getOrElse(appShuffleId,
+      throw new IllegalArgumentException("shuffle has no standalone producer reservation"))
+    val attempts = acceptedEncodedAttempts.toVector
+    require(attempts.size == reservation.numMappers && attempts.forall(_ >= 0))
+    val lease = RetainedShuffleLeaseHandle.acquire(control, reservation.shuffleId, handoffTtlMillis)
+      .getOrElse(throw new IllegalStateException("shuffle could not be retained for publication"))
+    var published = false
+    try {
+      val seal = control.seal(lease.lease, attempts, reservation.numReducers)
+        .getOrElse(throw new IllegalStateException("committed shuffle does not match Spark winners"))
+      require(seal.applicationId == applicationId, "sealed application identity changed")
+      val descriptor = RetainedShuffleDescriptor.encode(
+        RetainedShuffleDescriptor(host, port, reservation.user, seal))
+      require(lease.isCurrent, "publication lease expired while sealing")
+      published = true
+      descriptor
+    } finally {
+      if (!published) lease.close()
+    }
+  }
+
   def unregister(appShuffleId: Int): Unit = synchronized {
     registrations.get(appShuffleId).foreach { value =>
       require(control.retire(value), "standalone shuffle retirement rejected")

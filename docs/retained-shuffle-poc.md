@@ -134,11 +134,36 @@ replace Spark recovery's required recomputation fallback.
 Unregister and producer shutdown retire reservations through the remote owner and shut down
 only the producer's local control RPC environment. Retirement schedules normal delayed
 shuffle cleanup; a live retention lease continues to pin registered metadata. A producer
-must acquire its publication lease before unregister or shutdown. Publication, collection of
-Spark's accepted encoded mapper attempts, and renewal scheduling still need wiring.
+must acquire its publication lease before unregister or shutdown. The publication API below pins output for handoff. Collection of
+Spark's accepted encoded mapper attempts and renewal scheduling still need wiring.
 
 Admission is limited to 4096 reservations over one owner lifetime, including retired
 reservations. Tombstones prevent a retried registration from resurrecting a retired ID.
 A producer crash does not currently reclaim its reservation table entries. These explicit
 PoC limits must be replaced by bounded session expiry and catalog ownership before long-lived
 shared deployment. The new producer code has not yet been compiled or exercised.
+
+## Publication handoff and replacement entry point
+
+`SparkShuffleManager.publishRetainedShuffle` delegates to the standalone producer using
+Spark's local shuffle ID, the scheduler-frozen encoded attempt vector, and a handoff TTL.
+It acquires a lease before sealing, requires the native winners to match, and emits a
+bounded binary descriptor. Failed publication releases the lease. Successful publication
+intentionally leaves that lease on the owner until its TTL expires, allowing producer
+shutdown to retire the shuffle without immediately removing retained metadata. The TTL
+starts at acquisition, not at descriptor persistence. Publication retries consume separate
+bounded leases; this API is not an unlimited catalog retention promise.
+
+The descriptor contains the owner route, user identity, application ID, incarnation, native
+shuffle ID, shape, winner vector, native reducer metadata, and seal digest. Its decoder
+checks format/version, bounded lengths, digest, and absence of trailing bytes. It contains
+no lease token. The enclosing Spark manifest must bind these provider bytes to the certified
+computation identity and atomically persist them; that integration is not yet wired.
+
+`StandaloneRetainedShuffleReader` accepts those bytes and creates its own control RPC
+environment and native reader. It must claim before the handoff pin expires or before
+normal cleanup otherwise removes the output. Its new claim revalidates the seal against
+the live owner. The caller owns renewal and close. Descriptor presence does not establish
+liveness, and a constructor/read/renew failure must enter Spark's recovery miss or whole-
+shuffle invalidation path. The codec regression suite is written but has not been run;
+all new APIs still await compilation and the combined end-to-end validation.

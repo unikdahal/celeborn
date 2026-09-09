@@ -287,6 +287,15 @@ public class SparkShuffleManager implements ShuffleManager {
     }
   }
 
+  /** Export only after Spark has frozen the scheduler-accepted encoded mapper attempts. */
+  public byte[] publishRetainedShuffle(
+      int appShuffleId, int[] acceptedEncodedAttempts, long handoffTtlMillis) {
+    if (standaloneProducer == null) {
+      throw new IllegalStateException("Shuffle has no standalone lifecycle owner");
+    }
+    return standaloneProducer.publish(appShuffleId, acceptedEncodedAttempts, handoffTtlMillis);
+  }
+
   @Override
   public boolean unregisterShuffle(int appShuffleId) {
     if (sortShuffleIds.remove(appShuffleId)) {
