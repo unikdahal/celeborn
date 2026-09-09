@@ -90,6 +90,7 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
   private val shufflePartitionType = JavaUtils.newConcurrentHashMap[Int, PartitionType]()
   private val rangeReadFilter = conf.shuffleRangeReadFilterEnabled
   private val unregisterShuffleTime = JavaUtils.newConcurrentHashMap[Int, Long]()
+  private val retainedShuffleLeases = new RetainedShuffleLeases()
 
   val registeredShuffle = ConcurrentHashMap.newKeySet[Int]()
   val shuffleCount = new LongAdder()
@@ -1263,6 +1264,23 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
     reply(mapperAttemptFinishedSuccess)
   }
 
+  /** Pins local shuffle metadata until release or expiry; this does not seal a shuffle. */
+  private[celeborn] def retainShuffle(
+      shuffleId: Int,
+      ttlMillis: Long): Option[RetainedShuffleLease] = {
+    retainedShuffleLeases.acquire(shuffleId, ttlMillis) {
+      registeredShuffle.contains(shuffleId)
+    }
+  }
+
+  private[celeborn] def renewRetainedShuffle(
+      lease: RetainedShuffleLease,
+      ttlMillis: Long): Boolean = retainedShuffleLeases.renew(lease, ttlMillis)
+
+  private[celeborn] def releaseRetainedShuffle(lease: RetainedShuffleLease): Unit = {
+    retainedShuffleLeases.release(lease)
+  }
+
   def unregisterShuffle(shuffleId: Int): Unit = {
     if (getPartitionType(shuffleId) == PartitionType.REDUCE) {
       // if StageEnd has not been handled, trigger StageEnd
@@ -1808,10 +1826,12 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
     val currentTime = System.currentTimeMillis()
     val shuffleIdsToRemove = new ArrayBuffer[Integer]
     unregisterShuffleTime.keys().asScala.foreach { shuffleId =>
-      if (unregisterShuffleTime.get(shuffleId) < currentTime - shuffleExpiredCheckIntervalMs) {
+      if (unregisterShuffleTime.get(shuffleId) < currentTime - shuffleExpiredCheckIntervalMs &&
+          retainedShuffleLeases.beginRemoval(shuffleId) {
+            registeredShuffle.remove(shuffleId)
+          }) {
         shuffleIdsToRemove += shuffleId
-        // clear for the shuffle
-        registeredShuffle.remove(shuffleId)
+        // The registered-shuffle set was cleared atomically with the retention check above.
         registeringShuffleRequest.remove(shuffleId)
         shuffleAllocatedWorkers.remove(shuffleId)
         latestPartitionLocation.remove(shuffleId)
@@ -2049,6 +2069,7 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
    * A convenient method to stop [[RpcEndpoint]].
    */
   override def stop(): Unit = {
+    retainedShuffleLeases.close()
     heartbeater.stop()
     super.stop()
   }
