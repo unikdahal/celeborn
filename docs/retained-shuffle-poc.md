@@ -51,3 +51,12 @@ The process currently exposes the existing native lifecycle endpoint. The next c
 must connect producer/replacement clients to this owner, add the retention control RPCs,
 and export a sealed commit descriptor. Merely launching the process is not yet an
 end-to-end retention or recovery result. No provider restart/HA guarantee is claimed.
+
+The service also registers `RetainedShuffleControlV1` in its native RPC environment.
+Its internal JVM messages support probe, acquire, renew, and release; requests and
+responses carry the exact service incarnation. Client code reuses an existing Celeborn
+RPC environment and does not stop the owner. These messages use Celeborn's existing
+JVM serialization fallback and are not a released language-neutral protocol. Identity
+fencing is not a replacement for transport authorization. This control endpoint does not
+seal output or establish worker availability. A client must measure any local lease
+validity conservatively from the request start, not from the response arrival time.

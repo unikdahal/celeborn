@@ -37,6 +37,10 @@ private[celeborn] final class RetainedShuffleService(conf: CelebornConf) extends
   val appUniqueId: String = s"retained-$incarnation"
   private val closed = new AtomicBoolean(false)
   private[celeborn] val lifecycleManager = new LifecycleManager(appUniqueId, conf)
+  lifecycleManager.rpcEnv.setupEndpoint(RetainedShuffleControl.EndpointName,
+    new RetainedShuffleControlEndpoint(this))
+
+  def isLive: Boolean = !closed.get()
 
   def retain(shuffleId: Int, ttlMillis: Long): Option[RetainedShuffleLease] = {
     if (closed.get()) None else lifecycleManager.retainShuffle(shuffleId, ttlMillis)
@@ -55,6 +59,7 @@ private[celeborn] final class RetainedShuffleService(conf: CelebornConf) extends
     require(path != null && !closed.get(), "service must be live before advertising its endpoint")
     val properties = new Properties()
     properties.setProperty("formatVersion", "1")
+    properties.setProperty("controlEndpoint", RetainedShuffleControl.EndpointName)
     properties.setProperty("applicationId", appUniqueId)
     properties.setProperty("incarnation", incarnation)
     properties.setProperty("host", lifecycleManager.getHost)
