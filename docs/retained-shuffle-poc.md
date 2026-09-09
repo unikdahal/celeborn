@@ -37,3 +37,17 @@ by this process-local registry. A lease is not a seal or proof of successful com
 Compilation, race tests, expiry tests, and end-to-end Spark integration are deferred
 until the requested combined validation phase. Do not interpret this branch as a
 validated provider integration yet.
+
+## Provider-owned lifecycle process
+
+`org.apache.celeborn.client.RetainedShuffleService` is a standalone entry point accepting
+a Celeborn properties file and an unused endpoint output path. It starts the normal
+Celeborn lifecycle manager and its master heartbeats outside Spark. The output properties
+record application ID, service incarnation, host and port. Service restarts create a new
+application identity. Shutdown closes leases and the lifecycle manager. The endpoint file
+is only discovery metadata; clients must verify liveness and exact incarnation before use.
+
+The process currently exposes the existing native lifecycle endpoint. The next changes
+must connect producer/replacement clients to this owner, add the retention control RPCs,
+and export a sealed commit descriptor. Merely launching the process is not yet an
+end-to-end retention or recovery result. No provider restart/HA guarantee is claimed.
