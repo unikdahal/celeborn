@@ -17,7 +17,11 @@
 
 package org.apache.celeborn.client
 
+import java.util.UUID
+
 import scala.util.control.NonFatal
+
+import org.apache.celeborn.common.identity.UserIdentifier
 
 import org.apache.celeborn.common.rpc.{RpcAddress, RpcCallContext, RpcEndpoint, RpcEndpointRef, RpcEnv}
 
@@ -30,6 +34,22 @@ private[celeborn] object RetainedShuffleControl {
   case class Renew(incarnation: String, lease: RetainedShuffleLease, ttlMillis: Long) extends Request
   case class Release(incarnation: String, lease: RetainedShuffleLease) extends Request
   case class Probe(incarnation: String) extends Request
+  case class Reserve(
+      incarnation: String,
+      producer: UUID,
+      appShuffleId: Int,
+      numMappers: Int,
+      numReducers: Int) extends Request
+  case class Retire(incarnation: String, reservation: Reservation) extends Request
+  case class Reservation(
+      incarnation: String,
+      applicationId: String,
+      producer: UUID,
+      appShuffleId: Int,
+      shuffleId: Int,
+      numMappers: Int,
+      numReducers: Int,
+      user: UserIdentifier) extends Serializable
   case class Seal(
       incarnation: String,
       lease: RetainedShuffleLease,
@@ -40,7 +60,8 @@ private[celeborn] object RetainedShuffleControl {
       accepted: Boolean,
       lease: Option[RetainedShuffleLease],
       reason: String,
-      seal: Option[RetainedShuffleSeal] = None) extends Serializable
+      seal: Option[RetainedShuffleSeal] = None,
+      reservation: Option[Reservation] = None) extends Serializable
 }
 
 private[celeborn] final class RetainedShuffleControlEndpoint(
@@ -67,6 +88,15 @@ private[celeborn] final class RetainedShuffleControlEndpoint(
             service.release(lease)
             Response(service.incarnation, true, None, "released")
           case Probe(_) => Response(service.incarnation, true, None, "live")
+          case Reserve(_, producer, appShuffleId, numMappers, numReducers) =>
+            val reservation = service.reserve(producer, appShuffleId, numMappers, numReducers)
+            Response(service.incarnation, reservation.nonEmpty, None,
+              if (reservation.nonEmpty) "reserved" else "reservation rejected",
+              reservation = reservation)
+          case Retire(_, reservation) =>
+            val retired = service.retire(reservation)
+            Response(service.incarnation, retired, None,
+              if (retired) "retired" else "reservation unknown")
           case Seal(_, lease, attempts, reducerCount) =>
             val seal = service.seal(lease, attempts, reducerCount)
             Response(service.incarnation, seal.nonEmpty, None,
@@ -100,6 +130,29 @@ private[celeborn] final class RetainedShuffleControlClient(
   }
 
   def probe(): Boolean = request(Probe(incarnation)).accepted
+
+  def reserve(
+      producer: UUID,
+      appShuffleId: Int,
+      numMappers: Int,
+      numReducers: Int): Option[Reservation] = {
+    val response = request(Reserve(incarnation, producer, appShuffleId, numMappers, numReducers))
+    if (!response.accepted) None
+    else {
+      require(response.reservation.exists { value =>
+        value.incarnation == incarnation && value.producer == producer &&
+          value.appShuffleId == appShuffleId && value.numMappers == numMappers &&
+          value.numReducers == numReducers && value.shuffleId >= 0 &&
+          value.applicationId != null && value.applicationId.nonEmpty && value.user != null
+      }, "reservation response does not match the producer shuffle")
+      response.reservation
+    }
+  }
+
+  def retire(reservation: Reservation): Boolean = {
+    request(Retire(incarnation, reservation)).accepted
+  }
+
   def acquire(shuffleId: Int, ttlMillis: Long): Option[RetainedShuffleLease] = {
     val response = request(Acquire(incarnation, shuffleId, ttlMillis))
     if (response.accepted) {

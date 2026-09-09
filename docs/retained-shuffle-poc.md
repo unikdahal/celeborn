@@ -30,7 +30,7 @@ all leases. No network calls run while the lease lock is held.
 
 These leases alone do not survive a Spark driver failure if the lifecycle manager
 runs in that driver. The standalone extension and retained reader below provide the
-provider primitives for independent ownership and replacement reads. Spark producer
+provider primitives for independent ownership and replacement reads. Spark publication
 and adoption integration remains outstanding. Worker/master loss and provider restart are not covered
 by this process-local registry. A lease is not a seal or proof of successful commit.
 
@@ -54,7 +54,7 @@ Even if an operator reuses the application ID, old descriptors must be rejected 
 the control incarnation changes. This attachment does not restore metadata after restart.
 The endpoint file is only discovery metadata, not evidence of liveness or a lease.
 
-Spark producer/replacement integration remains outstanding. Adding this
+Spark publication/replacement adoption remains outstanding. Adding this
 attachment to the existing standalone daemon does not by itself prove end-to-end recovery.
 
 The service also registers `RetainedShuffleControlV1` in its native RPC environment.
@@ -103,6 +103,42 @@ The local deadline starts before each acquire or renewal request. Renewal must r
 fetch threads, and the caller is responsible for scheduling it. These checks bound local
 use of a lease; they do not promise worker availability or instantaneous detection of a
 provider failure. Native read errors still need to feed Spark's whole-shuffle invalidation
-and recomputation path. Neither the Spark writer connection to the standalone owner nor
-that scheduler integration is implemented by this reader. Compilation and execution remain
+and recomputation path. The producer connection below supplies the native writer path;
+the scheduler integration is still outstanding. Compilation and execution remain
 deferred to the combined validation phase.
+
+## Spark producer connection
+
+The Spark shuffle manager recognizes the experimental setting
+`spark.celeborn.retainedShuffle.endpointFile`. Set it to the discovery file written by
+the existing standalone daemon, and continue using the normal Celeborn Spark shuffle
+manager class. Only the driver reads the file. Executors receive the owner's application
+ID, host, port, user identity, and reserved native shuffle ID in the serialized handle.
+The normal driver-owned path remains the default when this property is absent.
+
+The standalone owner reserves a distinct native ID for each `(producer UUID, Spark shuffle
+ID)`. The client creates a fresh producer UUID per manager instance. Reservations use the
+same native sequence as LifecycleManager's stage-rerun allocator, and repeated requests
+must match the mapper/reducer shape. Spark's local shuffle ID remains unchanged for its
+scheduler and executor cleanup tracking. Writers and readers resolve the separate native
+ID through the handle. Use a dedicated owner for this protocol: legacy clients that write
+unreserved native IDs must not share its application namespace.
+
+The initial producer path requires `spark.celeborn.client.spark.shuffle.fallback.policy=NEVER`.
+It rejects stage rerun, failed-shuffle cleaning, Celeborn skew optimization, reducer-file-group
+broadcast, columnar shuffle, client authentication, and Spark IO encryption. Those features
+need driver callbacks or data-format/lifetime integration that is not provided here. This
+restriction concerns Celeborn's normal backend-selection policy; it does not implement or
+replace Spark recovery's required recomputation fallback.
+
+Unregister and producer shutdown retire reservations through the remote owner and shut down
+only the producer's local control RPC environment. Retirement schedules normal delayed
+shuffle cleanup; a live retention lease continues to pin registered metadata. A producer
+must acquire its publication lease before unregister or shutdown. Publication, collection of
+Spark's accepted encoded mapper attempts, and renewal scheduling still need wiring.
+
+Admission is limited to 4096 reservations over one owner lifetime, including retired
+reservations. Tombstones prevent a retried registration from resurrecting a retired ID.
+A producer crash does not currently reclaim its reservation table entries. These explicit
+PoC limits must be replaced by bounded session expiry and catalog ownership before long-lived
+shared deployment. The new producer code has not yet been compiled or exercised.

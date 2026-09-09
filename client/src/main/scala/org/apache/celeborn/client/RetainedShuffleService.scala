@@ -21,6 +21,10 @@ import java.nio.file.{Files, Path, StandardOpenOption}
 import java.util.{Properties, UUID}
 import java.util.concurrent.atomic.AtomicBoolean
 
+import scala.collection.mutable
+
+import org.apache.celeborn.client.RetainedShuffleControl.Reservation
+
 /**
  * Retention and seal controls attached to Celeborn's existing standalone lifecycle daemon.
  * The daemon owns registration, heartbeats and shutdown. This attachment neither creates nor
@@ -34,10 +38,58 @@ private[celeborn] final class RetainedShuffleService(
   val incarnation: String = UUID.randomUUID().toString
   val appUniqueId: String = lifecycleManager.appUniqueId
   private val closed = new AtomicBoolean(false)
+  // Keep tombstones until owner shutdown so retries cannot reuse retired IDs. This is a
+  // bounded PoC admission table, not a durable catalog or an unbounded multi-tenant service.
+  private val reservations = mutable.HashMap.empty[(UUID, Int), Reservation]
+  private val retired = mutable.HashSet.empty[Int]
+  private val maxReservations = 4096
   private val controlEndpoint = lifecycleManager.rpcEnv.setupEndpoint(
     RetainedShuffleControl.EndpointName, new RetainedShuffleControlEndpoint(this))
 
   def isLive: Boolean = !closed.get()
+
+  def reserve(
+      producer: UUID,
+      appShuffleId: Int,
+      numMappers: Int,
+      numReducers: Int): Option[Reservation] = reservations.synchronized {
+    require(producer != null && appShuffleId >= 0)
+    require(numMappers > 0 && numMappers <= 65536)
+    require(numReducers > 0 && numReducers <= 65536)
+    if (closed.get()) None
+    else {
+      val key = (producer, appShuffleId)
+      reservations.get(key) match {
+        case Some(value) =>
+          if (!retired.contains(value.shuffleId) && value.numMappers == numMappers &&
+              value.numReducers == numReducers) Some(value) else None
+        case None if reservations.size < maxReservations =>
+          val value = Reservation(incarnation, appUniqueId, producer, appShuffleId,
+            lifecycleManager.allocateRetainedShuffleId(), numMappers, numReducers,
+            lifecycleManager.getUserIdentifier)
+          reservations.put(key, value)
+          Some(value)
+        case _ => None
+      }
+    }
+  }
+
+  def retire(reservation: Reservation): Boolean = {
+    require(reservation != null)
+    val known = reservations.synchronized {
+      val matches = !closed.get() &&
+        reservations.get((reservation.producer, reservation.appShuffleId)).contains(reservation)
+      if (matches) retired.add(reservation.shuffleId)
+      matches
+    }
+    if (!known) false
+    else {
+      // Do not hold the admission lock over commit waits or unregister RPCs. Concurrent
+      // retries may unregister twice; LifecycleManager's delayed cleanup is idempotent.
+      lifecycleManager.unregisterAppShuffle(reservation.shuffleId, false)
+      true
+    }
+  }
 
   def retain(shuffleId: Int, ttlMillis: Long): Option[RetainedShuffleLease] = {
     if (closed.get()) None else lifecycleManager.retainShuffle(shuffleId, ttlMillis)

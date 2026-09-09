@@ -160,7 +160,7 @@ public class SparkUtils {
         return res._1;
       }
     } else {
-      return handle.shuffleId();
+      return handle.nativeShuffleId();
     }
   }
 

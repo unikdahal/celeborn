@@ -1266,6 +1266,14 @@ class LifecycleManager(val appUniqueId: String, val conf: CelebornConf) extends 
     reply(mapperAttemptFinishedSuccess)
   }
 
+  // Share the native ID sequence with stage-rerun allocation. Standalone producers must
+  // reserve IDs rather than reusing IDs from independent compute drivers.
+  private[celeborn] def allocateRetainedShuffleId(): Int = {
+    val id = shuffleIdGenerator.getAndIncrement()
+    require(id >= 0, "native shuffle ID space exhausted; restart the standalone owner")
+    id
+  }
+
   /** Pins local shuffle metadata until release or expiry; this does not seal a shuffle. */
   private[celeborn] def retainShuffle(
       shuffleId: Int,

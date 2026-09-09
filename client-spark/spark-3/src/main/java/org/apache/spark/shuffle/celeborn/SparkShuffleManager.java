@@ -34,6 +34,8 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.celeborn.client.LifecycleManager;
 import org.apache.celeborn.client.ShuffleClient;
+import org.apache.celeborn.client.StandaloneShuffleProducer;
+import org.apache.celeborn.client.StandaloneShuffleRegistration;
 import org.apache.celeborn.client.security.CryptoHandler;
 import org.apache.celeborn.common.CelebornConf;
 import org.apache.celeborn.common.protocol.ShuffleMode;
@@ -57,6 +59,8 @@ public class SparkShuffleManager implements ShuffleManager {
 
   private static final String SORT_SHUFFLE_MANAGER_NAME =
       "org.apache.spark.shuffle.sort.SortShuffleManager";
+  private static final String STANDALONE_ENDPOINT_FILE =
+      "spark.celeborn.retainedShuffle.endpointFile";
 
   private static final boolean COLUMNAR_SHUFFLE_CLASSES_PRESENT;
 
@@ -80,6 +84,7 @@ public class SparkShuffleManager implements ShuffleManager {
   private String appUniqueId;
 
   private LifecycleManager lifecycleManager;
+  private StandaloneShuffleProducer standaloneProducer;
   private ShuffleClient shuffleClient;
   private volatile SortShuffleManager _sortShuffleManager;
   private final ConcurrentHashMap.KeySetView<Integer, Boolean> sortShuffleIds =
@@ -150,6 +155,28 @@ public class SparkShuffleManager implements ShuffleManager {
     return _sortShuffleManager;
   }
 
+  private synchronized StandaloneShuffleProducer standaloneProducer() {
+    if (standaloneProducer == null) {
+      if (!isDriver
+          || celebornConf.clientStageRerunEnabled()
+          || celebornConf.clientFetchCleanFailedShuffle()
+          || celebornConf.clientAdaptiveOptimizeSkewedPartitionReadEnabled()
+          || celebornConf.getReducerFileGroupBroadcastEnabled()
+          || celebornConf.columnarShuffleEnabled()
+          || celebornConf.authEnabledOnClient()
+          || conf.getBoolean("spark.io.encryption.enabled", false)
+          || !"NEVER".equals(celebornConf.sparkShuffleFallbackPolicy().toString())) {
+        throw new IllegalArgumentException(
+            "Standalone retained shuffle requires fallback policy NEVER and disables "
+                + "stage rerun, failed shuffle cleaning, skew optimization, file-group "
+                + "broadcast, columnar shuffle, authentication and IO encryption");
+      }
+      standaloneProducer =
+          new StandaloneShuffleProducer(conf.get(STANDALONE_ENDPOINT_FILE), celebornConf);
+    }
+    return standaloneProducer;
+  }
+
   private void initializeLifecycleManager(String appId) {
     // Only create LifecycleManager singleton in Driver. When register shuffle multiple times, we
     // need to ensure that LifecycleManager will only be created once. Parallelism needs to be
@@ -215,6 +242,16 @@ public class SparkShuffleManager implements ShuffleManager {
     // Note: generate app unique id at driver side, make sure dependency.rdd.context
     // is the same SparkContext among different shuffleIds.
     // This method may be called many times.
+    if (conf.contains(STANDALONE_ENDPOINT_FILE)) {
+      StandaloneShuffleProducer producer = standaloneProducer();
+      StandaloneShuffleRegistration registration =
+          producer.register(
+              shuffleId, dependency.rdd().getNumPartitions(),
+              dependency.partitioner().numPartitions());
+      return new StandaloneCelebornShuffleHandle<>(
+          producer.applicationId(), producer.host(), producer.port(), registration.user(),
+          shuffleId, registration.shuffleId(), dependency.rdd().getNumPartitions(), dependency);
+    }
     String appId = SparkUtils.appUniqueId(dependency.rdd().context());
     initializeLifecycleManager(appId);
 
@@ -255,6 +292,10 @@ public class SparkShuffleManager implements ShuffleManager {
     if (sortShuffleIds.remove(appShuffleId)) {
       return sortShuffleManager().unregisterShuffle(appShuffleId);
     }
+    // Retire the native reservation without stopping the independent lifecycle owner.
+    if (standaloneProducer != null) {
+      standaloneProducer.unregister(appShuffleId);
+    }
     // For Spark driver side trigger unregister shuffle.
     if (lifecycleManager != null) {
       lifecycleManager.unregisterAppShuffle(appShuffleId, celebornConf.clientStageRerunEnabled());
@@ -287,6 +328,13 @@ public class SparkShuffleManager implements ShuffleManager {
     if (_sortShuffleManager != null) {
       _sortShuffleManager.stop();
       _sortShuffleManager = null;
+    }
+    if (standaloneProducer != null) {
+      try {
+        standaloneProducer.close();
+      } finally {
+        standaloneProducer = null;
+      }
     }
     if (failedShuffleCleaner != null) {
       failedShuffleCleaner.stop();
