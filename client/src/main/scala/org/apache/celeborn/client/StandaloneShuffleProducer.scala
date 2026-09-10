@@ -19,6 +19,7 @@ package org.apache.celeborn.client
 
 import java.nio.file.{Files, Paths}
 import java.util.{Properties, UUID}
+import java.util.concurrent.TimeUnit
 
 import scala.collection.mutable
 import scala.util.control.NonFatal
@@ -89,12 +90,26 @@ final class StandaloneShuffleProducer(endpointFile: String, conf: CelebornConf)
       .getOrElse(throw new IllegalStateException("shuffle could not be retained for publication"))
     var published = false
     try {
-      val seal = control.seal(lease.lease, attempts, reservation.numReducers)
-        .getOrElse(throw new IllegalStateException("committed shuffle does not match Spark winners"))
+      // MapperEnd acknowledges before the asynchronous StageEnd commits worker files.
+      // Wait on this publication caller, never on the retention RPC endpoint. Every probe
+      // still requires the exact accepted attempts and a live lease; a mismatch never seals.
+      val waitMillis = math.min(60000L, math.min(conf.clientPushStageEndTimeout,
+        handoffTtlMillis / 2L))
+      val started = System.nanoTime()
+      var sealedOutput = control.seal(lease.lease, attempts, reservation.numReducers)
+      while (sealedOutput.isEmpty && lease.isCurrent &&
+          System.nanoTime() - started < TimeUnit.MILLISECONDS.toNanos(waitMillis)) {
+        Thread.sleep(math.min(100L, math.max(1L, waitMillis)))
+        if (lease.isCurrent) {
+          sealedOutput = control.seal(lease.lease, attempts, reservation.numReducers)
+        }
+      }
+      val seal = sealedOutput.getOrElse(throw new IllegalStateException(
+        "committed shuffle did not become available with Spark's accepted winners"))
       require(seal.applicationId == applicationId, "sealed application identity changed")
       val descriptor = RetainedShuffleDescriptor.encode(
         RetainedShuffleDescriptor(host, port, reservation.user, seal))
-      require(lease.isCurrent, "publication lease expired while sealing")
+      require(lease.renew(), "publication lease expired while sealing")
       published = true
       descriptor
     } finally {
