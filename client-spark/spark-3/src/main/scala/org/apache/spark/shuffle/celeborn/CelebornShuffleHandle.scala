@@ -33,6 +33,8 @@ class CelebornShuffleHandle[K, V, C](
     dependency: ShuffleDependency[K, V, C],
     val extension: Array[Byte])
   extends BaseShuffleHandle(shuffleId, dependency) {
+  def nativeShuffleId: Int = shuffleId
+
   def this(
       appUniqueId: String,
       lifecycleManagerHost: String,
@@ -52,3 +54,16 @@ class CelebornShuffleHandle[K, V, C](
     dependency,
     null)
 }
+
+/** The standalone owner allocates IDs independently of Spark's driver-local shuffle IDs. */
+class StandaloneCelebornShuffleHandle[K, V, C](
+    appUniqueId: String,
+    lifecycleManagerHost: String,
+    lifecycleManagerPort: Int,
+    userIdentifier: UserIdentifier,
+    shuffleId: Int,
+    override val nativeShuffleId: Int,
+    numMappers: Int,
+    dependency: ShuffleDependency[K, V, C])
+  extends CelebornShuffleHandle[K, V, C](appUniqueId, lifecycleManagerHost,
+    lifecycleManagerPort, userIdentifier, shuffleId, false, numMappers, dependency)
