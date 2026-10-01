@@ -57,7 +57,9 @@ public class TransportResponseHandler extends MessageHandler<ResponseMessage> {
   private final ConcurrentHashMap<StreamChunkSlice, FetchRequestInfo> outstandingFetches;
 
   private final ConcurrentHashMap<Long, RpcResponseCallback> outstandingRpcs;
-  // May be wrapped by transport integrations to observe push completion; volatile guarantees\n  // publication to response-handler threads.\n  private volatile ConcurrentHashMap<Long, PushRequestInfo> outstandingPushes;
+  // May be wrapped by transport integrations to observe push completion; volatile guarantees
+  // publication to response-handler threads.
+  private volatile ConcurrentHashMap<Long, PushRequestInfo> outstandingPushes;
 
   /** Records the time (in system nanoseconds) that the last fetch or RPC request was sent. */
   private final AtomicLong timeOfLastRequestNs;
