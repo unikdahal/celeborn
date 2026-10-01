@@ -46,8 +46,12 @@ public class TransportIntegrationCompatibilitySuiteJ {
     Field field = owner.getDeclaredField(fieldName);
     int modifiers = field.getModifiers();
 
-    assertFalse(owner.getName() + "." + fieldName + " must be an instance field", Modifier.isStatic(modifiers));
-    assertFalse(owner.getName() + "." + fieldName + " must not be final", Modifier.isFinal(modifiers));
-    assertTrue(owner.getName() + "." + fieldName + " must be volatile", Modifier.isVolatile(modifiers));
+    assertFalse(
+        owner.getName() + "." + fieldName + " must be an instance field",
+        Modifier.isStatic(modifiers));
+    assertFalse(
+        owner.getName() + "." + fieldName + " must not be final", Modifier.isFinal(modifiers));
+    assertTrue(
+        owner.getName() + "." + fieldName + " must be volatile", Modifier.isVolatile(modifiers));
   }
 }
