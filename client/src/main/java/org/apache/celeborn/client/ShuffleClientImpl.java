@@ -131,7 +131,7 @@ public class ShuffleClientImpl extends ShuffleClient {
   private boolean pushReplicateEnabled;
   private boolean fetchExcludeWorkerOnFailureEnabled;
 
-  private final ExecutorService pushDataRetryPool;
+  private volatile ExecutorService pushDataRetryPool;
 
   private final Map<Integer, Set<Integer>> splitting = JavaUtils.newConcurrentHashMap();
 
