@@ -80,7 +80,7 @@ public class TransportClientFactory implements Closeable {
   private static final Logger logger = LoggerFactory.getLogger(TransportClientFactory.class);
 
   private final TransportContext context;
-  private final List<TransportClientBootstrap> clientBootstraps;
+  private volatile List<TransportClientBootstrap> clientBootstraps;
   private final ConcurrentHashMap<SocketAddress, ClientPool> connectionPool;
 
   /** Random number generator for picking connections between peers. */
