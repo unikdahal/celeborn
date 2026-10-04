@@ -76,7 +76,7 @@ import org.apache.celeborn.common.write.PushRequestInfo;
 public class TransportClient implements Closeable {
   private static final Logger logger = LoggerFactory.getLogger(TransportClient.class);
 
-  private final Channel channel;
+  private volatile Channel channel;
   private final TransportResponseHandler handler;
   private volatile boolean timedOut;
   @Nullable private String clientId;
