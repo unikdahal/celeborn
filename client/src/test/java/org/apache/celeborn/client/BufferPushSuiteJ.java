@@ -64,6 +64,17 @@ public class BufferPushSuiteJ {
     catch (ExecutionException expected) { assertEquals("cancelled", expected.getCause().getMessage()); }
     assertFalse(push.retainWork());
   }
+  @Test public void nettyAliasesCanOutliveTheManagedReference() throws Exception {
+    BufferPush push = new BufferPush(ByteBuffer.allocateDirect(32));
+    ManagedBuffer request = push.newBuffer();
+    ByteBuf netty = (ByteBuf) request.convertToNetty();
+    ByteBuf alias = netty.retainedDuplicate();
+    CompletableFuture<Integer> done = push.completion().toCompletableFuture();
+    push.succeed(); push.releaseWork(); request.release(); netty.release();
+    assertFalse(done.isDone());
+    alias.release();
+    assertEquals(48, (int) done.get());
+  }
   @Test public void callerCannotCancelTheLifetimePromise() throws Exception {
     BufferPush push = new BufferPush(ByteBuffer.allocate(32));
     assertTrue(push.completion().toCompletableFuture().cancel(true));

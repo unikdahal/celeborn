@@ -26,6 +26,7 @@ import java.util.concurrent.CompletionStage;
 
 import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.buffer.UnpooledByteBufAllocator;
 import org.apache.celeborn.common.network.buffer.ManagedBuffer;
 import org.apache.celeborn.common.network.buffer.NettyManagedBuffer;
 
@@ -92,33 +93,25 @@ final class BufferPush implements PushDataBody {
       if (references <= 0) { throw new IllegalStateException("Buffer push is retired"); }
       references++;
     }
+    CompositeByteBuf composite;
     try {
-      CompositeByteBuf composite = Unpooled.compositeBuffer(2);
-      composite.addComponent(true, Unpooled.wrappedBuffer(header));
-      composite.addComponent(true, Unpooled.wrappedBuffer(payload.duplicate()));
-      return new OwnedBuffer(new NettyManagedBuffer(composite));
+      composite = new CompositeByteBuf(UnpooledByteBufAllocator.DEFAULT, false, 2) {
+        @Override protected void deallocate() {
+          try { super.deallocate(); }
+          finally { releaseWork(); }
+        }
+      };
     } catch (Throwable failure) {
       releaseWork();
       throw failure;
     }
-  }
-  private final class OwnedBuffer extends ManagedBuffer {
-    private final NettyManagedBuffer delegate;
-    OwnedBuffer(NettyManagedBuffer delegate) { this.delegate = delegate; }
-    public long size() { return delegate.size(); }
-    public ByteBuffer nioByteBuffer() throws IOException { return delegate.nioByteBuffer(); }
-    public InputStream createInputStream() throws IOException { return delegate.createInputStream(); }
-    public ManagedBuffer retain() {
-      synchronized (BufferPush.this) { references++; }
-      delegate.retain();
-      return this;
+    try {
+      composite.addComponent(true, Unpooled.wrappedBuffer(header));
+      composite.addComponent(true, Unpooled.wrappedBuffer(payload.duplicate()));
+      return new NettyManagedBuffer(composite);
+    } catch (Throwable failure) {
+      composite.release();
+      throw failure;
     }
-    public ManagedBuffer release() {
-      delegate.release();
-      releaseWork();
-      return this;
-    }
-    public Object convertToNetty() throws IOException { return delegate.convertToNetty(); }
-    public Object convertToNettyForSsl() throws IOException { return delegate.convertToNettyForSsl(); }
   }
 }

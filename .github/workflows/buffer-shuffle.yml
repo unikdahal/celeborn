@@ -29,12 +29,23 @@ jobs:
           build/mvn -B -Pspark-3.5 -pl client -am test \
             -Dtest=BufferPushSuiteJ,ShuffleClientSuiteJ \
             -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false
+      - name: Measure repeated framing and allocation
+        if: matrix.java == 17
+        run: |
+          build/mvn -B -Pspark-3.5 -pl client -am install -DskipTests
+          build/mvn -B -Pspark-3.5 -pl client dependency:build-classpath -Dmdep.outputFile=target/benchmark-classpath
+          for fork in 1 2 3; do
+            java -Xms512m -Xmx512m -XX:+UseG1GC \
+              -cp "client/target/test-classes:client/target/classes:$(cat client/target/benchmark-classpath)" \
+              org.apache.celeborn.client.BufferPushBenchmark > "framing-benchmark-${fork}.jsonl"
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: client-java-${{ matrix.java }}
           path: |
             formatting.patch
+            framing-benchmark-*.jsonl
             **/target/surefire-reports/**
             **/target/test-reports/**
             **/target/unit-tests.log
