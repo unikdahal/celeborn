@@ -123,6 +123,36 @@ public class ShuffleClientSuiteJ {
   private final int BATCH_HEADER_SIZE = 4 * 4;
 
   @Test
+  public void testCallbackFailureStillWaitsForTransportAndFailsTheMap() throws Exception {
+    CelebornConf conf = setupEnv(CompressionCodec.NONE);
+    shuffleClient.shutdown();
+    IllegalStateException failure = new IllegalStateException("congestion callback failed");
+    PushState state = new PushState(conf) {
+      @Override public void onSuccess(String target) { throw failure; }
+    };
+    shuffleClient = new ShuffleClientImpl(TEST_APPLICATION_ID, conf, new UserIdentifier("mock", "mock")) {
+      @Override public PushState getPushState(String key) { return state; }
+    };
+    shuffleClient.setupLifecycleManagerRef(endpointRef);
+    shuffleClient.dataClientFactory = clientFactory;
+    AtomicReference<PushData> request = new AtomicReference<>();
+    AtomicReference<RpcResponseCallback> callback = new AtomicReference<>();
+    when(client.pushData(any(), anyLong(), any())).thenAnswer(invocation -> {
+      request.set(invocation.getArgument(0)); callback.set(invocation.getArgument(2)); return null;
+    });
+    CompletableFuture<Integer> done = shuffleClient.pushDataAsync(1, 0, 0, 0,
+        ByteBuffer.allocateDirect(32), 1, 1).toCompletableFuture();
+    try { callback.get().onSuccess(ByteBuffer.allocate(0)); fail(); }
+    catch (IllegalStateException expected) { assertSame(failure, expected); }
+    assertFalse(done.isDone());
+    assertNotNull(state.exception.get());
+    request.get().body().release();
+    try { done.get(5, TimeUnit.SECONDS); fail(); }
+    catch (ExecutionException expected) { assertSame(failure, expected.getCause().getCause()); }
+    shuffleClient.shutdown();
+  }
+
+  @Test
   public void testClosedChannelRetiresUnencodedBorrowedBuffer() throws Exception {
     CelebornConf conf = setupEnv(CompressionCodec.NONE);
     shuffleClient.shutdown();

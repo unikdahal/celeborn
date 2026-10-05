@@ -1203,6 +1203,11 @@ public class ShuffleClientImpl extends ShuffleClient {
               pushState.removeBatch(nextBatchId, this.latest.hostAndPushPort());
               this.latest = newloc;
 
+            } catch (Throwable failure) {
+              CelebornIOException error = new CelebornIOException("Push callback failed", failure);
+              pushState.exception.compareAndSet(null, error);
+              body.fail(error);
+              throw failure;
             } finally {
               body.releaseWork();
             }
@@ -1318,6 +1323,11 @@ public class ShuffleClientImpl extends ShuffleClient {
                 callback.onSuccess(response);
               }
 
+            } catch (Throwable failure) {
+              CelebornIOException error = new CelebornIOException("Push callback failed", failure);
+              pushState.exception.compareAndSet(null, error);
+              body.fail(error);
+              throw failure;
             } finally {
               body.releaseWork();
             }
@@ -1397,6 +1407,11 @@ public class ShuffleClientImpl extends ShuffleClient {
                     remainReviveTimes);
               }
 
+            } catch (Throwable failure) {
+              CelebornIOException error = new CelebornIOException("Push callback failed", failure);
+              pushState.exception.compareAndSet(null, error);
+              body.fail(error);
+              throw failure;
             } finally {
               body.releaseWork();
             }
@@ -1530,13 +1545,6 @@ public class ShuffleClientImpl extends ShuffleClient {
     // Allocate the caller's view before any transport/retry owner can borrow the buffer.
     CompletionStage<Integer> lifetime = body.completion();
     try {
-      synchronized (bufferPushLock) {
-        if (bufferPushesClosed) {
-          body.fail(new CelebornIOException("Shuffle client is closed"));
-        } else {
-          bufferPushes.computeIfAbsent(mapKey, key -> new HashSet<>()).add(body);
-        }
-      }
       body.completion()
           .whenComplete(
               (size, failure) -> {
@@ -1550,6 +1558,13 @@ public class ShuffleClientImpl extends ShuffleClient {
                   }
                 }
               });
+      synchronized (bufferPushLock) {
+        if (bufferPushesClosed) {
+          body.fail(new CelebornIOException("Shuffle client is closed"));
+        } else {
+          bufferPushes.computeIfAbsent(mapKey, key -> new HashSet<>()).add(body);
+        }
+      }
       if (!body.isActive()) {
         return lifetime;
       }
