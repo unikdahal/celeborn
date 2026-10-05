@@ -24,7 +24,6 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import scala.Tuple2;
@@ -1504,7 +1503,7 @@ public class ShuffleClientImpl extends ShuffleClient {
               body.releaseWork();
             }
           });
-    } catch (RejectedExecutionException failure) {
+    } catch (RuntimeException | Error failure) {
       body.fail(failure);
       body.releaseWork();
     }
