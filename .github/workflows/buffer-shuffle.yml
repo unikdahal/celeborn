@@ -39,6 +39,8 @@ jobs:
               -cp "client/target/test-classes:client/target/classes:$(cat client/target/benchmark-classpath)" \
               org.apache.celeborn.client.BufferPushBenchmark > "framing-benchmark-${fork}.jsonl"
           done
+          python dev/buffer_push_report.py
+          cat framing-report.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -47,6 +49,7 @@ jobs:
             formatting.patch
             framing-benchmark-*.jsonl
             benchmark-*.txt
+            framing-report.*
             **/target/surefire-reports/**
             **/target/test-reports/**
             **/target/unit-tests.log
