@@ -1529,27 +1529,27 @@ public class ShuffleClientImpl extends ShuffleClient {
     BufferPush body = new BufferPush(data);
     // Allocate the caller's view before any transport/retry owner can borrow the buffer.
     CompletionStage<Integer> lifetime = body.completion();
-    synchronized (bufferPushLock) {
-      if (bufferPushesClosed) {
-        body.fail(new CelebornIOException("Shuffle client is closed"));
-      } else {
-        bufferPushes.computeIfAbsent(mapKey, key -> new HashSet<>()).add(body);
+    try {
+      synchronized (bufferPushLock) {
+        if (bufferPushesClosed) {
+          body.fail(new CelebornIOException("Shuffle client is closed"));
+        } else {
+          bufferPushes.computeIfAbsent(mapKey, key -> new HashSet<>()).add(body);
+        }
       }
-    }
-    body.completion()
-        .whenComplete(
-            (size, failure) -> {
-              synchronized (bufferPushLock) {
-                Set<BufferPush> pushes = bufferPushes.get(mapKey);
-                if (pushes != null) {
-                  pushes.remove(body);
-                  if (pushes.isEmpty()) {
-                    bufferPushes.remove(mapKey);
+      body.completion()
+          .whenComplete(
+              (size, failure) -> {
+                synchronized (bufferPushLock) {
+                  Set<BufferPush> pushes = bufferPushes.get(mapKey);
+                  if (pushes != null) {
+                    pushes.remove(body);
+                    if (pushes.isEmpty()) {
+                      bufferPushes.remove(mapKey);
+                    }
                   }
                 }
-              }
-            });
-    try {
+              });
       if (!body.isActive()) {
         return lifetime;
       }
