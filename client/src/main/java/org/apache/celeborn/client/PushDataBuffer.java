@@ -29,7 +29,9 @@ final class PushDataBuffer extends NettyManagedBuffer {
   private boolean encoded;
   private int managedReferences = 1;
 
-  PushDataBuffer(ByteBuf buffer) { super(buffer); }
+  PushDataBuffer(ByteBuf buffer) {
+    super(buffer);
+  }
 
   @Override
   public synchronized Object convertToNetty() throws IOException {
@@ -67,10 +69,14 @@ final class PushDataBuffer extends NettyManagedBuffer {
   }
 
   synchronized void releaseIfUnencoded() {
-    if (!encoded) { release(); }
+    if (!encoded) {
+      release();
+    }
   }
 
   private void checkLive() {
-    if (managedReferences == 0) { throw new IllegalStateException("Push body already released"); }
+    if (managedReferences == 0) {
+      throw new IllegalStateException("Push body already released");
+    }
   }
 }

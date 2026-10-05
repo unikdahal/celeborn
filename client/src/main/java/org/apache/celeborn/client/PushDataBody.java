@@ -17,7 +17,6 @@
 
 package org.apache.celeborn.client;
 
-
 /** A replayable batch body shared by the ordinary and caller-owned push paths. */
 interface PushDataBody {
   int length();

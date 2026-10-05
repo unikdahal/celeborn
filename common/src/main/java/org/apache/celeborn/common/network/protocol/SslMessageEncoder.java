@@ -87,7 +87,7 @@ public final class SslMessageEncoder extends MessageToMessageEncoder<Message> {
       header.writeInt(bodyLength);
       in.encode(header);
       assert header.writableBytes() == 0;
-  
+
       if (body != null && bodyLength > 0) {
         // We transfer ownership of the reference on in.body() to EncryptedMessageWithHeader.
         // This reference will be freed when EncryptedMessageWithHeader.close() is called.
@@ -100,9 +100,10 @@ public final class SslMessageEncoder extends MessageToMessageEncoder<Message> {
       // still fail before an outbound message exists to release either reference.
       ReferenceCountUtil.release(header);
       ReferenceCountUtil.release(body);
-      if (in.body() != null) { in.body().release(); }
+      if (in.body() != null) {
+        in.body().release();
+      }
       throw failure;
     }
-
   }
 }

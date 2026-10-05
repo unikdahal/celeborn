@@ -19,7 +19,6 @@ package org.apache.celeborn.client;
 
 import io.netty.buffer.Unpooled;
 
-
 final class HeapPushDataBody implements PushDataBody {
   private final byte[] body;
 

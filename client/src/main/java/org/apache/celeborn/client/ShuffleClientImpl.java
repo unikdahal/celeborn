@@ -34,9 +34,9 @@ import scala.reflect.ClassTag$;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Lists;
 import com.google.protobuf.InvalidProtocolBufferException;
-import io.netty.channel.ChannelFuture;
 import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFuture;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.hadoop.fs.FileSystem;
@@ -54,7 +54,6 @@ import org.apache.celeborn.common.exception.CelebornRuntimeException;
 import org.apache.celeborn.common.identity.UserIdentifier;
 import org.apache.celeborn.common.metrics.source.Role;
 import org.apache.celeborn.common.network.TransportContext;
-import org.apache.celeborn.common.network.buffer.ManagedBuffer;
 import org.apache.celeborn.common.network.buffer.NettyManagedBuffer;
 import org.apache.celeborn.common.network.client.*;
 import org.apache.celeborn.common.network.protocol.*;
@@ -1447,14 +1446,18 @@ public class ShuffleClientImpl extends ShuffleClient {
       RpcResponseCallback callback) {
     PushDataBuffer buffer = body.newBuffer();
     try {
-      ChannelFuture write = client.pushData(
-          new PushData(PRIMARY_MODE, shuffleKey, partitionUniqueId, buffer),
-          pushDataTimeout,
-          callback);
+      ChannelFuture write =
+          client.pushData(
+              new PushData(PRIMARY_MODE, shuffleKey, partitionUniqueId, buffer),
+              pushDataTimeout,
+              callback);
       if (write != null) {
-        write.addListener(future -> {
-          if (!future.isSuccess()) { buffer.releaseIfUnencoded(); }
-        });
+        write.addListener(
+            future -> {
+              if (!future.isSuccess()) {
+                buffer.releaseIfUnencoded();
+              }
+            });
       }
     } catch (RuntimeException | Error failure) {
       // An accepted write can fail before the encoder. Once encoded, only the outbound
@@ -1484,7 +1487,9 @@ public class ShuffleClientImpl extends ShuffleClient {
     } catch (RejectedExecutionException failure) {
       body.fail(failure);
       body.releaseWork();
-      if (body instanceof HeapPushDataBody) { throw failure; }
+      if (body instanceof HeapPushDataBody) {
+        throw failure;
+      }
     }
   }
 

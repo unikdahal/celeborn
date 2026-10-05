@@ -26,8 +26,6 @@ import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.buffer.UnpooledByteBufAllocator;
 
-import org.apache.celeborn.common.network.buffer.ManagedBuffer;
-
 /** Completes only when a logical push and every work/transport owner have retired. */
 final class BufferPush implements PushDataBody {
   private ByteBuffer payload;

@@ -26,18 +26,16 @@ import static org.mockito.Mockito.when;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.Collections;
 import java.util.Collection;
-import java.util.Optional;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ExecutionException;
-import org.apache.celeborn.client.security.CryptoHandler;
-import org.apache.celeborn.common.protocol.ReviveRequest;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -56,6 +54,7 @@ import org.junit.Test;
 import org.mockito.ArgumentCaptor;
 
 import org.apache.celeborn.client.compress.Compressor;
+import org.apache.celeborn.client.security.CryptoHandler;
 import org.apache.celeborn.common.CelebornConf;
 import org.apache.celeborn.common.CommitMetadata;
 import org.apache.celeborn.common.exception.CelebornIOException;
@@ -69,6 +68,7 @@ import org.apache.celeborn.common.protocol.CompressionCodec;
 import org.apache.celeborn.common.protocol.PartitionLocation;
 import org.apache.celeborn.common.protocol.PbReadReducerPartitionEnd;
 import org.apache.celeborn.common.protocol.PbReadReducerPartitionEndResponse;
+import org.apache.celeborn.common.protocol.ReviveRequest;
 import org.apache.celeborn.common.protocol.message.ControlMessages.GetReducerFileGroupResponse$;
 import org.apache.celeborn.common.protocol.message.ControlMessages.RegisterShuffleResponse$;
 import org.apache.celeborn.common.protocol.message.StatusCode;
@@ -128,21 +128,31 @@ public class ShuffleClientSuiteJ {
     shuffleClient.shutdown();
     conf.set(CelebornConf.CLIENT_PUSH_MAX_REVIVE_TIMES().key(), "0");
     conf.set(CelebornConf.CLIENT_PUSH_LIMIT_IN_FLIGHT_TIMEOUT().key(), "2s");
-    shuffleClient = new ShuffleClientImpl(TEST_APPLICATION_ID, conf, new UserIdentifier("mock", "mock"));
+    shuffleClient =
+        new ShuffleClientImpl(TEST_APPLICATION_ID, conf, new UserIdentifier("mock", "mock"));
     shuffleClient.setupLifecycleManagerRef(endpointRef);
     shuffleClient.dataClientFactory = clientFactory;
-    io.netty.channel.embedded.EmbeddedChannel channel = new io.netty.channel.embedded.EmbeddedChannel(
-        org.apache.celeborn.common.network.protocol.MessageEncoder.INSTANCE);
+    io.netty.channel.embedded.EmbeddedChannel channel =
+        new io.netty.channel.embedded.EmbeddedChannel(
+            org.apache.celeborn.common.network.protocol.MessageEncoder.INSTANCE);
     org.apache.celeborn.common.network.client.TransportResponseHandler responses =
         new org.apache.celeborn.common.network.client.TransportResponseHandler(
-            Utils.fromCelebornConf(conf, org.apache.celeborn.common.network.TransportModuleConstants.PUSH_MODULE, 1), channel);
+            Utils.fromCelebornConf(
+                conf, org.apache.celeborn.common.protocol.TransportModuleConstants.PUSH_MODULE, 1),
+            channel);
     TransportClient closed = new TransportClient(channel, responses);
     when(clientFactory.createClient(anyString(), anyInt(), anyInt())).thenReturn(closed);
     channel.close().sync();
-    CompletableFuture<Integer> done = shuffleClient.pushDataAsync(1, 0, 0, 0,
-        ByteBuffer.allocateDirect(32), 1, 1).toCompletableFuture();
-    try { done.get(5, TimeUnit.SECONDS); fail(); }
-    catch (ExecutionException expected) { assertNotNull(expected.getCause()); }
+    CompletableFuture<Integer> done =
+        shuffleClient
+            .pushDataAsync(1, 0, 0, 0, ByteBuffer.allocateDirect(32), 1, 1)
+            .toCompletableFuture();
+    try {
+      done.get(5, TimeUnit.SECONDS);
+      fail();
+    } catch (ExecutionException expected) {
+      assertNotNull(expected.getCause());
+    }
     channel.finishAndReleaseAll();
     shuffleClient.shutdown();
   }
@@ -203,30 +213,41 @@ public class ShuffleClientSuiteJ {
     CelebornConf conf = setupEnv(CompressionCodec.NONE);
     shuffleClient.shutdown();
     conf.set(CelebornConf.CLIENT_SHUFFLE_INTEGRITY_CHECK_ENABLED().key(), "true");
-    shuffleClient = new ShuffleClientImpl(TEST_APPLICATION_ID, conf, new UserIdentifier("mock", "mock")) {
-      @Override Map<Integer, Integer> reviveBatch(int shuffle, Set<Integer> maps,
-          Collection<ReviveRequest> requests) {
-        return Collections.singletonMap(0, (int) StatusCode.SUCCESS.getValue());
-      }
-    };
+    shuffleClient =
+        new ShuffleClientImpl(TEST_APPLICATION_ID, conf, new UserIdentifier("mock", "mock")) {
+          @Override
+          Map<Integer, Integer> reviveBatch(
+              int shuffle, Set<Integer> maps, Collection<ReviveRequest> requests) {
+            return Collections.singletonMap(0, (int) StatusCode.SUCCESS.getValue());
+          }
+        };
     shuffleClient.setupLifecycleManagerRef(endpointRef);
     shuffleClient.dataClientFactory = clientFactory;
     LinkedBlockingQueue<PushData> requests = new LinkedBlockingQueue<>();
     LinkedBlockingQueue<RpcResponseCallback> callbacks = new LinkedBlockingQueue<>();
-    when(client.pushData(any(), anyLong(), any())).thenAnswer(invocation -> {
-      requests.add(invocation.getArgument(0)); callbacks.add(invocation.getArgument(2));
-      return null;
-    });
+    when(client.pushData(any(), anyLong(), any()))
+        .thenAnswer(
+            invocation -> {
+              requests.add(invocation.getArgument(0));
+              callbacks.add(invocation.getArgument(2));
+              return null;
+            });
     ByteBuffer payload = ByteBuffer.allocateDirect(32);
-    for (int i=0; i<32; i++) { payload.put(i, (byte) i); }
-    CompletableFuture<Integer> done = shuffleClient.pushDataAsync(1, 0, 0, 0,
-        payload.asReadOnlyBuffer(), 1, 1).toCompletableFuture();
+    for (int i = 0; i < 32; i++) {
+      payload.put(i, (byte) i);
+    }
+    CompletableFuture<Integer> done =
+        shuffleClient
+            .pushDataAsync(1, 0, 0, 0, payload.asReadOnlyBuffer(), 1, 1)
+            .toCompletableFuture();
     PushData old = requests.poll(5, TimeUnit.SECONDS);
-    callbacks.poll(5, TimeUnit.SECONDS).onSuccess(ByteBuffer.wrap(new byte[]{StatusCode.HARD_SPLIT.getValue()}));
+    callbacks
+        .poll(5, TimeUnit.SECONDS)
+        .onSuccess(ByteBuffer.wrap(new byte[] {StatusCode.HARD_SPLIT.getValue()}));
     PushData retry = requests.poll(5, TimeUnit.SECONDS);
     assertNotNull(retry);
     assertEquals(48, retry.body().size());
-    assertEquals(32, shuffleClient.getPushState("1-0-0").getBytesWrittenPerPartition(true,1)[0]);
+    assertEquals(32, shuffleClient.getPushState("1-0-0").getBytesWrittenPerPartition(true, 1)[0]);
     callbacks.poll(5, TimeUnit.SECONDS).onSuccess(ByteBuffer.allocate(0));
     retry.body().release();
     assertFalse(done.isDone());
@@ -244,7 +265,9 @@ public class ShuffleClientSuiteJ {
     try {
       shuffleClient.pushDataAsync(1, 0, 0, 0, ByteBuffer.allocateDirect(32), 1, 1);
       fail();
-    } catch (UnsupportedOperationException expected) { assertFalse(shuffleClient.supportsBufferPush()); }
+    } catch (UnsupportedOperationException expected) {
+      assertFalse(shuffleClient.supportsBufferPush());
+    }
     org.mockito.Mockito.verifyNoInteractions(handler);
     shuffleClient.shutdown();
   }
@@ -255,21 +278,32 @@ public class ShuffleClientSuiteJ {
     shuffleClient.shutdown();
     conf.set(CelebornConf.CLIENT_PUSH_MAX_REVIVE_TIMES().key(), "0");
     conf.set(CelebornConf.CLIENT_PUSH_LIMIT_IN_FLIGHT_TIMEOUT().key(), "2s");
-    shuffleClient = new ShuffleClientImpl(TEST_APPLICATION_ID, conf, new UserIdentifier("mock", "mock"));
+    shuffleClient =
+        new ShuffleClientImpl(TEST_APPLICATION_ID, conf, new UserIdentifier("mock", "mock"));
     shuffleClient.setupLifecycleManagerRef(endpointRef);
     shuffleClient.dataClientFactory = clientFactory;
     AtomicReference<PushData> request = new AtomicReference<>();
     AtomicReference<RpcResponseCallback> callback = new AtomicReference<>();
-    when(client.pushData(any(), anyLong(), any())).thenAnswer(invocation -> {
-      request.set(invocation.getArgument(0)); callback.set(invocation.getArgument(2)); return null;
-    });
-    CompletableFuture<Integer> done = shuffleClient.pushDataAsync(1, 0, 0, 0,
-        ByteBuffer.allocateDirect(32), 1, 1).toCompletableFuture();
+    when(client.pushData(any(), anyLong(), any()))
+        .thenAnswer(
+            invocation -> {
+              request.set(invocation.getArgument(0));
+              callback.set(invocation.getArgument(2));
+              return null;
+            });
+    CompletableFuture<Integer> done =
+        shuffleClient
+            .pushDataAsync(1, 0, 0, 0, ByteBuffer.allocateDirect(32), 1, 1)
+            .toCompletableFuture();
     callback.get().onFailure(new IOException("transport timeout"));
     assertFalse(done.isDone());
     request.get().body().release();
-    try { done.get(5, TimeUnit.SECONDS); fail(); }
-    catch (ExecutionException expected) { assertNotNull(expected.getCause()); }
+    try {
+      done.get(5, TimeUnit.SECONDS);
+      fail();
+    } catch (ExecutionException expected) {
+      assertNotNull(expected.getCause());
+    }
     assertNotNull(shuffleClient.getPushState("1-0-0").exception.get());
     shuffleClient.shutdown();
   }

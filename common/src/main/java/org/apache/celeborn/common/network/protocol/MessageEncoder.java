@@ -90,7 +90,7 @@ public final class MessageEncoder extends MessageToMessageEncoder<Message> {
       header.writeInt(bodyLength);
       in.encode(header);
       assert header.writableBytes() == 0;
-  
+
       if (body != null) {
         if (body instanceof FileRegion && in.body() instanceof FileSegmentManagedBuffer) {
           // Emit header and FileRegion as separate objects so that native transports
@@ -117,10 +117,11 @@ public final class MessageEncoder extends MessageToMessageEncoder<Message> {
       // still fail before an outbound message exists to release either reference.
       ReferenceCountUtil.release(header);
       ReferenceCountUtil.release(body);
-      if (in.body() != null) { in.body().release(); }
+      if (in.body() != null) {
+        in.body().release();
+      }
       throw failure;
     }
-
   }
 
   public void setSource(AbstractSource source) {

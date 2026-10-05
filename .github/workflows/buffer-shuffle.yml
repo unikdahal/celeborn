@@ -26,9 +26,7 @@ jobs:
           git diff > formatting.patch
       - name: Test client and shared transport
         run: |
-          build/mvn -B -Pspark-3.5 -pl client -am test \
-            -Dtest=BufferPushSuiteJ,ShuffleClientSuiteJ,SslMessageEncoderSuiteJ,TransportResponseHandlerSuiteJ \
-            -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false
+          build/mvn -B -Pspark-3.5 -pl client -am test
       - name: Measure repeated framing and allocation
         if: matrix.java == 17
         run: |

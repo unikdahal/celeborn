@@ -32,16 +32,20 @@ import org.apache.celeborn.common.network.buffer.ManagedBuffer;
 public class BufferPushSuiteJ {
   @Test
   public void encoderFailureReleasesConvertedAndManagedReferences() throws Exception {
-    for (io.netty.channel.ChannelHandler encoder : new io.netty.channel.ChannelHandler[] {
-        org.apache.celeborn.common.network.protocol.MessageEncoder.INSTANCE,
-        org.apache.celeborn.common.network.protocol.SslMessageEncoder.INSTANCE}) {
+    for (io.netty.channel.ChannelHandler encoder :
+        new io.netty.channel.ChannelHandler[] {
+          org.apache.celeborn.common.network.protocol.MessageEncoder.INSTANCE,
+          org.apache.celeborn.common.network.protocol.SslMessageEncoder.INSTANCE
+        }) {
       BufferPush push = new BufferPush(ByteBuffer.allocateDirect(32));
       PushDataBuffer request = push.newBuffer();
-      io.netty.channel.embedded.EmbeddedChannel channel = new io.netty.channel.embedded.EmbeddedChannel(encoder);
+      io.netty.channel.embedded.EmbeddedChannel channel =
+          new io.netty.channel.embedded.EmbeddedChannel(encoder);
       try {
         // Invalid header fails after conversion and before MessageWithHeader is constructed.
-        channel.writeOutbound(new org.apache.celeborn.common.network.protocol.PushData(
-            (byte) 0, null, "0-0", request));
+        channel.writeOutbound(
+            new org.apache.celeborn.common.network.protocol.PushData(
+                (byte) 0, null, "0-0", request));
         fail();
       } catch (io.netty.handler.codec.EncoderException expected) {
         push.fail(expected);
@@ -121,27 +125,46 @@ public class BufferPushSuiteJ {
 
   @Test
   public void raceLogicalCancellationAgainstTransportRetirement() throws Exception {
-    java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(2);
+    java.util.concurrent.ExecutorService pool =
+        java.util.concurrent.Executors.newFixedThreadPool(2);
     try {
-      for (int iteration=0; iteration<1000; iteration++) {
+      for (int iteration = 0; iteration < 1000; iteration++) {
         BufferPush push = new BufferPush(ByteBuffer.allocateDirect(32));
         ManagedBuffer request = push.newBuffer();
         ByteBuf alias = (ByteBuf) request.convertToNetty();
         push.releaseWork();
         java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
-        java.util.concurrent.Future<?> cancelled = pool.submit(() -> {
-          try { start.await(); } catch (InterruptedException e) { throw new RuntimeException(e); }
-          push.fail(new IllegalStateException("cancelled"));
-        });
-        java.util.concurrent.Future<?> released = pool.submit(() -> {
-          try { start.await(); } catch (InterruptedException e) { throw new RuntimeException(e); }
-          request.release(); alias.release();
-        });
-        start.countDown(); cancelled.get(); released.get();
+        java.util.concurrent.Future<?> cancelled =
+            pool.submit(
+                () -> {
+                  try {
+                    start.await();
+                  } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                  }
+                  push.fail(new IllegalStateException("cancelled"));
+                });
+        java.util.concurrent.Future<?> released =
+            pool.submit(
+                () -> {
+                  try {
+                    start.await();
+                  } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                  }
+                  request.release();
+                  alias.release();
+                });
+        start.countDown();
+        cancelled.get();
+        released.get();
         assertTrue(push.completion().toCompletableFuture().isCompletedExceptionally());
       }
-    } finally { pool.shutdownNow(); }
+    } finally {
+      pool.shutdownNow();
+    }
   }
+
   @Test
   public void callerCannotCancelTheLifetimePromise() throws Exception {
     BufferPush push = new BufferPush(ByteBuffer.allocate(32));
