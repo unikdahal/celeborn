@@ -18,13 +18,21 @@
 package org.apache.celeborn.client;
 
 import io.netty.buffer.Unpooled;
+
 import org.apache.celeborn.common.network.buffer.ManagedBuffer;
 import org.apache.celeborn.common.network.buffer.NettyManagedBuffer;
 
 final class HeapPushDataBody implements PushDataBody {
   private final byte[] body;
-  HeapPushDataBody(byte[] body) { this.body = body; }
-  public int length() { return body.length; }
+
+  HeapPushDataBody(byte[] body) {
+    this.body = body;
+  }
+
+  public int length() {
+    return body.length;
+  }
+
   public ManagedBuffer newBuffer() {
     return new NettyManagedBuffer(Unpooled.wrappedBuffer(body));
   }

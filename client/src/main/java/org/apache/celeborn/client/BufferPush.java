@@ -17,8 +17,6 @@
 
 package org.apache.celeborn.client;
 
-import java.io.IOException;
-import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.concurrent.CompletableFuture;
@@ -27,13 +25,15 @@ import java.util.concurrent.CompletionStage;
 import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.buffer.UnpooledByteBufAllocator;
+
 import org.apache.celeborn.common.network.buffer.ManagedBuffer;
 import org.apache.celeborn.common.network.buffer.NettyManagedBuffer;
 
 /** Completes only when a logical push and every work/transport owner have retired. */
 final class BufferPush implements PushDataBody {
-  private final ByteBuffer payload;
-  private final byte[] header = new byte[16];
+  private ByteBuffer payload;
+  private final int payloadLength;
+  private byte[] header = new byte[16];
   private final CompletableFuture<Integer> completion = new CompletableFuture<>();
   private int references = 1; // the submitting invocation
   private boolean terminal;
@@ -41,66 +41,121 @@ final class BufferPush implements PushDataBody {
   private int result;
   private int batchId;
 
-  BufferPush(ByteBuffer payload) { this.payload = payload.slice().asReadOnlyBuffer(); }
+  BufferPush(ByteBuffer payload) {
+    this.payload = payload.slice().asReadOnlyBuffer();
+    this.payloadLength = payload.remaining();
+  }
+
   synchronized void setHeader(int mapId, int attemptId, int batchId) {
     this.batchId = batchId;
-    ByteBuffer.wrap(header).order(ByteOrder.nativeOrder())
-        .putInt(mapId).putInt(attemptId).putInt(batchId).putInt(payload.remaining());
+    ByteBuffer.wrap(header)
+        .order(ByteOrder.nativeOrder())
+        .putInt(mapId)
+        .putInt(attemptId)
+        .putInt(batchId)
+        .putInt(payloadLength);
   }
-  int batchId() { return batchId; }
-  public int length() { return header.length + payload.remaining(); }
+
+  int batchId() {
+    return batchId;
+  }
+
+  public int length() {
+    return 16 + payloadLength;
+  }
   // A dependent stage isolates the internal lifetime promise from caller cancellation.
-  CompletionStage<Integer> completion() { return completion.thenApply(size -> size); }
+  CompletionStage<Integer> completion() {
+    return completion.thenApply(size -> size);
+  }
+
   public synchronized boolean retainWork() {
-    if (terminal) { return false; }
+    if (terminal) {
+      return false;
+    }
     references++;
     return true;
   }
-  public synchronized boolean isActive() { return !terminal; }
+
+  public synchronized boolean isActive() {
+    return !terminal;
+  }
+
   public void releaseWork() {
     synchronized (this) {
-      if (--references < 0) { throw new IllegalStateException("Unbalanced buffer push ownership"); }
+      if (--references < 0) {
+        throw new IllegalStateException("Unbalanced buffer push ownership");
+      }
     }
     completeIfRetired();
   }
-  public void succeed() { succeed(length()); }
-  void succeed(int size) { finish(size, null); }
-  public void fail(Throwable failure) { finish(0, failure); }
+
+  public void succeed() {
+    succeed(length());
+  }
+
+  void succeed(int size) {
+    finish(size, null);
+  }
+
+  public void fail(Throwable failure) {
+    finish(0, failure);
+  }
+
   private void finish(int size, Throwable cause) {
     synchronized (this) {
-      if (terminal) { return; }
+      if (terminal) {
+        return;
+      }
       terminal = true;
       result = size;
       failure = cause;
     }
     completeIfRetired();
   }
+
   private void completeIfRetired() {
     int size;
     Throwable cause;
     synchronized (this) {
-      if (!terminal || references != 0) { return; }
+      if (!terminal || references != 0) {
+        return;
+      }
       size = result;
       cause = failure;
+      // Late RPC callbacks can still hold this operation, but can no longer acquire work.
+      // Detach payload references before returning admission to the caller.
+      payload = null;
+      header = null;
     }
     // Never run a caller's continuations under the ownership lock.
-    if (cause == null) { completion.complete(size); }
-    else { completion.completeExceptionally(cause); }
+    if (cause == null) {
+      completion.complete(size);
+    } else {
+      completion.completeExceptionally(cause);
+    }
   }
+
   public ManagedBuffer newBuffer() {
     synchronized (this) {
       // A submitting invocation or retry already owns work; cancellation may race it.
-      if (references <= 0) { throw new IllegalStateException("Buffer push is retired"); }
+      if (references <= 0) {
+        throw new IllegalStateException("Buffer push is retired");
+      }
       references++;
     }
     CompositeByteBuf composite;
     try {
-      composite = new CompositeByteBuf(UnpooledByteBufAllocator.DEFAULT, false, 2) {
-        @Override protected void deallocate() {
-          try { super.deallocate(); }
-          finally { releaseWork(); }
-        }
-      };
+      composite =
+          new CompositeByteBuf(UnpooledByteBufAllocator.DEFAULT, false, 2) {
+            @Override
+            protected void deallocate() {
+              try {
+                super.deallocate();
+              } finally {
+                releaseWork();
+              }
+            }
+          };
     } catch (Throwable failure) {
       releaseWork();
       throw failure;

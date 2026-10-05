@@ -19,12 +19,12 @@ package org.apache.celeborn.client;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.concurrent.CompletionStage;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.BiFunction;
@@ -115,7 +115,9 @@ public abstract class ShuffleClient {
   }
 
   /** Whether the client supports {@link #pushDataAsync} with its current security settings. */
-  public boolean supportsBufferPush() { return false; }
+  public boolean supportsBufferPush() {
+    return false;
+  }
 
   /**
    * Pushes the remaining bytes of an already encoded buffer without compression or payload copies.
@@ -124,17 +126,23 @@ public abstract class ShuffleClient {
    *
    * <p>The caller must keep the bytes immutable and their backing allocation alive until the
    * returned stage completes, on success OR failure. Completion includes all queued/active retries,
-   * callbacks and transport buffer releases, even when an RPC times out or cleanup cancels the
-   * map. Calling {@code cleanup} cancels the map; cancelling a future obtained from this stage
-   * does not cancel a push or establish that its buffer is safe to release.
+   * callbacks and transport buffer releases, even when an RPC times out or cleanup cancels the map.
+   * Calling {@code cleanup} cancels the map; cancelling a future obtained from this stage does not
+   * cancel a push or establish that its buffer is safe to release.
    *
    * <p>The completed value is the framed batch length, or zero if the mapper already ended.
    * Synchronous validation errors leave ownership with the caller. Once a stage is returned,
    * asynchronous errors are delivered only after all owners retire. Shuffle encryption is
    * unsupported; callers must use the ordinary push API when {@link #supportsBufferPush} is false.
    */
-  public CompletionStage<Integer> pushDataAsync(int shuffleId, int mapId, int attemptId,
-      int partitionId, ByteBuffer data, int numMappers, int numPartitions) {
+  public CompletionStage<Integer> pushDataAsync(
+      int shuffleId,
+      int mapId,
+      int attemptId,
+      int partitionId,
+      ByteBuffer data,
+      int numMappers,
+      int numPartitions) {
     throw new UnsupportedOperationException("Client does not support caller-owned buffer pushes");
   }
 

@@ -22,10 +22,20 @@ import org.apache.celeborn.common.network.buffer.ManagedBuffer;
 /** A replayable batch body shared by the ordinary and caller-owned push paths. */
 interface PushDataBody {
   int length();
+
   ManagedBuffer newBuffer();
-  default boolean retainWork() { return true; }
+
+  default boolean retainWork() {
+    return true;
+  }
+
   default void releaseWork() {}
-  default boolean isActive() { return true; }
+
+  default boolean isActive() {
+    return true;
+  }
+
   default void succeed() {}
+
   default void fail(Throwable failure) {}
 }
