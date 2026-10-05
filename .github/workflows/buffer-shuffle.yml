@@ -27,7 +27,7 @@ jobs:
       - name: Test client and shared transport
         run: |
           build/mvn -B -Pspark-3.5 -pl client -am test \
-            -Dtest=BufferPushSuiteJ,ShuffleClientSuiteJ \
+            -Dtest=BufferPushSuiteJ,ShuffleClientSuiteJ,SslMessageEncoderSuiteJ,TransportResponseHandlerSuiteJ \
             -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false
       - name: Measure repeated framing and allocation
         if: matrix.java == 17

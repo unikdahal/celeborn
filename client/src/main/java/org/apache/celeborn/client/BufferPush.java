@@ -27,7 +27,6 @@ import io.netty.buffer.Unpooled;
 import io.netty.buffer.UnpooledByteBufAllocator;
 
 import org.apache.celeborn.common.network.buffer.ManagedBuffer;
-import org.apache.celeborn.common.network.buffer.NettyManagedBuffer;
 
 /** Completes only when a logical push and every work/transport owner have retired. */
 final class BufferPush implements PushDataBody {
@@ -135,7 +134,7 @@ final class BufferPush implements PushDataBody {
     }
   }
 
-  public ManagedBuffer newBuffer() {
+  public PushDataBuffer newBuffer() {
     synchronized (this) {
       // A submitting invocation or retry already owns work; cancellation may race it.
       if (references <= 0) {
@@ -163,7 +162,7 @@ final class BufferPush implements PushDataBody {
     try {
       composite.addComponent(true, Unpooled.wrappedBuffer(header));
       composite.addComponent(true, Unpooled.wrappedBuffer(payload.duplicate()));
-      return new NettyManagedBuffer(composite);
+      return new PushDataBuffer(composite);
     } catch (Throwable failure) {
       composite.release();
       throw failure;

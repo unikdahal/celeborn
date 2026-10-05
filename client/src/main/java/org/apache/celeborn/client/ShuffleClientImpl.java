@@ -34,6 +34,7 @@ import scala.reflect.ClassTag$;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Lists;
 import com.google.protobuf.InvalidProtocolBufferException;
+import io.netty.channel.ChannelFuture;
 import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.commons.lang3.StringUtils;
@@ -1444,16 +1445,21 @@ public class ShuffleClientImpl extends ShuffleClient {
       String shuffleKey,
       String partitionUniqueId,
       RpcResponseCallback callback) {
-    ManagedBuffer buffer = body.newBuffer();
+    PushDataBuffer buffer = body.newBuffer();
     try {
-      client.pushData(
+      ChannelFuture write = client.pushData(
           new PushData(PRIMARY_MODE, shuffleKey, partitionUniqueId, buffer),
           pushDataTimeout,
           callback);
+      if (write != null) {
+        write.addListener(future -> {
+          if (!future.isSuccess()) { buffer.releaseIfUnencoded(); }
+        });
+      }
     } catch (RuntimeException | Error failure) {
-      // TransportClient owns a request once accepted. A synchronous submission failure
-      // leaves this reference with the caller.
-      buffer.release();
+      // An accepted write can fail before the encoder. Once encoded, only the outbound
+      // message and its retained Netty aliases may retire transport ownership.
+      buffer.releaseIfUnencoded();
       throw failure;
     }
   }

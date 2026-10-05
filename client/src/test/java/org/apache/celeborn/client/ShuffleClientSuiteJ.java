@@ -123,6 +123,31 @@ public class ShuffleClientSuiteJ {
   private final int BATCH_HEADER_SIZE = 4 * 4;
 
   @Test
+  public void testClosedChannelRetiresUnencodedBorrowedBuffer() throws Exception {
+    CelebornConf conf = setupEnv(CompressionCodec.NONE);
+    shuffleClient.shutdown();
+    conf.set(CelebornConf.CLIENT_PUSH_MAX_REVIVE_TIMES().key(), "0");
+    conf.set(CelebornConf.CLIENT_PUSH_LIMIT_IN_FLIGHT_TIMEOUT().key(), "2s");
+    shuffleClient = new ShuffleClientImpl(TEST_APPLICATION_ID, conf, new UserIdentifier("mock", "mock"));
+    shuffleClient.setupLifecycleManagerRef(endpointRef);
+    shuffleClient.dataClientFactory = clientFactory;
+    io.netty.channel.embedded.EmbeddedChannel channel = new io.netty.channel.embedded.EmbeddedChannel(
+        org.apache.celeborn.common.network.protocol.MessageEncoder.INSTANCE);
+    org.apache.celeborn.common.network.client.TransportResponseHandler responses =
+        new org.apache.celeborn.common.network.client.TransportResponseHandler(
+            Utils.fromCelebornConf(conf, org.apache.celeborn.common.network.TransportModuleConstants.PUSH_MODULE, 1), channel);
+    TransportClient closed = new TransportClient(channel, responses);
+    when(clientFactory.createClient(anyString(), anyInt(), anyInt())).thenReturn(closed);
+    channel.close().sync();
+    CompletableFuture<Integer> done = shuffleClient.pushDataAsync(1, 0, 0, 0,
+        ByteBuffer.allocateDirect(32), 1, 1).toCompletableFuture();
+    try { done.get(5, TimeUnit.SECONDS); fail(); }
+    catch (ExecutionException expected) { assertNotNull(expected.getCause()); }
+    channel.finishAndReleaseAll();
+    shuffleClient.shutdown();
+  }
+
+  @Test
   public void testBufferPushWaitsForTransportAfterResponse() throws Exception {
     setupEnv(CompressionCodec.NONE);
     AtomicReference<PushData> request = new AtomicReference<>();

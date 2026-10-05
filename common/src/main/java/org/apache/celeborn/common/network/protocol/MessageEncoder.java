@@ -24,6 +24,7 @@ import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.FileRegion;
 import io.netty.handler.codec.MessageToMessageEncoder;
+import io.netty.util.ReferenceCountUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -78,37 +79,48 @@ public final class MessageEncoder extends MessageToMessageEncoder<Message> {
       }
     }
 
-    Message.Type msgType = in.type();
-    // message size, message type size, body size, message encoded length
-    int headerLength = 4 + msgType.encodedLength() + 4 + in.encodedLength();
-    ByteBuf header = ctx.alloc().heapBuffer(headerLength);
-    header.writeInt(in.encodedLength());
-    msgType.encode(header);
-    header.writeInt(bodyLength);
-    in.encode(header);
-    assert header.writableBytes() == 0;
-
-    if (body != null) {
-      if (body instanceof FileRegion && in.body() instanceof FileSegmentManagedBuffer) {
-        // Emit header and FileRegion as separate objects so that native transports
-        // (EPOLL, KQUEUE) can apply zero-copy sendfile/splice on the FileRegion directly.
-        // When wrapped in MessageWithHeader, native transports fall into a generic
-        // FileRegion.transferTo() fallback that copies data through user-space, bypassing
-        // the optimized sendfile() path.
-        //
-        // This split is only safe when the ManagedBuffer is FileSegmentManagedBuffer,
-        // whose release() is a no-op. Other ManagedBuffer types perform resource cleanup in
-        // release() that must be tied to the write lifecycle via MessageWithHeader.deallocate().
-        out.add(header);
-        out.add(body);
+    ByteBuf header = null;
+    try {
+      Message.Type msgType = in.type();
+      // message size, message type size, body size, message encoded length
+      int headerLength = 4 + msgType.encodedLength() + 4 + in.encodedLength();
+      header = ctx.alloc().heapBuffer(headerLength);
+      header.writeInt(in.encodedLength());
+      msgType.encode(header);
+      header.writeInt(bodyLength);
+      in.encode(header);
+      assert header.writableBytes() == 0;
+  
+      if (body != null) {
+        if (body instanceof FileRegion && in.body() instanceof FileSegmentManagedBuffer) {
+          // Emit header and FileRegion as separate objects so that native transports
+          // (EPOLL, KQUEUE) can apply zero-copy sendfile/splice on the FileRegion directly.
+          // When wrapped in MessageWithHeader, native transports fall into a generic
+          // FileRegion.transferTo() fallback that copies data through user-space, bypassing
+          // the optimized sendfile() path.
+          //
+          // This split is only safe when the ManagedBuffer is FileSegmentManagedBuffer,
+          // whose release() is a no-op. Other ManagedBuffer types perform resource cleanup in
+          // release() that must be tied to the write lifecycle via MessageWithHeader.deallocate().
+          out.add(header);
+          out.add(body);
+        } else {
+          // We transfer ownership of the reference on in.body() to MessageWithHeader.
+          // This reference will be freed when MessageWithHeader.deallocate() is called.
+          out.add(new MessageWithHeader(in.body(), header, body, bodyLength, source));
+        }
       } else {
-        // We transfer ownership of the reference on in.body() to MessageWithHeader.
-        // This reference will be freed when MessageWithHeader.deallocate() is called.
-        out.add(new MessageWithHeader(in.body(), header, body, bodyLength, source));
+        out.add(header);
       }
-    } else {
-      out.add(header);
+    } catch (Throwable failure) {
+      // Conversion already acquired a Netty reference. Header allocation/encoding can
+      // still fail before an outbound message exists to release either reference.
+      ReferenceCountUtil.release(header);
+      ReferenceCountUtil.release(body);
+      if (in.body() != null) { in.body().release(); }
+      throw failure;
     }
+
   }
 
   public void setSource(AbstractSource source) {

@@ -17,13 +17,12 @@
 
 package org.apache.celeborn.client;
 
-import org.apache.celeborn.common.network.buffer.ManagedBuffer;
 
 /** A replayable batch body shared by the ordinary and caller-owned push paths. */
 interface PushDataBody {
   int length();
 
-  ManagedBuffer newBuffer();
+  PushDataBuffer newBuffer();
 
   default boolean retainWork() {
     return true;

@@ -98,15 +98,14 @@ public final class BufferPushBenchmark {
             java.util.Locale.ROOT,
             "{\"mode\":\"%s\",\"frame_bytes\":%d,\"iterations\":%d,\"repeats\":9,"
                 + "\"median_ns_per_frame\":%.1f,\"min_ns_per_frame\":%.1f,\"max_ns_per_frame\":%.1f,"
-                + "\"heap_allocated_bytes_per_frame\":%.1f,\"framing_gib_per_second\":%.3f}%n",
+                + "\"heap_allocated_bytes_per_frame\":%.1f}%n",
             modes[index],
             size,
             iterations,
             median,
             ns[index][0] / (double) iterations,
             ns[index][8] / (double) iterations,
-            allocation[index][4] / (double) iterations,
-            size / median * 1e9 / (1024.0 * 1024 * 1024));
+            allocation[index][4] / (double) iterations);
       }
     }
   }

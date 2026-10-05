@@ -23,6 +23,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.MessageToMessageEncoder;
+import io.netty.util.ReferenceCountUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -75,22 +76,33 @@ public final class SslMessageEncoder extends MessageToMessageEncoder<Message> {
       }
     }
 
-    Message.Type msgType = in.type();
-    // message size, message type size, body size, message encoded length
-    int headerLength = 4 + msgType.encodedLength() + 4 + in.encodedLength();
-    ByteBuf header = ctx.alloc().heapBuffer(headerLength);
-    header.writeInt(in.encodedLength());
-    msgType.encode(header);
-    header.writeInt(bodyLength);
-    in.encode(header);
-    assert header.writableBytes() == 0;
-
-    if (body != null && bodyLength > 0) {
-      // We transfer ownership of the reference on in.body() to EncryptedMessageWithHeader.
-      // This reference will be freed when EncryptedMessageWithHeader.close() is called.
-      out.add(new EncryptedMessageWithHeader(in.body(), header, body, bodyLength));
-    } else {
-      out.add(header);
+    ByteBuf header = null;
+    try {
+      Message.Type msgType = in.type();
+      // message size, message type size, body size, message encoded length
+      int headerLength = 4 + msgType.encodedLength() + 4 + in.encodedLength();
+      header = ctx.alloc().heapBuffer(headerLength);
+      header.writeInt(in.encodedLength());
+      msgType.encode(header);
+      header.writeInt(bodyLength);
+      in.encode(header);
+      assert header.writableBytes() == 0;
+  
+      if (body != null && bodyLength > 0) {
+        // We transfer ownership of the reference on in.body() to EncryptedMessageWithHeader.
+        // This reference will be freed when EncryptedMessageWithHeader.close() is called.
+        out.add(new EncryptedMessageWithHeader(in.body(), header, body, bodyLength));
+      } else {
+        out.add(header);
+      }
+    } catch (Throwable failure) {
+      // Conversion already acquired a Netty reference. Header allocation/encoding can
+      // still fail before an outbound message exists to release either reference.
+      ReferenceCountUtil.release(header);
+      ReferenceCountUtil.release(body);
+      if (in.body() != null) { in.body().release(); }
+      throw failure;
     }
+
   }
 }

@@ -31,6 +31,30 @@ import org.apache.celeborn.common.network.buffer.ManagedBuffer;
 
 public class BufferPushSuiteJ {
   @Test
+  public void encoderFailureReleasesConvertedAndManagedReferences() throws Exception {
+    for (io.netty.channel.ChannelHandler encoder : new io.netty.channel.ChannelHandler[] {
+        org.apache.celeborn.common.network.protocol.MessageEncoder.INSTANCE,
+        org.apache.celeborn.common.network.protocol.SslMessageEncoder.INSTANCE}) {
+      BufferPush push = new BufferPush(ByteBuffer.allocateDirect(32));
+      PushDataBuffer request = push.newBuffer();
+      io.netty.channel.embedded.EmbeddedChannel channel = new io.netty.channel.embedded.EmbeddedChannel(encoder);
+      try {
+        // Invalid header fails after conversion and before MessageWithHeader is constructed.
+        channel.writeOutbound(new org.apache.celeborn.common.network.protocol.PushData(
+            (byte) 0, null, "0-0", request));
+        fail();
+      } catch (io.netty.handler.codec.EncoderException expected) {
+        push.fail(expected);
+      } finally {
+        request.releaseIfUnencoded();
+        push.releaseWork();
+        channel.finishAndReleaseAll();
+      }
+      assertTrue(push.completion().toCompletableFuture().isCompletedExceptionally());
+    }
+  }
+
+  @Test
   public void completionWaitsForEveryOwnerInEitherOrder() throws Exception {
     for (boolean terminalFirst : new boolean[] {false, true}) {
       BufferPush push = new BufferPush(ByteBuffer.allocateDirect(32));
