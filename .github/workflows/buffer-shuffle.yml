@@ -24,6 +24,7 @@ jobs:
         run: |
           build/mvn -B -Pspark-3.5 spotless:apply
           git diff > formatting.patch
+          git diff --exit-code
       - name: Test public buffer contract
         run: |
           build/mvn -B -Pspark-3.5 -pl client -am test \

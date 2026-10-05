@@ -18,6 +18,7 @@
 #  */
 # 
 import json
+import os
 import statistics
 from pathlib import Path
 
@@ -27,7 +28,7 @@ for file in sorted(Path(".").glob("framing-benchmark-*.jsonl")):
         value = json.loads(line)
         records.setdefault((value["frame_bytes"], value["mode"]), []).append(value)
 assert len(records) == 12
-lines = ["# Framing allocation evidence", "",
+lines = ["# Framing allocation evidence", "", "Commit: `" + os.environ["GITHUB_SHA"] + "`", "",
          "Three independent Java 17 JVM forks, five warmups per size/mode, nine measured samples",
          "per fork. Payloads are pre-encoded direct buffers. This measures payload copying and",
          "framing only; encoding, retries, network, TLS, and kernel costs are excluded.", "",
