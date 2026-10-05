@@ -1483,6 +1483,11 @@ public class ShuffleClientImpl extends ShuffleClient {
   }
 
   private void submitBufferRetry(PushDataBody body, Runnable retry) {
+    if (body instanceof HeapPushDataBody) {
+      // Preserve the existing retry executor and exception behavior for byte-array pushes.
+      pushDataRetryPool.execute(retry);
+      return;
+    }
     if (!body.retainWork()) {
       return;
     }
@@ -1502,9 +1507,6 @@ public class ShuffleClientImpl extends ShuffleClient {
     } catch (RejectedExecutionException failure) {
       body.fail(failure);
       body.releaseWork();
-      if (body instanceof HeapPushDataBody) {
-        throw failure;
-      }
     }
   }
 
