@@ -24,6 +24,19 @@ jobs:
         run: |
           build/mvn -B -Pspark-3.5 spotless:apply
           git diff > formatting.patch
+      - name: Test public buffer contract
+        run: |
+          build/mvn -B -Pspark-3.5 -pl client -am test \
+            -Dtest=BufferPushSuiteJ,ShuffleClientSuiteJ \
+            -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: contract-java-${{ matrix.java }}
+          path: |
+            formatting.patch
+            client/target/surefire-reports/**
+            client/target/test-reports/**
       - name: Test client and shared transport
         run: |
           build/mvn -B -Pspark-3.5 -pl client -am test
