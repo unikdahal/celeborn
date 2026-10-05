@@ -25,6 +25,10 @@ import static org.mockito.Mockito.when;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
+import java.util.concurrent.CompletableFuture;
+import org.apache.celeborn.common.network.protocol.PushData;
+import org.apache.celeborn.common.network.client.RpcResponseCallback;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
@@ -111,6 +115,47 @@ public class ShuffleClientSuiteJ {
 
   private static final byte[] TEST_BUF1 = "hello world".getBytes(StandardCharsets.UTF_8);
   private final int BATCH_HEADER_SIZE = 4 * 4;
+
+  @Test
+  public void testBufferPushWaitsForTransportAfterResponse() throws Exception {
+    setupEnv(CompressionCodec.NONE);
+    AtomicReference<PushData> request = new AtomicReference<>();
+    AtomicReference<RpcResponseCallback> callback = new AtomicReference<>();
+    when(client.pushData(any(), anyLong(), any())).thenAnswer(invocation -> {
+      request.set(invocation.getArgument(0)); callback.set(invocation.getArgument(2));
+      return null;
+    });
+    ByteBuffer payload = ByteBuffer.allocateDirect(32);
+    payload.position(3); payload.limit(30);
+    CompletableFuture<Integer> done = shuffleClient.pushDataAsync(1, 0, 0, 0,
+        payload, 1, 1).toCompletableFuture();
+    callback.get().onSuccess(ByteBuffer.allocate(0));
+    assertFalse(done.isDone());
+    request.get().body().release();
+    assertEquals(43, (int) done.get(5, TimeUnit.SECONDS));
+    assertEquals(3, payload.position()); assertEquals(30, payload.limit());
+    shuffleClient.shutdown();
+  }
+
+  @Test
+  public void testCleanupCannotCompleteWhileTransportRetainsPayload() throws Exception {
+    setupEnv(CompressionCodec.NONE);
+    AtomicReference<PushData> request = new AtomicReference<>();
+    AtomicReference<RpcResponseCallback> callback = new AtomicReference<>();
+    when(client.pushData(any(), anyLong(), any())).thenAnswer(invocation -> {
+      request.set(invocation.getArgument(0)); callback.set(invocation.getArgument(2));
+      return null;
+    });
+    CompletableFuture<Integer> done = shuffleClient.pushDataAsync(1, 0, 0, 0,
+        ByteBuffer.allocateDirect(32), 1, 1).toCompletableFuture();
+    shuffleClient.cleanup(1, 0, 0);
+    assertFalse(done.isDone());
+    callback.get().onFailure(new IOException("late timeout"));
+    assertFalse(done.isDone());
+    request.get().body().release();
+    assertTrue(done.isCompletedExceptionally());
+    shuffleClient.shutdown();
+  }
 
   @Test
   public void testPushData() throws IOException, InterruptedException {
