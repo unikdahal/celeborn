@@ -1007,7 +1007,7 @@ public class ShuffleClientImpl extends ShuffleClient {
     }
   }
 
-  private static final class DirectPushBody implements PushBody {
+  private final class DirectPushBody implements PushBody {
     private final byte[] header;
     private final ByteBuffer payload;
     private final int payloadLength;
