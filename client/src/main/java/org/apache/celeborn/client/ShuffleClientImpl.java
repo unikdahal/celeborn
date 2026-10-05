@@ -1516,6 +1516,8 @@ public class ShuffleClientImpl extends ShuffleClient {
     }
     String mapKey = Utils.makeMapKey(shuffleId, mapId, attemptId);
     BufferPush body = new BufferPush(data);
+    // Allocate the caller's view before any transport/retry owner can borrow the buffer.
+    CompletionStage<Integer> lifetime = body.completion();
     synchronized (bufferPushLock) {
       if (bufferPushesClosed) {
         body.fail(new CelebornIOException("Shuffle client is closed"));
@@ -1538,11 +1540,11 @@ public class ShuffleClientImpl extends ShuffleClient {
             });
     try {
       if (!body.isActive()) {
-        return body.completion();
+        return lifetime;
       }
       if (mapperEnded(shuffleId, mapId)) {
         body.succeed(0);
-        return body.completion();
+        return lifetime;
       }
       ConcurrentHashMap<Integer, PartitionLocation> locations =
           getPartitionLocation(shuffleId, numMappers, numPartitions);
@@ -1559,7 +1561,7 @@ public class ShuffleClientImpl extends ShuffleClient {
       }
       if (mapperEnded(shuffleId, mapId)) {
         body.succeed(0);
-        return body.completion();
+        return lifetime;
       }
       PartitionLocation loc = locations.get(partitionId);
       if (loc == null) {
@@ -1579,7 +1581,7 @@ public class ShuffleClientImpl extends ShuffleClient {
     } finally {
       body.releaseWork();
     }
-    return body.completion();
+    return lifetime;
   }
 
   @Override

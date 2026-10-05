@@ -229,6 +229,7 @@ public class ShuffleClientSuiteJ {
     CelebornConf conf = setupEnv(CompressionCodec.NONE);
     shuffleClient.shutdown();
     conf.set(CelebornConf.CLIENT_PUSH_MAX_REVIVE_TIMES().key(), "0");
+    conf.set(CelebornConf.CLIENT_PUSH_LIMIT_IN_FLIGHT_TIMEOUT().key(), "2s");
     shuffleClient = new ShuffleClientImpl(TEST_APPLICATION_ID, conf, new UserIdentifier("mock", "mock"));
     shuffleClient.setupLifecycleManagerRef(endpointRef);
     shuffleClient.dataClientFactory = clientFactory;
