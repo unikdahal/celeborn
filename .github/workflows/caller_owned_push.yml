@@ -151,3 +151,59 @@ jobs:
           build/mvn -B -Pgoogle-mirror -pl client test \
             -Dtest='PushDataBodyBufferSuiteJ,ShuffleClientPushLifecycleSuiteJ,ShuffleClientSuiteJ,DataPushQueueSuiteJ' \
             -DwildcardSuites=none -DfailIfNoTests=false
+
+  push-path-ab:
+    name: pushData(byte[]) A/B against the unmodified base
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ci
+      - uses: actions/checkout@v4
+        with:
+          ref: branch-0.7-baseline
+          path: base
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/push-body-refcount
+          path: pr
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+          cache: maven
+      - name: Build both
+        run: |
+          for v in base pr; do
+            cp ci/dev/ci/PushDataPathBenchmark.scala $v/worker/src/test/scala/org/apache/celeborn/service/deploy/cluster/
+            (cd $v && git log --oneline -1 && build/mvn -B -q -Dspotless.check.skip=true -Pgoogle-mirror -pl worker -am install -DskipTests)
+          done
+      - name: Interleaved runs
+        run: |
+          export MAVEN_OPTS="-Xmx6g --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED -Dio.netty.tryReflectionSetAccessible=true"
+          for round in 1 2 3 4 5; do
+            for v in base pr; do
+              if [ $((round % 2)) -eq 0 ]; then v=$([ $v = base ] && echo pr || echo base); fi
+              (cd $v && build/mvn -B -q -Dspotless.check.skip=true -Pgoogle-mirror -pl client install -DskipTests)
+              (cd $v && build/mvn -B -q -Dspotless.check.skip=true -Pgoogle-mirror -pl worker \
+                org.codehaus.mojo:exec-maven-plugin:3.1.0:java -Dexec.classpathScope=test \
+                -Dexec.mainClass=org.apache.celeborn.service.deploy.cluster.PushDataPathBenchmark \
+                -Dexec.args=$v -Dexec.cleanupDaemonThreads=false 2>&1 | grep '^RESULT' | tee -a results.txt) || true
+            done
+          done
+          mv base/results.txt base-results.txt 2>/dev/null || true; mv pr/results.txt pr-results.txt 2>/dev/null || true
+          cat base-results.txt pr-results.txt > all.txt
+          python3 - <<'PY'
+          import statistics, collections
+          rows = collections.defaultdict(list)
+          for line in open("all.txt"):
+              _, label, size, wall, cpu, alloc = line.split()
+              rows[(int(size), label)].append((float(wall), float(cpu), float(alloc)))
+          print("| batch KiB | version | runs | wall ms (median) | process CPU ms (median) | allocated MiB (median) |")
+          print("|---|---|---|---|---|---|")
+          for (size, label) in sorted(rows):
+              r = rows[(size, label)]
+              med = [statistics.median(x[i] for x in r) for i in range(3)]
+              print(f"| {size} | {label} | {len(r)} | {med[0]:.1f} | {med[1]:.1f} | {med[2]:.1f} |")
+          PY
