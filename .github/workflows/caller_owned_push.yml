@@ -151,6 +151,9 @@ jobs:
           build/mvn -B -Pgoogle-mirror -pl client test \
             -Dtest='PushDataBodyBufferSuiteJ,ShuffleClientPushLifecycleSuiteJ,ShuffleClientSuiteJ,DataPushQueueSuiteJ' \
             -DwildcardSuites=none -DfailIfNoTests=false
+          build/mvn -B -Pgoogle-mirror -pl worker -am install -DskipTests
+          build/mvn -B -Pgoogle-mirror -pl worker test -Dtest=none -DfailIfNoTests=false \
+            -DwildcardSuites='org.apache.celeborn.service.deploy.cluster.PushDataRetryLifecycleSuite,org.apache.celeborn.service.deploy.cluster.ClusterReadWriteTestWithNONE,org.apache.celeborn.service.deploy.cluster.ReadWriteTestWithFailures,org.apache.celeborn.service.deploy.cluster.PushMergedDataSplitSuite'
 
   push-path-ab:
     name: pushData(byte[]) A/B against the unmodified base
