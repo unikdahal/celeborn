@@ -56,8 +56,8 @@ jobs:
         if: success() || failure()
         run: |
           for i in $(seq 1 20); do
-            build/mvn -B -q -Dspotless.check.skip=true -Pgoogle-mirror -pl client surefire:test \
-              -Dtest='ShuffleClientRawPushSuiteJ,PushDataBodyBufferSuiteJ' -DfailIfNoTests=false
+            build/mvn -B -q -Dspotless.check.skip=true -Pgoogle-mirror -pl client test \
+              -Dtest='ShuffleClientRawPushSuiteJ,PushDataBodyBufferSuiteJ' -DwildcardSuites=none -DfailIfNoTests=false
           done
       - name: Mini cluster read/write with hard splits
         if: success() || failure()
@@ -121,10 +121,10 @@ jobs:
             org.codehaus.mojo:exec-maven-plugin:3.1.0:java \
             -Dexec.mainClass=org.apache.celeborn.service.deploy.cluster.RawPushDataBenchmark \
             -Dexec.classpathScope=test -Dexec.cleanupDaemonThreads=false 2>&1 | grep -v ' INFO \| DEBUG \| WARN ' | tee benchmark.log || true
-          cat worker/benchmarks/RawPushDataBenchmark-jdk17-results.txt
+          find . -name 'RawPushDataBenchmark*results.txt' -exec cat {} \; -exec cp {} . \;
       - uses: actions/upload-artifact@v4
         with:
           name: raw-push-benchmark
           path: |
-            worker/benchmarks/RawPushDataBenchmark-jdk17-results.txt
+            RawPushDataBenchmark-jdk17-results.txt
             benchmark.log
