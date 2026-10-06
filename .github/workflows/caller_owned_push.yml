@@ -1,0 +1,124 @@
+name: Caller-owned push validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/caller-owned-push
+
+concurrency:
+  group: caller-owned-push-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  style:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 8
+          cache: maven
+      - name: Spotless
+        run: build/mvn -B -Pgoogle-mirror,spark-3.5 spotless:check
+
+  tests:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [8, 17]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: ${{ matrix.java }}
+          cache: maven
+      - name: Build
+        run: build/mvn -B -Pgoogle-mirror -pl worker -am install -DskipTests
+      - name: Client unit tests
+        run: |
+          build/mvn -B -Pgoogle-mirror -pl client test \
+            -Dtest='ShuffleClientRawPushSuiteJ,PushDataBodyBufferSuiteJ,ShuffleClientSuiteJ,DataPushQueueSuiteJ' \
+            -DwildcardSuites=none -DfailIfNoTests=false
+      - name: Repeat ownership tests x20
+        run: |
+          for i in $(seq 1 20); do
+            build/mvn -B -q -Pgoogle-mirror -pl client surefire:test \
+              -Dtest='ShuffleClientRawPushSuiteJ,PushDataBodyBufferSuiteJ' -DfailIfNoTests=false
+          done
+      - name: Mini cluster read/write with hard splits
+        run: |
+          build/mvn -B -Pgoogle-mirror -pl worker test -Dtest=none -DfailIfNoTests=false \
+            -DwildcardSuites='org.apache.celeborn.service.deploy.cluster.RawPushDataReadWriteSuite,org.apache.celeborn.service.deploy.cluster.ClusterReadWriteTestWithNONE,org.apache.celeborn.service.deploy.cluster.ClusterReadWriteTestWithLZ4,org.apache.celeborn.service.deploy.cluster.ReadWriteTestWithFailures,org.apache.celeborn.service.deploy.cluster.PushMergedDataSplitSuite'
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-java-${{ matrix.java }}
+          path: |
+            **/target/surefire-reports/**
+            **/target/unit-tests.log
+
+  cherry-pick-main:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+          cache: maven
+      - name: Apply the feature commit to upstream main
+        run: |
+          git config user.name ci && git config user.email ci@example.com
+          FEATURE=$(git log --format=%H -n 1 --grep='^Add a zero-copy push API for caller-owned buffers')
+          git remote add upstream https://github.com/apache/celeborn.git
+          git fetch -q upstream main
+          git checkout -q -b on-main upstream/main
+          git cherry-pick "$FEATURE"
+          git log --oneline -2
+      - name: Build and test on main
+        run: |
+          build/mvn -B -Pgoogle-mirror -pl worker -am install -DskipTests
+          build/mvn -B -Pgoogle-mirror -pl client test \
+            -Dtest='ShuffleClientRawPushSuiteJ,PushDataBodyBufferSuiteJ,ShuffleClientSuiteJ' \
+            -DwildcardSuites=none -DfailIfNoTests=false
+          build/mvn -B -Pgoogle-mirror -pl worker test -Dtest=none -DfailIfNoTests=false \
+            -DwildcardSuites=org.apache.celeborn.service.deploy.cluster.RawPushDataReadWriteSuite
+
+  benchmark:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+          cache: maven
+      - name: Build
+        run: |
+          build/mvn -B -Pgoogle-mirror -pl worker -am install -DskipTests
+          build/mvn -B -q -Pgoogle-mirror -pl worker dependency:build-classpath \
+            -Dmdep.includeScope=test -Dmdep.outputFile=$PWD/worker-cp.txt
+      - name: Run RawPushDataBenchmark
+        run: |
+          cd worker
+          CELEBORN_GENERATE_BENCHMARK_FILES=1 java -Xmx4g \
+            --add-opens=java.base/java.nio=ALL-UNNAMED \
+            --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED \
+            --add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
+            -Dio.netty.tryReflectionSetAccessible=true \
+            -cp "target/test-classes:target/classes:$(cat ../worker-cp.txt)" \
+            org.apache.celeborn.service.deploy.cluster.RawPushDataBenchmark 2>&1 | tee ../benchmark.log | grep -v ' INFO \| DEBUG ' 
+          cat benchmarks/RawPushDataBenchmark-jdk17-results.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: raw-push-benchmark
+          path: |
+            worker/benchmarks/RawPushDataBenchmark-jdk17-results.txt
+            benchmark.log
