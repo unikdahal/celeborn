@@ -21,7 +21,16 @@ jobs:
           java-version: 8
           cache: maven
       - name: Spotless
-        run: build/mvn -B -Pgoogle-mirror,spark-3.5 spotless:check
+        run: |
+          build/mvn -B -q -Pgoogle-mirror,spark-3.5 spotless:apply
+          git diff > format.patch
+          cat format.patch
+          test ! -s format.patch
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: format-patch
+          path: format.patch
 
   tests:
     runs-on: ubuntu-22.04
@@ -37,21 +46,21 @@ jobs:
           java-version: ${{ matrix.java }}
           cache: maven
       - name: Build
-        run: build/mvn -B -Pgoogle-mirror -pl worker -am install -DskipTests
+        run: build/mvn -B -Dspotless.check.skip=true -Pgoogle-mirror -pl worker -am install -DskipTests
       - name: Client unit tests
         run: |
-          build/mvn -B -Pgoogle-mirror -pl client test \
+          build/mvn -B -Dspotless.check.skip=true -Pgoogle-mirror -pl client test \
             -Dtest='ShuffleClientRawPushSuiteJ,PushDataBodyBufferSuiteJ,ShuffleClientSuiteJ,DataPushQueueSuiteJ' \
             -DwildcardSuites=none -DfailIfNoTests=false
       - name: Repeat ownership tests x20
         run: |
           for i in $(seq 1 20); do
-            build/mvn -B -q -Pgoogle-mirror -pl client surefire:test \
+            build/mvn -B -q -Dspotless.check.skip=true -Pgoogle-mirror -pl client surefire:test \
               -Dtest='ShuffleClientRawPushSuiteJ,PushDataBodyBufferSuiteJ' -DfailIfNoTests=false
           done
       - name: Mini cluster read/write with hard splits
         run: |
-          build/mvn -B -Pgoogle-mirror -pl worker test -Dtest=none -DfailIfNoTests=false \
+          build/mvn -B -Dspotless.check.skip=true -Pgoogle-mirror -pl worker test -Dtest=none -DfailIfNoTests=false \
             -DwildcardSuites='org.apache.celeborn.service.deploy.cluster.RawPushDataReadWriteSuite,org.apache.celeborn.service.deploy.cluster.ClusterReadWriteTestWithNONE,org.apache.celeborn.service.deploy.cluster.ClusterReadWriteTestWithLZ4,org.apache.celeborn.service.deploy.cluster.ReadWriteTestWithFailures,org.apache.celeborn.service.deploy.cluster.PushMergedDataSplitSuite'
       - name: Upload test log
         if: failure()
@@ -84,11 +93,11 @@ jobs:
           git log --oneline -2
       - name: Build and test on main
         run: |
-          build/mvn -B -Pgoogle-mirror -pl worker -am install -DskipTests
-          build/mvn -B -Pgoogle-mirror -pl client test \
+          build/mvn -B -Dspotless.check.skip=true -Pgoogle-mirror -pl worker -am install -DskipTests
+          build/mvn -B -Dspotless.check.skip=true -Pgoogle-mirror -pl client test \
             -Dtest='ShuffleClientRawPushSuiteJ,PushDataBodyBufferSuiteJ,ShuffleClientSuiteJ' \
             -DwildcardSuites=none -DfailIfNoTests=false
-          build/mvn -B -Pgoogle-mirror -pl worker test -Dtest=none -DfailIfNoTests=false \
+          build/mvn -B -Dspotless.check.skip=true -Pgoogle-mirror -pl worker test -Dtest=none -DfailIfNoTests=false \
             -DwildcardSuites=org.apache.celeborn.service.deploy.cluster.RawPushDataReadWriteSuite
 
   benchmark:
@@ -102,8 +111,8 @@ jobs:
           cache: maven
       - name: Build
         run: |
-          build/mvn -B -Pgoogle-mirror -pl worker -am install -DskipTests
-          build/mvn -B -q -Pgoogle-mirror -pl worker dependency:build-classpath \
+          build/mvn -B -Dspotless.check.skip=true -Pgoogle-mirror -pl worker -am install -DskipTests
+          build/mvn -B -q -Dspotless.check.skip=true -Pgoogle-mirror -pl worker dependency:build-classpath \
             -Dmdep.includeScope=test -Dmdep.outputFile=$PWD/worker-cp.txt
       - name: Run RawPushDataBenchmark
         run: |
