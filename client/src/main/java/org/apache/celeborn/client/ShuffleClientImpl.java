@@ -1325,20 +1325,13 @@ public class ShuffleClientImpl extends ShuffleClient {
     return Unpooled.wrappedBuffer(framedBatch);
   }
 
-  public int pushOrMergeData(
-      int shuffleId,
-      int mapId,
-      int attemptId,
-      int partitionId,
-      byte[] data,
-      int offset,
-      int length,
-      int numMappers,
-      int numPartitions,
-      boolean doPush,
-      boolean skipCompress)
+  /**
+   * Returns the location to push a batch of the given partition to, registering the shuffle or
+   * reviving the partition as needed, or null if the mapper has already ended.
+   */
+  private PartitionLocation pushTargetLocation(
+      int shuffleId, int mapId, int attemptId, int partitionId, int numMappers, int numPartitions)
       throws IOException {
-    // mapKey
     final String mapKey = Utils.makeMapKey(shuffleId, mapId, attemptId);
     // return if shuffle stage already ended
     if (mapperEnded(shuffleId, mapId)) {
@@ -1352,7 +1345,7 @@ public class ShuffleClientImpl extends ShuffleClient {
       if (pushState != null) {
         pushState.cleanup();
       }
-      return 0;
+      return null;
     }
     // register shuffle if not registered
     final ConcurrentHashMap<Integer, PartitionLocation> map =
@@ -1386,7 +1379,7 @@ public class ShuffleClientImpl extends ShuffleClient {
       if (pushState != null) {
         pushState.cleanup();
       }
-      return 0;
+      return null;
     }
 
     final PartitionLocation loc = map.get(partitionId);
@@ -1394,6 +1387,29 @@ public class ShuffleClientImpl extends ShuffleClient {
       throw new CelebornIOException(
           String.format(
               "Partition location for shuffle %s partition %d is NULL!", shuffleId, partitionId));
+    }
+    return loc;
+  }
+
+  public int pushOrMergeData(
+      int shuffleId,
+      int mapId,
+      int attemptId,
+      int partitionId,
+      byte[] data,
+      int offset,
+      int length,
+      int numMappers,
+      int numPartitions,
+      boolean doPush,
+      boolean skipCompress)
+      throws IOException {
+    // mapKey
+    final String mapKey = Utils.makeMapKey(shuffleId, mapId, attemptId);
+    final PartitionLocation loc =
+        pushTargetLocation(shuffleId, mapId, attemptId, partitionId, numMappers, numPartitions);
+    if (loc == null) {
+      return 0;
     }
 
     PushState pushState = getPushState(mapKey);
@@ -1430,10 +1446,7 @@ public class ShuffleClientImpl extends ShuffleClient {
     }
 
     final byte[] body = new byte[BATCH_HEADER_SIZE + length];
-    Platform.putInt(body, Platform.BYTE_ARRAY_OFFSET, mapId);
-    Platform.putInt(body, Platform.BYTE_ARRAY_OFFSET + 4, attemptId);
-    Platform.putInt(body, Platform.BYTE_ARRAY_OFFSET + 8, nextBatchId);
-    Platform.putInt(body, Platform.BYTE_ARRAY_OFFSET + 12, length);
+    writeBatchHeader(body, mapId, attemptId, nextBatchId, length);
     System.arraycopy(data, offset, body, BATCH_HEADER_SIZE, length);
 
     if (doPush) {
@@ -1469,6 +1482,85 @@ public class ShuffleClientImpl extends ShuffleClient {
     }
 
     return body.length;
+  }
+
+  @Override
+  public int pushRawData(
+      int shuffleId,
+      int mapId,
+      int attemptId,
+      int partitionId,
+      ByteBuffer data,
+      int numMappers,
+      int numPartitions,
+      Runnable releaseCallback)
+      throws IOException {
+    Objects.requireNonNull(releaseCallback, "releaseCallback");
+    boolean callbackPending = true;
+    try {
+      // Read the caller's bytes through a view so that its position and limit are left intact.
+      final ByteBuffer payload = data.slice();
+      final int length = payload.remaining();
+      final PartitionLocation loc =
+          pushTargetLocation(shuffleId, mapId, attemptId, partitionId, numMappers, numPartitions);
+      if (loc == null) {
+        return 0;
+      }
+      final String mapKey = Utils.makeMapKey(shuffleId, mapId, attemptId);
+      PushState pushState = getPushState(mapKey);
+      if (shuffleIntegrityCheckEnabled) {
+        pushState.addData(partitionId, payload.duplicate());
+      }
+      final int nextBatchId = pushState.nextBatchId();
+
+      final ByteBuf body;
+      // Snapshot volatile field once to avoid a TOCTOU race between isPresent() and get().
+      Optional<CryptoHandler> handler = cryptoHandler;
+      if (handler.isPresent()) {
+        // Encryption produces a new array, so the caller's buffer can be released right away.
+        byte[] plain = new byte[length];
+        payload.duplicate().get(plain);
+        callbackPending = false;
+        runReleaseCallback(releaseCallback);
+        byte[] encrypted = handler.get().encrypt(plain, 0, length);
+        byte[] framed = new byte[BATCH_HEADER_SIZE + encrypted.length];
+        writeBatchHeader(framed, mapId, attemptId, nextBatchId, encrypted.length);
+        System.arraycopy(encrypted, 0, framed, BATCH_HEADER_SIZE, encrypted.length);
+        body = Unpooled.wrappedBuffer(framed);
+      } else {
+        // Frame the caller's bytes without copying them. The body notifies the caller once the
+        // last send or retry has released it.
+        byte[] header = new byte[BATCH_HEADER_SIZE];
+        writeBatchHeader(header, mapId, attemptId, nextBatchId, length);
+        body =
+            new ReleaseNotifyingCompositeByteBuf(
+                releaseCallback, Unpooled.wrappedBuffer(header), Unpooled.wrappedBuffer(payload));
+        callbackPending = false;
+      }
+      final int bodyLength = body.readableBytes();
+      pushBatch(
+          shuffleId, mapId, attemptId, partitionId, mapKey, loc, pushState, nextBatchId, body);
+      return bodyLength;
+    } finally {
+      if (callbackPending) {
+        runReleaseCallback(releaseCallback);
+      }
+    }
+  }
+
+  private void writeBatchHeader(byte[] target, int mapId, int attemptId, int batchId, int length) {
+    Platform.putInt(target, Platform.BYTE_ARRAY_OFFSET, mapId);
+    Platform.putInt(target, Platform.BYTE_ARRAY_OFFSET + 4, attemptId);
+    Platform.putInt(target, Platform.BYTE_ARRAY_OFFSET + 8, batchId);
+    Platform.putInt(target, Platform.BYTE_ARRAY_OFFSET + 12, length);
+  }
+
+  private static void runReleaseCallback(Runnable releaseCallback) {
+    try {
+      releaseCallback.run();
+    } catch (Throwable t) {
+      logger.error("Push data release callback failed.", t);
+    }
   }
 
   @Override

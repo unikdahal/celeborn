@@ -24,6 +24,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -114,6 +115,35 @@ public class DummyShuffleClient extends ShuffleClient {
 
     os.write(data, offset, length);
     return length;
+  }
+
+  @Override
+  public int pushRawData(
+      int shuffleId,
+      int mapId,
+      int attemptId,
+      int partitionId,
+      ByteBuffer data,
+      int numMappers,
+      int numPartitions,
+      Runnable releaseCallback)
+      throws IOException {
+    try {
+      byte[] bytes = new byte[data.remaining()];
+      data.duplicate().get(bytes);
+      return pushData(
+          shuffleId,
+          mapId,
+          attemptId,
+          partitionId,
+          bytes,
+          0,
+          bytes.length,
+          numMappers,
+          numPartitions);
+    } finally {
+      releaseCallback.run();
+    }
   }
 
   @Override
