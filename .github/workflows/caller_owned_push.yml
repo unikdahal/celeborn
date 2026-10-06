@@ -128,3 +128,26 @@ jobs:
           path: |
             RawPushDataBenchmark-jdk17-results.txt
             benchmark.log
+
+  part-one-alone:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: [feat/push-body-refcount, feat/push-body-refcount-main]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 8
+          cache: maven
+      - name: Build and test the first change on its own
+        run: |
+          git log --oneline -2
+          build/mvn -B -Pgoogle-mirror -pl client -am install -DskipTests
+          build/mvn -B -Pgoogle-mirror -pl client test \
+            -Dtest='PushDataBodyBufferSuiteJ,ShuffleClientPushLifecycleSuiteJ,ShuffleClientSuiteJ,DataPushQueueSuiteJ' \
+            -DwildcardSuites=none -DfailIfNoTests=false
