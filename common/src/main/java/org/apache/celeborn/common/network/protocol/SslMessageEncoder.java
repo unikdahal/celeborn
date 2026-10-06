@@ -75,22 +75,33 @@ public final class SslMessageEncoder extends MessageToMessageEncoder<Message> {
       }
     }
 
-    Message.Type msgType = in.type();
-    // message size, message type size, body size, message encoded length
-    int headerLength = 4 + msgType.encodedLength() + 4 + in.encodedLength();
-    ByteBuf header = ctx.alloc().heapBuffer(headerLength);
-    header.writeInt(in.encodedLength());
-    msgType.encode(header);
-    header.writeInt(bodyLength);
-    in.encode(header);
-    assert header.writableBytes() == 0;
+    // Until the body and header are handed to an outbound message, this method owns both, along
+    // with the reference on in.body() that the message would take over.
+    ByteBuf header = null;
+    try {
+      Message.Type msgType = in.type();
+      // message size, message type size, body size, message encoded length
+      int headerLength = 4 + msgType.encodedLength() + 4 + in.encodedLength();
+      header = ctx.alloc().heapBuffer(headerLength);
+      header.writeInt(in.encodedLength());
+      msgType.encode(header);
+      header.writeInt(bodyLength);
+      in.encode(header);
+      assert header.writableBytes() == 0;
 
-    if (body != null && bodyLength > 0) {
-      // We transfer ownership of the reference on in.body() to EncryptedMessageWithHeader.
-      // This reference will be freed when EncryptedMessageWithHeader.close() is called.
-      out.add(new EncryptedMessageWithHeader(in.body(), header, body, bodyLength));
-    } else {
-      out.add(header);
+      if (body != null && bodyLength > 0) {
+        // We transfer ownership of the reference on in.body() to EncryptedMessageWithHeader.
+        // This reference will be freed when EncryptedMessageWithHeader.close() is called.
+        out.add(new EncryptedMessageWithHeader(in.body(), header, body, bodyLength));
+      } else {
+        // An empty body is not sent, so nothing takes over its references.
+        MessageEncoder.releaseUnsentBody(in, null, body);
+        body = null;
+        out.add(header);
+      }
+    } catch (Throwable t) {
+      MessageEncoder.releaseUnsentBody(in, header, body);
+      throw t;
     }
   }
 }
