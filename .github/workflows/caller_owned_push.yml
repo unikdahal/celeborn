@@ -113,22 +113,15 @@ jobs:
           java-version: 17
           cache: maven
       - name: Build
-        run: |
-          build/mvn -B -Dspotless.check.skip=true -Pgoogle-mirror -pl worker -am install -DskipTests
-          build/mvn -B -q -Dspotless.check.skip=true -Pgoogle-mirror -pl worker dependency:build-classpath \
-            -Dmdep.includeScope=test -Dmdep.outputFile=$PWD/worker-cp.txt
+        run: build/mvn -B -Dspotless.check.skip=true -Pgoogle-mirror -pl worker -am install -DskipTests
       - name: Run RawPushDataBenchmark
         run: |
-          tr ':' '\n' < worker-cp.txt | grep -i celeborn || true
-          cd worker
-          CELEBORN_GENERATE_BENCHMARK_FILES=1 timeout 50m java -Xmx4g \
-            --add-opens=java.base/java.nio=ALL-UNNAMED \
-            --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED \
-            --add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
-            -Dio.netty.tryReflectionSetAccessible=true \
-            -cp "target/test-classes:target/classes:../master/target/classes:../service/target/classes:../service/target/test-classes:../common/target/test-classes:$(cat ../worker-cp.txt)" \
-            org.apache.celeborn.service.deploy.cluster.RawPushDataBenchmark 2>&1 | tee ../benchmark.log | grep -v ' INFO \| DEBUG ' 
-          cat benchmarks/RawPushDataBenchmark-jdk17-results.txt
+          export MAVEN_OPTS="-Xmx6g --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED -Dio.netty.tryReflectionSetAccessible=true"
+          CELEBORN_GENERATE_BENCHMARK_FILES=1 timeout 50m build/mvn -B -q -Dspotless.check.skip=true -Pgoogle-mirror -pl worker \
+            org.codehaus.mojo:exec-maven-plugin:3.1.0:java \
+            -Dexec.mainClass=org.apache.celeborn.service.deploy.cluster.RawPushDataBenchmark \
+            -Dexec.classpathScope=test -Dexec.cleanupDaemonThreads=false 2>&1 | grep -v ' INFO \| DEBUG \| WARN ' | tee benchmark.log || true
+          cat worker/benchmarks/RawPushDataBenchmark-jdk17-results.txt
       - uses: actions/upload-artifact@v4
         with:
           name: raw-push-benchmark
