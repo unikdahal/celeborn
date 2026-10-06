@@ -50,14 +50,14 @@ jobs:
       - name: Client unit tests
         run: |
           build/mvn -B -Dspotless.check.skip=true -Pgoogle-mirror -pl client test \
-            -Dtest='ShuffleClientRawPushSuiteJ,PushDataBodyBufferSuiteJ,ShuffleClientSuiteJ,DataPushQueueSuiteJ' \
+            -Dtest='ShuffleClientRawPushSuiteJ,PushDataBodyBufferSuiteJ,ShuffleClientPushLifecycleSuiteJ,ShuffleClientSuiteJ,DataPushQueueSuiteJ' \
             -DwildcardSuites=none -DfailIfNoTests=false
       - name: Repeat ownership tests x20
         if: success() || failure()
         run: |
           for i in $(seq 1 20); do
             build/mvn -B -q -Dspotless.check.skip=true -Pgoogle-mirror -pl client test \
-              -Dtest='ShuffleClientRawPushSuiteJ,PushDataBodyBufferSuiteJ' -DwildcardSuites=none -DfailIfNoTests=false
+              -Dtest='ShuffleClientRawPushSuiteJ,PushDataBodyBufferSuiteJ,ShuffleClientPushLifecycleSuiteJ' -DwildcardSuites=none -DfailIfNoTests=false
           done
       - name: Mini cluster read/write with hard splits
         if: success() || failure()
@@ -97,7 +97,7 @@ jobs:
         run: |
           build/mvn -B -Dspotless.check.skip=true -Pgoogle-mirror -pl worker -am install -DskipTests
           build/mvn -B -Dspotless.check.skip=true -Pgoogle-mirror -pl client test \
-            -Dtest='ShuffleClientRawPushSuiteJ,PushDataBodyBufferSuiteJ,ShuffleClientSuiteJ' \
+            -Dtest='ShuffleClientRawPushSuiteJ,PushDataBodyBufferSuiteJ,ShuffleClientPushLifecycleSuiteJ,ShuffleClientSuiteJ' \
             -DwildcardSuites=none -DfailIfNoTests=false
           build/mvn -B -Dspotless.check.skip=true -Pgoogle-mirror -pl worker test -Dtest=none -DfailIfNoTests=false \
             -DwildcardSuites=org.apache.celeborn.service.deploy.cluster.RawPushDataReadWriteSuite
