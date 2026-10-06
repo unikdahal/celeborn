@@ -53,12 +53,14 @@ jobs:
             -Dtest='ShuffleClientRawPushSuiteJ,PushDataBodyBufferSuiteJ,ShuffleClientSuiteJ,DataPushQueueSuiteJ' \
             -DwildcardSuites=none -DfailIfNoTests=false
       - name: Repeat ownership tests x20
+        if: success() || failure()
         run: |
           for i in $(seq 1 20); do
             build/mvn -B -q -Dspotless.check.skip=true -Pgoogle-mirror -pl client surefire:test \
               -Dtest='ShuffleClientRawPushSuiteJ,PushDataBodyBufferSuiteJ' -DfailIfNoTests=false
           done
       - name: Mini cluster read/write with hard splits
+        if: success() || failure()
         run: |
           build/mvn -B -Dspotless.check.skip=true -Pgoogle-mirror -pl worker test -Dtest=none -DfailIfNoTests=false \
             -DwildcardSuites='org.apache.celeborn.service.deploy.cluster.RawPushDataReadWriteSuite,org.apache.celeborn.service.deploy.cluster.ClusterReadWriteTestWithNONE,org.apache.celeborn.service.deploy.cluster.ClusterReadWriteTestWithLZ4,org.apache.celeborn.service.deploy.cluster.ReadWriteTestWithFailures,org.apache.celeborn.service.deploy.cluster.PushMergedDataSplitSuite'
