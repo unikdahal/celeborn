@@ -21,6 +21,8 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -58,5 +60,20 @@ public class PushDataBodyBufferSuiteJ {
     buffer.release();
     assertEquals(1, body.refCnt());
     body.release();
+  }
+
+  @Test
+  public void testReleaseCallbackRunsOnceWhenTheLastReferenceIsReleased() {
+    AtomicInteger releases = new AtomicInteger();
+    ByteBuf body =
+        new ReleaseNotifyingCompositeByteBuf(
+            releases::incrementAndGet,
+            Unpooled.wrappedBuffer(new byte[16]),
+            Unpooled.wrappedBuffer(ByteBuffer.allocateDirect(32)));
+    ByteBuf send = body.retainedDuplicate();
+    body.release();
+    assertEquals(0, releases.get());
+    send.release();
+    assertEquals(1, releases.get());
   }
 }
