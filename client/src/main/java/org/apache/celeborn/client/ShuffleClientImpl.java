@@ -23,7 +23,9 @@ import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import scala.Tuple2;
 import scala.Tuple3;
@@ -32,8 +34,10 @@ import scala.reflect.ClassTag$;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Lists;
 import com.google.protobuf.InvalidProtocolBufferException;
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFuture;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.hadoop.fs.FileSystem;
@@ -306,7 +310,7 @@ public class ShuffleClientImpl extends ShuffleClient {
 
   private void submitRetryPushData(
       int shuffleId,
-      byte[] body,
+      ByteBuf body,
       int batchId,
       PushDataRpcResponseCallback pushDataRpcResponseCallback,
       PushState pushState,
@@ -341,6 +345,7 @@ public class ShuffleClientImpl extends ShuffleClient {
           batchId,
           loc);
       pushState.removeBatch(batchId, loc.hostAndPushPort());
+      pushDataRpcResponseCallback.releaseBody();
     } else if (request.reviveStatus != StatusCode.SUCCESS.getValue()) {
       pushDataRpcResponseCallback.onFailure(
           new CelebornIOException(
@@ -368,14 +373,7 @@ public class ShuffleClientImpl extends ShuffleClient {
       try {
         if (!isPushTargetWorkerExcluded(newLoc, pushDataRpcResponseCallback)) {
           if (!testRetryRevive || remainReviveTimes < 1) {
-            assert dataClientFactory != null;
-            TransportClient client =
-                dataClientFactory.createClient(newLoc.getHost(), newLoc.getPushPort(), partitionId);
-            NettyManagedBuffer newBuffer = new NettyManagedBuffer(Unpooled.wrappedBuffer(body));
-            String shuffleKey = Utils.makeShuffleKey(appUniqueId, shuffleId);
-            PushData newPushData =
-                new PushData(PRIMARY_MODE, shuffleKey, newLoc.getUniqueId(), newBuffer);
-            client.pushData(newPushData, pushDataTimeout, pushDataRpcResponseCallback);
+            sendPushData(shuffleId, partitionId, newLoc, body, pushDataRpcResponseCallback);
           } else {
             throw new RuntimeException(
                 "Mock push data submit retry failed. remainReviveTimes = "
@@ -975,22 +973,365 @@ public class ShuffleClientImpl extends ShuffleClient {
 
   private interface PushDataRpcResponseCallback extends RpcResponseCallback {
     default void updateLatestPartition(PartitionLocation latest) {}
+
+    /**
+     * Releases the batch body once it will not be sent or retried again. Every implementation must
+     * release it exactly once, on whichever terminal outcome comes first.
+     */
+    void releaseBody();
   }
 
-  public int pushOrMergeData(
+  /**
+   * Sends one attempt of a push data batch. The request holds its own reference to {@code body},
+   * which the transport releases once the write has finished, even if the write never started.
+   */
+  private void sendPushData(
+      int shuffleId,
+      int partitionId,
+      PartitionLocation loc,
+      ByteBuf body,
+      RpcResponseCallback callback)
+      throws IOException, InterruptedException {
+    assert dataClientFactory != null;
+    TransportClient client =
+        dataClientFactory.createClient(loc.getHost(), loc.getPushPort(), partitionId);
+    PushDataBodyBuffer buffer = new PushDataBodyBuffer(body.retainedDuplicate());
+    try {
+      String shuffleKey = Utils.makeShuffleKey(appUniqueId, shuffleId);
+      PushData pushData = new PushData(PRIMARY_MODE, shuffleKey, loc.getUniqueId(), buffer);
+      ChannelFuture future = client.pushData(pushData, pushDataTimeout, callback);
+      if (future != null) {
+        future.addListener(
+            f -> {
+              if (!f.isSuccess()) {
+                buffer.releaseIfNotEncoded();
+              }
+            });
+      }
+    } catch (Throwable t) {
+      buffer.releaseIfNotEncoded();
+      throw t;
+    }
+  }
+
+  /** Submits a retry of a push data batch, failing the batch if the client is shutting down. */
+  private void submitPushDataRetry(
+      PushDataRpcResponseCallback owner, RpcResponseCallback terminal, Runnable retry) {
+    try {
+      pushDataRetryPool.submit(retry);
+    } catch (RejectedExecutionException e) {
+      terminal.onFailure(new CelebornIOException("Push data retry was rejected", e));
+      owner.releaseBody();
+    }
+  }
+
+  /**
+   * Pushes one framed batch, taking ownership of a reference to {@code body}. The reference is
+   * released once the batch is acknowledged, permanently fails or is dropped, and will not be sent
+   * or retried again.
+   */
+  private void pushBatch(
       int shuffleId,
       int mapId,
       int attemptId,
       int partitionId,
-      byte[] data,
-      int offset,
-      int length,
-      int numMappers,
-      int numPartitions,
-      boolean doPush,
-      boolean skipCompress)
+      String mapKey,
+      PartitionLocation loc,
+      PushState pushState,
+      int nextBatchId,
+      ByteBuf body)
       throws IOException {
-    // mapKey
+    final int bodyLength = body.readableBytes();
+    try {
+      // check limit
+      limitMaxInFlight(mapKey, pushState, loc.hostAndPushPort());
+    } catch (Throwable t) {
+      body.release();
+      throw t;
+    }
+
+    // add inFlight requests
+    pushState.addBatch(nextBatchId, bodyLength, loc.hostAndPushPort());
+
+    // build callback
+    RpcResponseCallback callback =
+        new RpcResponseCallback() {
+          @Override
+          public void onSuccess(ByteBuffer response) {
+            if (response.remaining() > 0 && response.get() == StatusCode.MAP_ENDED.getValue()) {
+              mapperEndMap
+                  .computeIfAbsent(shuffleId, (id) -> ConcurrentHashMap.newKeySet())
+                  .add(mapId);
+            }
+            logger.debug(
+                "Push data to {} success for shuffle {} map {} attempt {} partition {} batch {}.",
+                loc.hostAndPushPort(),
+                shuffleId,
+                mapId,
+                attemptId,
+                partitionId,
+                nextBatchId);
+          }
+
+          @Override
+          public void onFailure(Throwable e) {
+            String errorMsg =
+                String.format(
+                    "Push data to %s failed for shuffle %d map %d attempt %d partition %d batch %d.",
+                    loc, shuffleId, mapId, attemptId, partitionId, nextBatchId);
+            pushState.exception.compareAndSet(null, new CelebornIOException(errorMsg, e));
+          }
+        };
+
+    PushDataRpcResponseCallback wrappedCallback =
+        new PushDataRpcResponseCallback() {
+          int remainReviveTimes = maxReviveTimes;
+          PartitionLocation latest = loc;
+          final AtomicBoolean bodyReleased = new AtomicBoolean();
+
+          @Override
+          public void releaseBody() {
+            if (bodyReleased.compareAndSet(false, true)) {
+              body.release();
+            }
+          }
+
+          @Override
+          public void updateLatestPartition(PartitionLocation newloc) {
+            pushState.addBatch(nextBatchId, bodyLength, newloc.hostAndPushPort());
+            pushState.removeBatch(nextBatchId, this.latest.hostAndPushPort());
+            this.latest = newloc;
+          }
+
+          @Override
+          public void onSuccess(ByteBuffer response) {
+            if (response.remaining() > 0) {
+              byte reason = response.get();
+              if (reason == StatusCode.SOFT_SPLIT.getValue()) {
+                logger.debug(
+                    "Push data to {} soft split required for shuffle {} map {} attempt {} partition {} batch {}.",
+                    latest.hostAndPushPort(),
+                    shuffleId,
+                    mapId,
+                    attemptId,
+                    partitionId,
+                    nextBatchId);
+                if (!newerPartitionLocationExists(
+                    reducePartitionMap.get(shuffleId), partitionId, latest.getEpoch(), false)) {
+                  ReviveRequest reviveRequest =
+                      new ReviveRequest(
+                          shuffleId,
+                          mapId,
+                          attemptId,
+                          partitionId,
+                          latest.getEpoch(),
+                          latest,
+                          StatusCode.SOFT_SPLIT);
+                  reviveManager.addRequest(reviveRequest);
+                }
+                pushState.onSuccess(latest.hostAndPushPort());
+                pushState.removeBatch(nextBatchId, latest.hostAndPushPort());
+                callback.onSuccess(response);
+                releaseBody();
+              } else if (reason == StatusCode.HARD_SPLIT.getValue()) {
+                logger.debug(
+                    "Push data to {} hard split required for shuffle {} map {} attempt {} partition {} batch {}.",
+                    latest.hostAndPushPort(),
+                    shuffleId,
+                    mapId,
+                    attemptId,
+                    partitionId,
+                    nextBatchId);
+                if (dataPushFailureTrackingEnabled && pushReplicateEnabled) {
+                  pushState.recordFailedBatch(latest.getUniqueId(), mapId, attemptId, nextBatchId);
+                }
+                ReviveRequest reviveRequest =
+                    new ReviveRequest(
+                        shuffleId,
+                        mapId,
+                        attemptId,
+                        partitionId,
+                        latest.getEpoch(),
+                        latest,
+                        StatusCode.HARD_SPLIT);
+                reviveManager.addRequest(reviveRequest);
+                long dueTime =
+                    System.currentTimeMillis()
+                        + conf.clientRpcRequestPartitionLocationAskTimeout().duration().toMillis();
+                submitPushDataRetry(
+                    this,
+                    callback,
+                    () ->
+                        submitRetryPushData(
+                            shuffleId,
+                            body,
+                            nextBatchId,
+                            this,
+                            pushState,
+                            reviveRequest,
+                            remainReviveTimes,
+                            dueTime));
+              } else if (reason == StatusCode.PUSH_DATA_SUCCESS_PRIMARY_CONGESTED.getValue()) {
+                logger.debug(
+                    "Push data to {} primary congestion required for shuffle {} map {} attempt {} partition {} batch {}.",
+                    latest.hostAndPushPort(),
+                    shuffleId,
+                    mapId,
+                    attemptId,
+                    partitionId,
+                    nextBatchId);
+                pushState.onCongestControl(latest.hostAndPushPort());
+                pushState.removeBatch(nextBatchId, latest.hostAndPushPort());
+                callback.onSuccess(response);
+                releaseBody();
+              } else if (reason == StatusCode.PUSH_DATA_SUCCESS_REPLICA_CONGESTED.getValue()) {
+                logger.debug(
+                    "Push data to {} replica congestion required for shuffle {} map {} attempt {} partition {} batch {}.",
+                    latest.hostAndPushPort(),
+                    shuffleId,
+                    mapId,
+                    attemptId,
+                    partitionId,
+                    nextBatchId);
+                pushState.onCongestControl(latest.hostAndPushPort());
+                pushState.removeBatch(nextBatchId, latest.hostAndPushPort());
+                callback.onSuccess(response);
+                releaseBody();
+              } else {
+                // StageEnd.
+                response.rewind();
+                pushState.onSuccess(latest.hostAndPushPort());
+                pushState.removeBatch(nextBatchId, latest.hostAndPushPort());
+                callback.onSuccess(response);
+                releaseBody();
+              }
+            } else {
+              pushState.onSuccess(latest.hostAndPushPort());
+              pushState.removeBatch(nextBatchId, latest.hostAndPushPort());
+              callback.onSuccess(response);
+              releaseBody();
+            }
+          }
+
+          @Override
+          public void onFailure(Throwable e) {
+            if (dataPushFailureTrackingEnabled) {
+              pushState.recordFailedBatch(latest.getUniqueId(), mapId, attemptId, nextBatchId);
+            }
+            if (pushState.exception.get() != null) {
+              releaseBody();
+              return;
+            }
+            if (e instanceof InterruptedException) {
+              Thread.currentThread().interrupt();
+              callback.onFailure(e);
+              releaseBody();
+              return;
+            }
+            StatusCode cause = getPushDataFailCause(e.getMessage());
+            if (remainReviveTimes <= 0) {
+              if (e instanceof CelebornIOException) {
+                callback.onFailure(e);
+              } else {
+                callback.onFailure(new CelebornIOException(cause, e));
+              }
+              releaseBody();
+              return;
+            }
+
+            logger.error(
+                "Push data to {} failed for shuffle {} map {} attempt {} partition {} batch {}, remain revive times {}.",
+                latest.hostAndPushPort(),
+                shuffleId,
+                mapId,
+                attemptId,
+                partitionId,
+                nextBatchId,
+                remainReviveTimes,
+                e);
+            // async retry push data
+            if (!mapperEnded(shuffleId, mapId)) {
+              remainReviveTimes = remainReviveTimes - 1;
+              ReviveRequest reviveRequest =
+                  new ReviveRequest(
+                      shuffleId, mapId, attemptId, partitionId, latest.getEpoch(), latest, cause);
+              reviveManager.addRequest(reviveRequest);
+              long dueTime =
+                  System.currentTimeMillis()
+                      + conf.clientRpcRequestPartitionLocationAskTimeout().duration().toMillis();
+              submitPushDataRetry(
+                  this,
+                  callback,
+                  () ->
+                      submitRetryPushData(
+                          shuffleId,
+                          body,
+                          nextBatchId,
+                          this,
+                          pushState,
+                          reviveRequest,
+                          remainReviveTimes,
+                          dueTime));
+            } else {
+              pushState.removeBatch(nextBatchId, latest.hostAndPushPort());
+              releaseBody();
+              logger.info(
+                  "Push data to {} failed but mapper already ended for shuffle {} map {} attempt {} partition {} batch {}, remain revive times {}.",
+                  latest.hostAndPushPort(),
+                  shuffleId,
+                  mapId,
+                  attemptId,
+                  partitionId,
+                  nextBatchId,
+                  remainReviveTimes);
+            }
+          }
+        };
+
+    // do push data
+    try {
+      if (!isPushTargetWorkerExcluded(loc, wrappedCallback)) {
+        if (!testRetryRevive) {
+          sendPushData(shuffleId, partitionId, loc, body, wrappedCallback);
+        } else {
+          wrappedCallback.onFailure(
+              new CelebornIOException(
+                  StatusCode.PUSH_DATA_FAIL_NON_CRITICAL_CAUSE_PRIMARY,
+                  new RuntimeException("Mock push data first time failed.")));
+        }
+      }
+    } catch (Exception e) {
+      logger.error(
+          "Exception raised while pushing data for shuffle {} map {} attempt {} partition {} batch {} location {}.",
+          shuffleId,
+          mapId,
+          attemptId,
+          partitionId,
+          nextBatchId,
+          loc,
+          e);
+      if (e instanceof InterruptedException) {
+        wrappedCallback.onFailure(e);
+      } else {
+        wrappedCallback.onFailure(
+            new CelebornIOException(StatusCode.PUSH_DATA_CREATE_CONNECTION_FAIL_PRIMARY, e));
+      }
+    }
+  }
+
+  /** Wraps a framed batch as the reference-counted body that its sends and retries share. */
+  @VisibleForTesting
+  protected ByteBuf newBatchBody(byte[] framedBatch) {
+    return Unpooled.wrappedBuffer(framedBatch);
+  }
+
+  /**
+   * Returns the location to push a batch of the given partition to, registering the shuffle or
+   * reviving the partition as needed, or null if the mapper has already ended.
+   */
+  private PartitionLocation pushTargetLocation(
+      int shuffleId, int mapId, int attemptId, int partitionId, int numMappers, int numPartitions)
+      throws IOException {
     final String mapKey = Utils.makeMapKey(shuffleId, mapId, attemptId);
     // return if shuffle stage already ended
     if (mapperEnded(shuffleId, mapId)) {
@@ -1004,7 +1345,7 @@ public class ShuffleClientImpl extends ShuffleClient {
       if (pushState != null) {
         pushState.cleanup();
       }
-      return 0;
+      return null;
     }
     // register shuffle if not registered
     final ConcurrentHashMap<Integer, PartitionLocation> map =
@@ -1038,7 +1379,7 @@ public class ShuffleClientImpl extends ShuffleClient {
       if (pushState != null) {
         pushState.cleanup();
       }
-      return 0;
+      return null;
     }
 
     final PartitionLocation loc = map.get(partitionId);
@@ -1046,6 +1387,29 @@ public class ShuffleClientImpl extends ShuffleClient {
       throw new CelebornIOException(
           String.format(
               "Partition location for shuffle %s partition %d is NULL!", shuffleId, partitionId));
+    }
+    return loc;
+  }
+
+  public int pushOrMergeData(
+      int shuffleId,
+      int mapId,
+      int attemptId,
+      int partitionId,
+      byte[] data,
+      int offset,
+      int length,
+      int numMappers,
+      int numPartitions,
+      boolean doPush,
+      boolean skipCompress)
+      throws IOException {
+    // mapKey
+    final String mapKey = Utils.makeMapKey(shuffleId, mapId, attemptId);
+    final PartitionLocation loc =
+        pushTargetLocation(shuffleId, mapId, attemptId, partitionId, numMappers, numPartitions);
+    if (loc == null) {
+      return 0;
     }
 
     PushState pushState = getPushState(mapKey);
@@ -1082,273 +1446,20 @@ public class ShuffleClientImpl extends ShuffleClient {
     }
 
     final byte[] body = new byte[BATCH_HEADER_SIZE + length];
-    Platform.putInt(body, Platform.BYTE_ARRAY_OFFSET, mapId);
-    Platform.putInt(body, Platform.BYTE_ARRAY_OFFSET + 4, attemptId);
-    Platform.putInt(body, Platform.BYTE_ARRAY_OFFSET + 8, nextBatchId);
-    Platform.putInt(body, Platform.BYTE_ARRAY_OFFSET + 12, length);
+    writeBatchHeader(body, mapId, attemptId, nextBatchId, length);
     System.arraycopy(data, offset, body, BATCH_HEADER_SIZE, length);
 
     if (doPush) {
-      // check limit
-      limitMaxInFlight(mapKey, pushState, loc.hostAndPushPort());
-
-      // add inFlight requests
-      pushState.addBatch(nextBatchId, body.length, loc.hostAndPushPort());
-
-      // build PushData request
-      NettyManagedBuffer buffer = new NettyManagedBuffer(Unpooled.wrappedBuffer(body));
-      final String shuffleKey = Utils.makeShuffleKey(appUniqueId, shuffleId);
-      PushData pushData = new PushData(PRIMARY_MODE, shuffleKey, loc.getUniqueId(), buffer);
-
-      // build callback
-      RpcResponseCallback callback =
-          new RpcResponseCallback() {
-            @Override
-            public void onSuccess(ByteBuffer response) {
-              if (response.remaining() > 0 && response.get() == StatusCode.MAP_ENDED.getValue()) {
-                mapperEndMap
-                    .computeIfAbsent(shuffleId, (id) -> ConcurrentHashMap.newKeySet())
-                    .add(mapId);
-              }
-              logger.debug(
-                  "Push data to {} success for shuffle {} map {} attempt {} partition {} batch {}.",
-                  loc.hostAndPushPort(),
-                  shuffleId,
-                  mapId,
-                  attemptId,
-                  partitionId,
-                  nextBatchId);
-            }
-
-            @Override
-            public void onFailure(Throwable e) {
-              String errorMsg =
-                  String.format(
-                      "Push data to %s failed for shuffle %d map %d attempt %d partition %d batch %d.",
-                      loc, shuffleId, mapId, attemptId, partitionId, nextBatchId);
-              pushState.exception.compareAndSet(null, new CelebornIOException(errorMsg, e));
-            }
-          };
-
-      RpcResponseCallback wrappedCallback =
-          new PushDataRpcResponseCallback() {
-            int remainReviveTimes = maxReviveTimes;
-            PartitionLocation latest = loc;
-
-            @Override
-            public void updateLatestPartition(PartitionLocation newloc) {
-              pushState.addBatch(nextBatchId, body.length, newloc.hostAndPushPort());
-              pushState.removeBatch(nextBatchId, this.latest.hostAndPushPort());
-              this.latest = newloc;
-            }
-
-            @Override
-            public void onSuccess(ByteBuffer response) {
-              if (response.remaining() > 0) {
-                byte reason = response.get();
-                if (reason == StatusCode.SOFT_SPLIT.getValue()) {
-                  logger.debug(
-                      "Push data to {} soft split required for shuffle {} map {} attempt {} partition {} batch {}.",
-                      latest.hostAndPushPort(),
-                      shuffleId,
-                      mapId,
-                      attemptId,
-                      partitionId,
-                      nextBatchId);
-                  if (!newerPartitionLocationExists(
-                      reducePartitionMap.get(shuffleId), partitionId, latest.getEpoch(), false)) {
-                    ReviveRequest reviveRequest =
-                        new ReviveRequest(
-                            shuffleId,
-                            mapId,
-                            attemptId,
-                            partitionId,
-                            latest.getEpoch(),
-                            latest,
-                            StatusCode.SOFT_SPLIT);
-                    reviveManager.addRequest(reviveRequest);
-                  }
-                  pushState.onSuccess(latest.hostAndPushPort());
-                  pushState.removeBatch(nextBatchId, latest.hostAndPushPort());
-                  callback.onSuccess(response);
-                } else if (reason == StatusCode.HARD_SPLIT.getValue()) {
-                  logger.debug(
-                      "Push data to {} hard split required for shuffle {} map {} attempt {} partition {} batch {}.",
-                      latest.hostAndPushPort(),
-                      shuffleId,
-                      mapId,
-                      attemptId,
-                      partitionId,
-                      nextBatchId);
-                  if (dataPushFailureTrackingEnabled && pushReplicateEnabled) {
-                    pushState.recordFailedBatch(
-                        latest.getUniqueId(), mapId, attemptId, nextBatchId);
-                  }
-                  ReviveRequest reviveRequest =
-                      new ReviveRequest(
-                          shuffleId,
-                          mapId,
-                          attemptId,
-                          partitionId,
-                          latest.getEpoch(),
-                          latest,
-                          StatusCode.HARD_SPLIT);
-                  reviveManager.addRequest(reviveRequest);
-                  long dueTime =
-                      System.currentTimeMillis()
-                          + conf.clientRpcRequestPartitionLocationAskTimeout()
-                              .duration()
-                              .toMillis();
-                  pushDataRetryPool.submit(
-                      () ->
-                          submitRetryPushData(
-                              shuffleId,
-                              body,
-                              nextBatchId,
-                              this,
-                              pushState,
-                              reviveRequest,
-                              remainReviveTimes,
-                              dueTime));
-                } else if (reason == StatusCode.PUSH_DATA_SUCCESS_PRIMARY_CONGESTED.getValue()) {
-                  logger.debug(
-                      "Push data to {} primary congestion required for shuffle {} map {} attempt {} partition {} batch {}.",
-                      latest.hostAndPushPort(),
-                      shuffleId,
-                      mapId,
-                      attemptId,
-                      partitionId,
-                      nextBatchId);
-                  pushState.onCongestControl(latest.hostAndPushPort());
-                  pushState.removeBatch(nextBatchId, latest.hostAndPushPort());
-                  callback.onSuccess(response);
-                } else if (reason == StatusCode.PUSH_DATA_SUCCESS_REPLICA_CONGESTED.getValue()) {
-                  logger.debug(
-                      "Push data to {} replica congestion required for shuffle {} map {} attempt {} partition {} batch {}.",
-                      latest.hostAndPushPort(),
-                      shuffleId,
-                      mapId,
-                      attemptId,
-                      partitionId,
-                      nextBatchId);
-                  pushState.onCongestControl(latest.hostAndPushPort());
-                  pushState.removeBatch(nextBatchId, latest.hostAndPushPort());
-                  callback.onSuccess(response);
-                } else {
-                  // StageEnd.
-                  response.rewind();
-                  pushState.onSuccess(latest.hostAndPushPort());
-                  pushState.removeBatch(nextBatchId, latest.hostAndPushPort());
-                  callback.onSuccess(response);
-                }
-              } else {
-                pushState.onSuccess(latest.hostAndPushPort());
-                pushState.removeBatch(nextBatchId, latest.hostAndPushPort());
-                callback.onSuccess(response);
-              }
-            }
-
-            @Override
-            public void onFailure(Throwable e) {
-              if (dataPushFailureTrackingEnabled) {
-                pushState.recordFailedBatch(latest.getUniqueId(), mapId, attemptId, nextBatchId);
-              }
-              if (pushState.exception.get() != null) {
-                return;
-              }
-              if (e instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-                callback.onFailure(e);
-                return;
-              }
-              StatusCode cause = getPushDataFailCause(e.getMessage());
-              if (remainReviveTimes <= 0) {
-                if (e instanceof CelebornIOException) {
-                  callback.onFailure(e);
-                } else {
-                  callback.onFailure(new CelebornIOException(cause, e));
-                }
-                return;
-              }
-
-              logger.error(
-                  "Push data to {} failed for shuffle {} map {} attempt {} partition {} batch {}, remain revive times {}.",
-                  latest.hostAndPushPort(),
-                  shuffleId,
-                  mapId,
-                  attemptId,
-                  partitionId,
-                  nextBatchId,
-                  remainReviveTimes,
-                  e);
-              // async retry push data
-              if (!mapperEnded(shuffleId, mapId)) {
-                remainReviveTimes = remainReviveTimes - 1;
-                ReviveRequest reviveRequest =
-                    new ReviveRequest(
-                        shuffleId, mapId, attemptId, partitionId, latest.getEpoch(), latest, cause);
-                reviveManager.addRequest(reviveRequest);
-                long dueTime =
-                    System.currentTimeMillis()
-                        + conf.clientRpcRequestPartitionLocationAskTimeout().duration().toMillis();
-                pushDataRetryPool.submit(
-                    () ->
-                        submitRetryPushData(
-                            shuffleId,
-                            body,
-                            nextBatchId,
-                            this,
-                            pushState,
-                            reviveRequest,
-                            remainReviveTimes,
-                            dueTime));
-              } else {
-                pushState.removeBatch(nextBatchId, latest.hostAndPushPort());
-                logger.info(
-                    "Push data to {} failed but mapper already ended for shuffle {} map {} attempt {} partition {} batch {}, remain revive times {}.",
-                    latest.hostAndPushPort(),
-                    shuffleId,
-                    mapId,
-                    attemptId,
-                    partitionId,
-                    nextBatchId,
-                    remainReviveTimes);
-              }
-            }
-          };
-
-      // do push data
-      try {
-        if (!isPushTargetWorkerExcluded(loc, wrappedCallback)) {
-          if (!testRetryRevive) {
-            assert dataClientFactory != null;
-            TransportClient client =
-                dataClientFactory.createClient(loc.getHost(), loc.getPushPort(), partitionId);
-            client.pushData(pushData, pushDataTimeout, wrappedCallback);
-          } else {
-            wrappedCallback.onFailure(
-                new CelebornIOException(
-                    StatusCode.PUSH_DATA_FAIL_NON_CRITICAL_CAUSE_PRIMARY,
-                    new RuntimeException("Mock push data first time failed.")));
-          }
-        }
-      } catch (Exception e) {
-        logger.error(
-            "Exception raised while pushing data for shuffle {} map {} attempt {} partition {} batch {} location {}.",
-            shuffleId,
-            mapId,
-            attemptId,
-            partitionId,
-            nextBatchId,
-            loc,
-            e);
-        if (e instanceof InterruptedException) {
-          wrappedCallback.onFailure(e);
-        } else {
-          wrappedCallback.onFailure(
-              new CelebornIOException(StatusCode.PUSH_DATA_CREATE_CONNECTION_FAIL_PRIMARY, e));
-        }
-      }
+      pushBatch(
+          shuffleId,
+          mapId,
+          attemptId,
+          partitionId,
+          mapKey,
+          loc,
+          pushState,
+          nextBatchId,
+          newBatchBody(body));
     } else {
       // add batch data
       logger.debug("Merge batch {}.", nextBatchId);
@@ -1371,6 +1482,85 @@ public class ShuffleClientImpl extends ShuffleClient {
     }
 
     return body.length;
+  }
+
+  @Override
+  public int pushRawData(
+      int shuffleId,
+      int mapId,
+      int attemptId,
+      int partitionId,
+      ByteBuffer data,
+      int numMappers,
+      int numPartitions,
+      Runnable releaseCallback)
+      throws IOException {
+    Objects.requireNonNull(releaseCallback, "releaseCallback");
+    boolean callbackPending = true;
+    try {
+      // Read the caller's bytes through a view so that its position and limit are left intact.
+      final ByteBuffer payload = data.slice();
+      final int length = payload.remaining();
+      final PartitionLocation loc =
+          pushTargetLocation(shuffleId, mapId, attemptId, partitionId, numMappers, numPartitions);
+      if (loc == null) {
+        return 0;
+      }
+      final String mapKey = Utils.makeMapKey(shuffleId, mapId, attemptId);
+      PushState pushState = getPushState(mapKey);
+      if (shuffleIntegrityCheckEnabled) {
+        pushState.addData(partitionId, payload.duplicate());
+      }
+      final int nextBatchId = pushState.nextBatchId();
+
+      final ByteBuf body;
+      // Snapshot volatile field once to avoid a TOCTOU race between isPresent() and get().
+      Optional<CryptoHandler> handler = cryptoHandler;
+      if (handler.isPresent()) {
+        // Encryption produces a new array, so the caller's buffer can be released right away.
+        byte[] plain = new byte[length];
+        payload.duplicate().get(plain);
+        callbackPending = false;
+        runReleaseCallback(releaseCallback);
+        byte[] encrypted = handler.get().encrypt(plain, 0, length);
+        byte[] framed = new byte[BATCH_HEADER_SIZE + encrypted.length];
+        writeBatchHeader(framed, mapId, attemptId, nextBatchId, encrypted.length);
+        System.arraycopy(encrypted, 0, framed, BATCH_HEADER_SIZE, encrypted.length);
+        body = Unpooled.wrappedBuffer(framed);
+      } else {
+        // Frame the caller's bytes without copying them. The body notifies the caller once the
+        // last send or retry has released it.
+        byte[] header = new byte[BATCH_HEADER_SIZE];
+        writeBatchHeader(header, mapId, attemptId, nextBatchId, length);
+        body =
+            new ReleaseNotifyingCompositeByteBuf(
+                releaseCallback, Unpooled.wrappedBuffer(header), Unpooled.wrappedBuffer(payload));
+        callbackPending = false;
+      }
+      final int bodyLength = body.readableBytes();
+      pushBatch(
+          shuffleId, mapId, attemptId, partitionId, mapKey, loc, pushState, nextBatchId, body);
+      return bodyLength;
+    } finally {
+      if (callbackPending) {
+        runReleaseCallback(releaseCallback);
+      }
+    }
+  }
+
+  private void writeBatchHeader(byte[] target, int mapId, int attemptId, int batchId, int length) {
+    Platform.putInt(target, Platform.BYTE_ARRAY_OFFSET, mapId);
+    Platform.putInt(target, Platform.BYTE_ARRAY_OFFSET + 4, attemptId);
+    Platform.putInt(target, Platform.BYTE_ARRAY_OFFSET + 8, batchId);
+    Platform.putInt(target, Platform.BYTE_ARRAY_OFFSET + 12, length);
+  }
+
+  private static void runReleaseCallback(Runnable releaseCallback) {
+    try {
+      releaseCallback.run();
+    } catch (Throwable t) {
+      logger.error("Push data release callback failed.", t);
+    }
   }
 
   @Override
