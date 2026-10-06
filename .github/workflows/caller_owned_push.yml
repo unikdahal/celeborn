@@ -116,13 +116,14 @@ jobs:
             -Dmdep.includeScope=test -Dmdep.outputFile=$PWD/worker-cp.txt
       - name: Run RawPushDataBenchmark
         run: |
+          tr ':' '\n' < worker-cp.txt | grep -i celeborn || true
           cd worker
           CELEBORN_GENERATE_BENCHMARK_FILES=1 java -Xmx4g \
             --add-opens=java.base/java.nio=ALL-UNNAMED \
             --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED \
             --add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
             -Dio.netty.tryReflectionSetAccessible=true \
-            -cp "target/test-classes:target/classes:$(cat ../worker-cp.txt)" \
+            -cp "target/test-classes:target/classes:../master/target/classes:../service/target/classes:../service/target/test-classes:../common/target/test-classes:$(cat ../worker-cp.txt)" \
             org.apache.celeborn.service.deploy.cluster.RawPushDataBenchmark 2>&1 | tee ../benchmark.log | grep -v ' INFO \| DEBUG ' 
           cat benchmarks/RawPushDataBenchmark-jdk17-results.txt
       - uses: actions/upload-artifact@v4
