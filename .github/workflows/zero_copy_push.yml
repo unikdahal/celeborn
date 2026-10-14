@@ -1,0 +1,141 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+name: Zero-copy push validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/zero-copy-push
+
+concurrency:
+  group: zero-copy-push-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  style:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 8
+          cache: maven
+      - name: Spotless
+        run: |
+          build/mvn -B -q -Pgoogle-mirror,spark-3.5 spotless:apply
+          git diff > format.patch
+          cat format.patch
+          test ! -s format.patch
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: format-patch
+          path: format.patch
+
+  ownership:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [8, 17]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: ${{ matrix.java }}
+          cache: maven
+      - name: Build
+        run: build/mvn -B -Dspotless.check.skip=true -Pgoogle-mirror -pl worker -am install -DskipTests
+      - name: Client and encoder unit tests
+        run: |
+          build/mvn -B -Dspotless.check.skip=true -Pgoogle-mirror -pl common,client test \
+            -Dtest='ShuffleClientRawPushSuiteJ,PushDataBodyBufferSuiteJ,ShuffleClientPushLifecycleSuiteJ,ShuffleClientSuiteJ,DataPushQueueSuiteJ,MessageEncoderReleaseSuiteJ' \
+            -DwildcardSuites=none -DfailIfNoTests=false
+      - name: Repeat ownership tests x20
+        if: success() || failure()
+        run: |
+          for i in $(seq 1 20); do
+            build/mvn -B -q -Dspotless.check.skip=true -Pgoogle-mirror -pl client test \
+              -Dtest='ShuffleClientRawPushSuiteJ,PushDataBodyBufferSuiteJ,ShuffleClientPushLifecycleSuiteJ' \
+              -DwildcardSuites=none -DfailIfNoTests=false
+          done
+      - name: Mini cluster read/write with hard splits and retries
+        if: success() || failure()
+        run: |
+          build/mvn -B -Dspotless.check.skip=true -Pgoogle-mirror -pl worker test -Dtest=none -DfailIfNoTests=false \
+            -DwildcardSuites='org.apache.celeborn.service.deploy.cluster.RawPushDataReadWriteSuite,org.apache.celeborn.service.deploy.cluster.PushDataRetryLifecycleSuite,org.apache.celeborn.service.deploy.cluster.ClusterReadWriteTestWithNONE,org.apache.celeborn.service.deploy.cluster.ClusterReadWriteTestWithLZ4,org.apache.celeborn.service.deploy.cluster.ReadWriteTestWithFailures,org.apache.celeborn.service.deploy.cluster.PushMergedDataSplitSuite'
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ownership-java-${{ matrix.java }}
+          path: |
+            **/target/surefire-reports/**
+            **/target/test-reports/**
+            **/target/unit-tests.log
+
+  service:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [8, 17]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: ${{ matrix.java }}
+          cache: maven
+      - name: Test service modules
+        run: build/mvn -B -Pgoogle-mirror test
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: service-java-${{ matrix.java }}
+          path: |
+            **/target/test-reports/**
+            **/target/unit-tests.log
+
+  spark35:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+          cache: maven
+      - name: Test Spark 3.5 client
+        run: |
+          PROFILES="-Pgoogle-mirror,aws,spark-3.5"
+          TEST_MODULES="client-spark/common,client-spark/spark-3,client-spark/spark-3-columnar-common,client-spark/spark-3-shaded,tests/spark-it"
+          build/mvn -B $PROFILES -pl $TEST_MODULES -am clean install -DskipTests
+          build/mvn -B $PROFILES -pl $TEST_MODULES test
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spark-3.5-java-17
+          path: |
+            **/target/test-reports/**
+            **/target/unit-tests.log
