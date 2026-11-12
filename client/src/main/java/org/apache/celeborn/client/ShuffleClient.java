@@ -18,6 +18,7 @@
 package org.apache.celeborn.client;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -288,6 +289,57 @@ public abstract class ShuffleClient {
       int numMappers,
       int numPartitions)
       throws IOException;
+
+  /**
+   * Write a caller-owned buffer to a specific reduce partition without copying it.
+   *
+   * <p>The bytes between the position and the limit of {@code data} are pushed as they are: the
+   * client applies no compression, so callers that compress must do so before calling this method,
+   * and must read the partition back without client decompression (for example with {@code
+   * needDecompress} set to false in {@link #readPartition}). When shuffle integrity checks are
+   * enabled, the CRC of the batch is recorded as by {@link #pushDataWithCRC}. When encryption is
+   * enabled, the batch is encrypted into a new buffer. The position and limit of {@code data} are
+   * not modified.
+   *
+   * <p>The client may reference the content of {@code data} after this method returns, until it has
+   * been acknowledged, failed permanently or been dropped, and every transport write and retry of
+   * it has finished. The caller must not modify or free that content before {@code releaseCallback}
+   * runs. The client runs {@code releaseCallback} exactly once, whatever the outcome: also when
+   * this method returns 0 because the mapper has already ended, and when it throws. The callback
+   * may run on the calling thread before this method returns, or later on a transport or retry
+   * thread, so it must be thread-safe and must not block. A failure of the batch itself is reported
+   * like that of {@link #pushData}, by the next push or by {@link #mapperEnd}.
+   *
+   * @param shuffleId the unique shuffle id of the application
+   * @param mapId the map id of the shuffle
+   * @param attemptId the attempt id of the map task, i.e. speculative task or task rerun for Apache
+   *     Spark
+   * @param partitionId the partition id the data belongs to
+   * @param data the bytes to push, between its position and its limit; it may be a direct buffer
+   * @param numMappers the number map tasks in the shuffle
+   * @param numPartitions the number of partitions in the shuffle
+   * @param releaseCallback run once the client no longer references the content of {@code data}
+   * @return bytes pushed, including the batch header, or 0 if the mapper has already ended
+   * @throws IOException if the batch cannot be pushed
+   * @throws UnsupportedOperationException if this client does not support caller-owned buffers
+   */
+  public int pushRawData(
+      int shuffleId,
+      int mapId,
+      int attemptId,
+      int partitionId,
+      ByteBuffer data,
+      int numMappers,
+      int numPartitions,
+      Runnable releaseCallback)
+      throws IOException {
+    try {
+      throw new UnsupportedOperationException(
+          getClass().getName() + " does not support pushing caller-owned buffers");
+    } finally {
+      releaseCallback.run();
+    }
+  }
 
   /**
    * Pre-compute CRC for a batch immediately after assembly in the writer, before the data enters
