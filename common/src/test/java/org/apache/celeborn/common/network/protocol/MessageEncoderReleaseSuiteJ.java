@@ -151,7 +151,8 @@ public class MessageEncoderReleaseSuiteJ {
     IllegalStateException error =
         assertThrows(
             IllegalStateException.class,
-            () -> SslMessageEncoder.INSTANCE.encode(contextFailingHeaderAllocation(), message, out));
+            () ->
+                SslMessageEncoder.INSTANCE.encode(contextFailingHeaderAllocation(), message, out));
     assertEquals("mock header allocation failure", error.getMessage());
     assertTrue(out.isEmpty());
     verify(stream).close();

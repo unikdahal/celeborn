@@ -1188,7 +1188,8 @@ public class ShuffleClientImpl extends ShuffleClient {
                       partitionId,
                       nextBatchId);
                   if (dataPushFailureTrackingEnabled && pushReplicateEnabled) {
-                    pushState.recordFailedBatch(latest.getUniqueId(), mapId, attemptId, nextBatchId);
+                    pushState.recordFailedBatch(
+                        latest.getUniqueId(), mapId, attemptId, nextBatchId);
                   }
                   ReviveRequest reviveRequest =
                       new ReviveRequest(
@@ -1202,7 +1203,9 @@ public class ShuffleClientImpl extends ShuffleClient {
                   reviveManager.addRequest(reviveRequest);
                   long dueTime =
                       System.currentTimeMillis()
-                          + conf.clientRpcRequestPartitionLocationAskTimeout().duration().toMillis();
+                          + conf.clientRpcRequestPartitionLocationAskTimeout()
+                              .duration()
+                              .toMillis();
                   submitPushDataRetry(
                       this,
                       callback,
