@@ -418,4 +418,24 @@ public class ShuffleClientRawPushSuiteJ {
     assertTrue(transportClient.requestIds.isEmpty());
     assertEquals(7, data.position());
   }
+
+  @Test
+  public void testReleasesWhenResponseHandlingThrows() throws Exception {
+    setup(0, false);
+    AtomicInteger releases = new AtomicInteger();
+
+    push(directPayload(100, 1), releases::incrementAndGet);
+    completeWrite();
+    PushState pushState =
+        shuffleClient.pushStates.get(Utils.makeMapKey(SHUFFLE_ID, MAP_ID, ATTEMPT_ID));
+    // Unregistering the shuffle drops its partition locations, which handling a soft split needs.
+    shuffleClient.cleanupShuffle(SHUFFLE_ID);
+    assertEquals(0, releases.get());
+
+    transportClient.respond(0, StatusCode.SOFT_SPLIT.getValue());
+
+    assertEquals("a response that cannot be handled must still end the batch", 1, releases.get());
+    assertTrue(
+        "the batch must fail rather than count as pushed", pushState.exception.get() != null);
+  }
 }
