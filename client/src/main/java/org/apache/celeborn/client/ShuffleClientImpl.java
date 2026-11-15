@@ -1147,6 +1147,53 @@ public class ShuffleClientImpl extends ShuffleClient {
 
             @Override
             public void onSuccess(ByteBuffer response) {
+              try {
+                handleSuccess(response);
+              } catch (Throwable t) {
+                failUnexpectedly(t);
+              }
+            }
+
+            @Override
+            public void onFailure(Throwable e) {
+              try {
+                handleFailure(e);
+              } catch (Throwable t) {
+                failUnexpectedly(t);
+              }
+            }
+
+            /**
+             * Ends the batch when handling a response threw before the batch reached a terminal
+             * outcome or was handed to a retry, for example because its shuffle was unregistered in
+             * the meantime. Nothing else would release the body, and whoever waits for its release
+             * callback would wait forever.
+             */
+            private void failUnexpectedly(Throwable t) {
+              logger.error(
+                  "Unexpected failure handling the push data response for shuffle {} map {} attempt {} partition {} batch {}.",
+                  shuffleId,
+                  mapId,
+                  attemptId,
+                  partitionId,
+                  nextBatchId,
+                  t);
+              if (bodyReleased.get()) {
+                // The batch already reached its terminal outcome, which removed it from the
+                // in-flight requests and released the body.
+                return;
+              }
+              try {
+                pushState.removeBatch(nextBatchId, latest.hostAndPushPort());
+              } finally {
+                failBatch(
+                    this,
+                    callback,
+                    new CelebornIOException("Push data response handling failed", t));
+              }
+            }
+
+            private void handleSuccess(ByteBuffer response) {
               if (response.remaining() > 0) {
                 byte reason = response.get();
                 if (reason == StatusCode.SOFT_SPLIT.getValue()) {
@@ -1273,8 +1320,7 @@ public class ShuffleClientImpl extends ShuffleClient {
               }
             }
 
-            @Override
-            public void onFailure(Throwable e) {
+            private void handleFailure(Throwable e) {
               if (dataPushFailureTrackingEnabled) {
                 pushState.recordFailedBatch(latest.getUniqueId(), mapId, attemptId, nextBatchId);
               }
